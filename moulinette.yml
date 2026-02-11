@@ -1,0 +1,49 @@
+name: Prospection Moulinette (12:30 & 17:00 FR)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 11 * * *"  # 12:30 FR (winter)
+    - cron: "30 16 * * *"  # 17:30 FR (winter)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      issues: read
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install pandas openpyxl pyyaml
+
+      - name: Run moulinette (emails + last_run)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          EMAIL_GR: ${{ secrets.EMAIL_GR }}
+          EMAIL_VR: ${{ secrets.EMAIL_VR }}
+          EMAIL_GRS: ${{ secrets.EMAIL_GRS }}
+          EMAIL_SLS: ${{ secrets.EMAIL_SLS }}
+        run: |
+          python scripts/notify_and_export.py
+
+      - name: Commit last_run marker
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add out/last_run.txt out/stats_sessions_*.csv out/stats_sessions_*.xlsx || true
+          git commit -m "Update last_run marker" || echo "No changes"
+          git push
