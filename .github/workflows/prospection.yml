@@ -19,9 +19,10 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Export & mail
+      - name: Export & mail (Brevo API)
         env:
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          # optionnel : forcer une date si besoin (sinon prend aujourd'hui UTC)
+          # RUN_DATE: "2026-02-12"
         run: python scripts/export_and_mail.py
