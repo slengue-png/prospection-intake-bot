@@ -26,11 +26,8 @@ def load_config(path="config.yml"):
 def fetch_jsonl(url: str, export_token: str) -> list[dict]:
     print(f"[FETCH] {url}")
     req = urllib.request.Request(url)
-
     for k, v in BROWSER_HEADERS.items():
         req.add_header(k, v)
-
-    # auth header
     req.add_header("X-Export-Token", export_token)
 
     try:
@@ -39,19 +36,12 @@ def fetch_jsonl(url: str, export_token: str) -> list[dict]:
             print(f"[HTTP] {resp.status}")
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        print(f"[HTTPERROR] code={e.code}")
-        print("[HTTPERROR_BODY_300]", body[:300].replace("\n", " ") )
-        raise RuntimeError(f"HTTPError {e.code} on {url}")
+        raise RuntimeError(f"HTTPError {e.code} on {url} -> {body[:300]}")
     except urllib.error.URLError as e:
-        print("[URLERROR]", getattr(e, "reason", str(e)))
         raise RuntimeError(f"URLError on {url} -> {getattr(e,'reason',str(e))}")
-    except Exception as e:
-        print("[FETCH_ERROR]", str(e))
-        raise
 
     if not raw:
         return []
-
     rows = []
     for line in raw.splitlines():
         line = line.strip()
@@ -60,7 +50,6 @@ def fetch_jsonl(url: str, export_token: str) -> list[dict]:
         try:
             rows.append(json.loads(line))
         except:
-            # si la ligne n'est pas du JSON, on ignore
             pass
     return rows
 
@@ -73,13 +62,18 @@ def build_excel(records: list[dict]) -> bytes:
     for r in records:
         ws.append([
             r.get("name",""),
-            "", "",
+            r.get("address",""),
+            r.get("postal_code",""),
             r.get("city",""),
             r.get("phone",""),
-            "",
+            r.get("phone2",""),
             r.get("email",""),
-            "", "", "",
-            "", "", r.get("interlocuteur",""),
+            r.get("siret",""),
+            r.get("naf",""),
+            r.get("website",""),
+            r.get("contact_civility",""),
+            r.get("contact_firstname",""),
+            r.get("contact_lastname","") or r.get("interlocuteur",""),
             r.get("resume",""),
             r.get("commande",""),
         ])
@@ -124,8 +118,49 @@ def main():
     prospects = fetch_jsonl(prospects_url, export_token)
     print(f"[OK] prospects rows={len(prospects)}")
 
-    # Pas d'envoi mail tant que exemple.com (comme tu voulais)
-    # Le but ici = valider l'export sans 1010.
+    # Regroupement par agence
+    agency_records = {ag: [] for ag in cfg["agencies"].keys()}
+    for p in prospects:
+        ag = (p.get("agency") or "").strip()
+        if ag in agency_records:
+            agency_records[ag].append(p)
+
+    # 1) Envoi Excel "import logiciel" par agence
+    for ag, recs in agency_records.items():
+        to_list = cfg["agencies"][ag]["daily_to"]
+        if not to_list or any("exemple.com" in x for x in to_list):
+            print(f"[SKIP EMAIL] {ag} daily_to not set or still example.com")
+            continue
+
+        excel_ag = build_excel(recs)
+        subject = f"[PROSPECTION] {ag} — Import — {date}"
+        body = f"Export prospection inconnus — {ag} — {date}\nFiches: {len(recs)}"
+        send_email_gmail(subject, body, to_list, [(f"{date}_{ag}_IMPORT.xlsx", excel_ag)])
+        print(f"[SENT] agency {ag} -> {len(to_list)} recipients")
+
+    # 2) Mail global stats (uniquement toi)
+    lines = [f"Résumé global prospection — {date}", ""]
+    total_fiches = 0
+    for ag in cfg["agencies"].keys():
+        n = len(agency_records[ag])
+        total_fiches += n
+        cmd = sum(1 for r in agency_records[ag] if (r.get("commande") or "").strip())
+        # (par personne viendra à l'étape suivante avec /whoami)
+        lines.append(f"{ag}: {n} fiches, {cmd} commandes")
+    lines.append("")
+    lines.append(f"TOTAL GLOBAL: {total_fiches} fiches")
+
+    to_global = cfg.get("global_to", [])
+    if to_global and not any("exemple.com" in x for x in to_global):
+        send_email_gmail(
+            f"[PROSPECTION] GLOBAL — Résumé — {date}",
+            "\n".join(lines),
+            to_global,
+            []
+        )
+        print("[SENT] global summary")
+    else:
+        print("[SKIP EMAIL] global_to not set or still example.com")
 
 if __name__ == "__main__":
     main()
