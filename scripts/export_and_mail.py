@@ -16,10 +16,13 @@ def load_config(path="config.yml"):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def fetch_jsonl(url: str):
+def fetch_jsonl(url: str, export_token: str) -> list[dict]:
     print(f"[FETCH] {url}")
+    req = urllib.request.Request(url)
+    req.add_header("X-Export-Token", export_token)
+
     try:
-        with urllib.request.urlopen(url, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8", errors="replace").strip()
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
@@ -31,15 +34,19 @@ def fetch_jsonl(url: str):
 
     if not raw:
         return []
+
     rows = []
     for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
             rows.append(json.loads(line))
         except:
             pass
     return rows
 
-def build_excel(records):
+def build_excel(records: list[dict]) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "IMPORT"
@@ -48,18 +55,13 @@ def build_excel(records):
     for r in records:
         ws.append([
             r.get("name",""),
-            "",
-            "",
+            "", "",  # adresse, code postal (complétés plus tard par ton outil)
             r.get("city",""),
             r.get("phone",""),
-            "",
+            "",      # téléphone 2
             r.get("email",""),
-            "",
-            "",
-            "",
-            "",
-            "",
-            r.get("interlocuteur",""),
+            "", "", "",  # siret, naf, site web
+            "", "", r.get("interlocuteur",""),
             r.get("resume",""),
             r.get("commande",""),
         ])
@@ -68,7 +70,7 @@ def build_excel(records):
     wb.save(bio)
     return bio.getvalue()
 
-def send_email(subject, body, to_list, attachments):
+def send_email_gmail(subject, body, to_list, attachments):
     gmail_user = os.environ["GMAIL_USER"]
     gmail_app_password = os.environ["GMAIL_APP_PASSWORD"]
 
@@ -94,50 +96,56 @@ def send_email(subject, body, to_list, attachments):
 def main():
     cfg = load_config("config.yml")
     worker = (cfg["worker_base_url"] or "").strip().rstrip("/")
-
     if not worker.startswith("https://"):
         raise RuntimeError(f"config.yml worker_base_url must start with https:// (got: {worker})")
 
-    token = os.environ["EXPORT_TOKEN"]
-    date = datetime.utcnow().strftime("%Y-%m-%d")
+    export_token = os.environ["EXPORT_TOKEN"]
+    date = os.environ.get("RUN_DATE") or datetime.utcnow().strftime("%Y-%m-%d")
 
-    prospects_url = f"{worker}/dump?token={token}&date={date}&kind=prospects"
-    prospects = fetch_jsonl(prospects_url)
+    # IMPORTANT: plus de token en querystring -> header seulement
+    prospects_url = f"{worker}/dump?date={date}&kind=prospects"
+    prospects = fetch_jsonl(prospects_url, export_token)
 
+    # Regroupement par agence
     agency_records = {ag: [] for ag in cfg["agencies"].keys()}
     for p in prospects:
         ag = p.get("agency","")
         if ag in agency_records:
             agency_records[ag].append(p)
 
+    # Envoi agences (si tu remplaces exemple.com par des vrais)
     for ag, recs in agency_records.items():
-        excel_file = build_excel(recs)
+        excel_ag = build_excel(recs)
+        subject = f"[PROSPECTION] {ag} — Export import — {date}"
+        body = f"Export prospection inconnus — agence {ag} — {date}\nFiches: {len(recs)}\n"
         to_list = cfg["agencies"][ag]["daily_to"]
 
         if any("exemple.com" in x for x in to_list):
             print(f"[SKIP EMAIL] {ag} daily_to still example.com")
             continue
 
-        send_email(
-            f"[PROSPECTION] {ag} — {date}",
-            f"Fiches: {len(recs)}",
-            to_list,
-            [(f"{date}_{ag}.xlsx", excel_file)]
-        )
+        send_email_gmail(subject, body, to_list, [(f"{date}_{ag}_AGENCE_IMPORT.xlsx", excel_ag)])
 
-    total = sum(len(v) for v in agency_records.values())
-    body_global = f"Résumé global {date}\n\nTOTAL: {total} fiches"
+    # Email global (stats agences)
+    lines = [f"Résumé global prospection — {date}", ""]
+    total_fiches = 0
+    for ag in cfg["agencies"].keys():
+        n = len(agency_records[ag])
+        total_fiches += n
+        cmd = sum(1 for r in agency_records[ag] if (r.get("commande") or "").strip())
+        lines.append(f"{ag}: {n} fiches, {cmd} commandes")
+    lines.append("")
+    lines.append(f"TOTAL GLOBAL: {total_fiches} fiches")
 
-    if any("exemple.com" in x for x in cfg["global_to"]):
+    subject_g = f"[PROSPECTION] GLOBAL — Résumé — {date}"
+    body_g = "\n".join(lines)
+    to_global = cfg["global_to"]
+
+    if any("exemple.com" in x for x in to_global):
         print("[SKIP EMAIL] global_to still example.com")
         return
 
-    send_email(
-        f"[PROSPECTION] GLOBAL — {date}",
-        body_global,
-        cfg["global_to"],
-        []
-    )
+    send_email_gmail(subject_g, body_g, to_global, [])
 
 if __name__ == "__main__":
     main()
