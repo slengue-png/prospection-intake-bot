@@ -3,19 +3,19 @@ worker_base_url: "https://prospection-intake-worker.slengue.workers.dev"
 agencies:
   GR:
     daily_to:
-      - "samuel.lengue@ras-interim.fr"
+      - "sam9999@free.fr"
 
   VR:
     daily_to:
-      - "samuel.lengue@ras-interim.fr"
+      - "sam9999@free.fr"
 
   GRS:
     daily_to:
-      - "samuel.lengue@ras-interim.fr"
+      - "sam9999@free.fr"
 
   SLS:
     daily_to:
-      - "samuel.lengue@ras-interim.fr"
+      - "sam9999@free.fr"
 
 global_to:
-  - "samuel.lengue@ras-interim.fr"
+  - "sam9999@free.fr"
