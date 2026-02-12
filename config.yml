@@ -2,12 +2,20 @@ worker_base_url: "https://prospection-intake-worker.slengue.workers.dev"
 
 agencies:
   GR:
-    daily_to: ["email_gr@exemple.com"]
-  VR:
-    daily_to: ["email_vr@exemple.com"]
-  GRS:
-    daily_to: ["email_grs@exemple.com"]
-  SLS:
-    daily_to: ["email_sls@exemple.com"]
+    daily_to:
+      - "samuel.lengue@ras-interim.fr"
 
-global_to: ["ton_email_global@exemple.com"]
+  VR:
+    daily_to:
+      - "samuel.lengue@ras-interim.fr"
+
+  GRS:
+    daily_to:
+      - "samuel.lengue@ras-interim.fr"
+
+  SLS:
+    daily_to:
+      - "samuel.lengue@ras-interim.fr"
+
+global_to:
+  - "samuel.lengue@ras-interim.fr"
