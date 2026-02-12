@@ -1,4 +1,4 @@
-worker_base_url: "https://TON-WORKER.workers.dev"
+worker_base_url: "https://prospection-intake-worker.prospection-intake-worker.slengue.workers.dev"
 timezone: "Europe/Paris"
 
 agencies:
