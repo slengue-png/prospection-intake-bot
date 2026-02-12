@@ -4,6 +4,7 @@ from email.message import EmailMessage
 from openpyxl import Workbook
 import yaml
 import urllib.request
+import urllib.error
 
 IMPORT_COLUMNS = [
     "NOM","ADRESSE","CODE POSTAL","VILLE","TELEPHONE","TELEPHONE 2","MAIL",
@@ -16,8 +17,18 @@ def load_config(path="config.yml"):
         return yaml.safe_load(f)
 
 def fetch_jsonl(url: str):
-    with urllib.request.urlopen(url, timeout=30) as resp:
-        raw = resp.read().decode("utf-8", errors="replace").strip()
+    print(f"[FETCH] {url}")
+    try:
+        with urllib.request.urlopen(url, timeout=30) as resp:
+            raw = resp.read().decode("utf-8", errors="replace").strip()
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTPError {e.code} on {url} -> {body[:300]}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"URLError on {url} -> {e.reason}")
+    except Exception as e:
+        raise RuntimeError(f"Fetch error on {url} -> {e}")
+
     if not raw:
         return []
     rows = []
@@ -82,9 +93,12 @@ def send_email(subject, body, to_list, attachments):
 
 def main():
     cfg = load_config("config.yml")
-    worker = cfg["worker_base_url"].rstrip("/")
-    token = os.environ["EXPORT_TOKEN"]
+    worker = (cfg["worker_base_url"] or "").strip().rstrip("/")
 
+    if not worker.startswith("https://"):
+        raise RuntimeError(f"config.yml worker_base_url must start with https:// (got: {worker})")
+
+    token = os.environ["EXPORT_TOKEN"]
     date = datetime.utcnow().strftime("%Y-%m-%d")
 
     prospects_url = f"{worker}/dump?token={token}&date={date}&kind=prospects"
@@ -101,6 +115,7 @@ def main():
         to_list = cfg["agencies"][ag]["daily_to"]
 
         if any("exemple.com" in x for x in to_list):
+            print(f"[SKIP EMAIL] {ag} daily_to still example.com")
             continue
 
         send_email(
@@ -113,13 +128,16 @@ def main():
     total = sum(len(v) for v in agency_records.values())
     body_global = f"Résumé global {date}\n\nTOTAL: {total} fiches"
 
-    if not any("exemple.com" in x for x in cfg["global_to"]):
-        send_email(
-            f"[PROSPECTION] GLOBAL — {date}",
-            body_global,
-            cfg["global_to"],
-            []
-        )
+    if any("exemple.com" in x for x in cfg["global_to"]):
+        print("[SKIP EMAIL] global_to still example.com")
+        return
+
+    send_email(
+        f"[PROSPECTION] GLOBAL — {date}",
+        body_global,
+        cfg["global_to"],
+        []
+    )
 
 if __name__ == "__main__":
     main()
