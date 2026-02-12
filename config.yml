@@ -1,0 +1,29 @@
+worker_base_url: "https://TON-WORKER.workers.dev"
+timezone: "Europe/Paris"
+
+agencies:
+  GR:
+    daily_to: ["email_gr@exemple.com"]
+    users:
+      JL: { telegram_user_id: 111111 }
+      CZ: { telegram_user_id: 222222 }
+      SL: { telegram_user_id: 333333 }
+  VR:
+    daily_to: ["email_vr@exemple.com"]
+    users:
+      JB: { telegram_user_id: 444444 }
+      LB: { telegram_user_id: 555555 }
+      SL: { telegram_user_id: 333333 }
+  GRS:
+    daily_to: ["email_grs@exemple.com"]
+    users:
+      PV: { telegram_user_id: 666666 }
+      ST: { telegram_user_id: 777777 }
+      SL: { telegram_user_id: 333333 }
+  SLS:
+    daily_to: ["email_sls@exemple.com"]
+    users:
+      AC: { telegram_user_id: 888888 }
+      SL: { telegram_user_id: 333333 }
+
+global_to: ["ton_email_global@exemple.com"]
