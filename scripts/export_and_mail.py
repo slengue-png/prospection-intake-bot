@@ -12,13 +12,28 @@ IMPORT_COLUMNS = [
     "RESUME ENTRETIEN","COMMANDE"
 ]
 
+BROWSER_HEADERS = {
+    # ⚠️ important : Cloudflare peut bloquer Python-urllib -> on mime Chrome
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Connection": "close",
+}
+
 def load_config(path="config.yml"):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 def fetch_jsonl(url: str, export_token: str) -> list[dict]:
     print(f"[FETCH] {url}")
+
     req = urllib.request.Request(url)
+
+    # ✅ headers anti-1010
+    for k, v in BROWSER_HEADERS.items():
+        req.add_header(k, v)
+
+    # ✅ auth header pour /dump
     req.add_header("X-Export-Token", export_token)
 
     try:
@@ -55,12 +70,12 @@ def build_excel(records: list[dict]) -> bytes:
     for r in records:
         ws.append([
             r.get("name",""),
-            "", "",  # adresse, code postal (complétés plus tard par ton outil)
+            "", "",  # ADRESSE, CODE POSTAL (complétés plus tard)
             r.get("city",""),
             r.get("phone",""),
-            "",      # téléphone 2
+            "",      # TELEPHONE 2
             r.get("email",""),
-            "", "", "",  # siret, naf, site web
+            "", "", "",  # SIRET, NAF, SITE WEB
             "", "", r.get("interlocuteur",""),
             r.get("resume",""),
             r.get("commande",""),
@@ -102,31 +117,31 @@ def main():
     export_token = os.environ["EXPORT_TOKEN"]
     date = os.environ.get("RUN_DATE") or datetime.utcnow().strftime("%Y-%m-%d")
 
-    # IMPORTANT: plus de token en querystring -> header seulement
     prospects_url = f"{worker}/dump?date={date}&kind=prospects"
     prospects = fetch_jsonl(prospects_url, export_token)
 
-    # Regroupement par agence
     agency_records = {ag: [] for ag in cfg["agencies"].keys()}
     for p in prospects:
         ag = p.get("agency","")
         if ag in agency_records:
             agency_records[ag].append(p)
 
-    # Envoi agences (si tu remplaces exemple.com par des vrais)
+    # Emails agences (si adresses réelles, sinon skip)
     for ag, recs in agency_records.items():
-        excel_ag = build_excel(recs)
-        subject = f"[PROSPECTION] {ag} — Export import — {date}"
-        body = f"Export prospection inconnus — agence {ag} — {date}\nFiches: {len(recs)}\n"
         to_list = cfg["agencies"][ag]["daily_to"]
-
         if any("exemple.com" in x for x in to_list):
             print(f"[SKIP EMAIL] {ag} daily_to still example.com")
             continue
 
-        send_email_gmail(subject, body, to_list, [(f"{date}_{ag}_AGENCE_IMPORT.xlsx", excel_ag)])
+        excel_ag = build_excel(recs)
+        send_email_gmail(
+            f"[PROSPECTION] {ag} — Export import — {date}",
+            f"Export prospection inconnus — agence {ag} — {date}\nFiches: {len(recs)}\n",
+            to_list,
+            [(f"{date}_{ag}_AGENCE_IMPORT.xlsx", excel_ag)]
+        )
 
-    # Email global (stats agences)
+    # Email global (stats)
     lines = [f"Résumé global prospection — {date}", ""]
     total_fiches = 0
     for ag in cfg["agencies"].keys():
@@ -137,15 +152,17 @@ def main():
     lines.append("")
     lines.append(f"TOTAL GLOBAL: {total_fiches} fiches")
 
-    subject_g = f"[PROSPECTION] GLOBAL — Résumé — {date}"
-    body_g = "\n".join(lines)
     to_global = cfg["global_to"]
-
     if any("exemple.com" in x for x in to_global):
         print("[SKIP EMAIL] global_to still example.com")
         return
 
-    send_email_gmail(subject_g, body_g, to_global, [])
+    send_email_gmail(
+        f"[PROSPECTION] GLOBAL — Résumé — {date}",
+        "\n".join(lines),
+        to_global,
+        []
+    )
 
 if __name__ == "__main__":
     main()
