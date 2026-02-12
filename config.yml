@@ -1,13 +1,18 @@
+worker_base_url: "https://prospection-intake-worker.slengue.workers.dev"
+
 agencies:
   GR:
     daily_to:
       - "s.lengue@gmail.com"
+
   VR:
     daily_to:
       - "s.lengue@gmail.com"
+
   GRS:
     daily_to:
       - "s.lengue@gmail.com"
+
   SLS:
     daily_to:
       - "s.lengue@gmail.com"
