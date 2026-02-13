@@ -2,8 +2,8 @@ name: Prospection — Export & Mail
 
 on:
   schedule:
-    - cron: "30 11 * * *"  # ~12:30 FR (selon heure GitHub)
-    - cron: "0 16 * * *"   # ~17:00 FR (selon heure GitHub)
+    - cron: "30 11 * * *"
+    - cron: "0 16 * * *"
   workflow_dispatch:
 
 jobs:
@@ -19,10 +19,10 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
-      - name: Export & mail (Brevo API)
+      - name: Export & mail
         env:
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
-          # optionnel : forcer une date si besoin (sinon prend aujourd'hui UTC)
-          # RUN_DATE: "2026-02-12"
+          BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
         run: python scripts/export_and_mail.py
