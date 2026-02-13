@@ -15,28 +15,16 @@ IMPORT_COLUMNS = [
 ]
 
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0",
     "Accept": "*/*",
-    "Accept-Language": "fr-FR,fr;q=0.9",
     "Connection": "close",
 }
-
-BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
-
 
 def load_config():
     with open("config.yml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-
 def normalize_emails(x):
-    """
-    Accepte:
-      - liste ["a@b.com", ...]
-      - string "a@b.com"
-      - string "a@b.com,b@c.com"
-    Retourne une liste nettoyée.
-    """
     if x is None:
         return []
     if isinstance(x, list):
@@ -45,46 +33,23 @@ def normalize_emails(x):
         raw = [p.strip() for p in x.split(",")]
     else:
         raw = []
-    out = []
-    for e in raw:
-        e = (e or "").strip()
-        if e:
-            out.append(e)
-    return out
-
+    return [e.strip() for e in raw if e.strip()]
 
 def fetch_jsonl(url, export_token):
     print(f"[FETCH] {url}")
-    print(f"[DEBUG] EXPORT_TOKEN present? {'YES' if export_token else 'NO'}")
 
     req = urllib.request.Request(url)
     for k, v in BROWSER_HEADERS.items():
         req.add_header(k, v)
     req.add_header("X-Export-Token", export_token)
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8", errors="replace").strip()
-            print("[HTTP]", resp.status)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        print("[HTTPERROR] code=", e.code)
-        print("[HTTPERROR_BODY_300]", body[:300])
-        raise
-    except Exception as e:
-        print("[FETCH_ERROR]", e)
-        raise
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        raw = resp.read().decode("utf-8", errors="replace").strip()
+        print("[HTTP]", resp.status)
 
     if not raw:
         return []
-    rows = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        rows.append(json.loads(line))
-    return rows
-
+    return [json.loads(line) for line in raw.splitlines() if line.strip()]
 
 def build_excel(records):
     wb = Workbook()
@@ -106,7 +71,7 @@ def build_excel(records):
             r.get("website",""),
             r.get("contact_civility",""),
             r.get("contact_firstname",""),
-            r.get("contact_lastname","") or r.get("interlocuteur",""),
+            r.get("contact_lastname",""),
             r.get("resume",""),
             r.get("commande",""),
         ])
@@ -115,20 +80,16 @@ def build_excel(records):
     wb.save(bio)
     return bio.getvalue()
 
-
 def send_email_brevo(subject, body, to_list, attachments):
-    api_key = os.environ.get("BREVO_API_KEY", "").strip()
+    api_key = os.environ.get("BREVO_API_KEY", "")
     if not api_key:
-        raise RuntimeError("BREVO_API_KEY missing in GitHub Secrets")
-
-    sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
-    if not sender_email:
-        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets (ex: prospection@pilopro.fr)")
+        raise RuntimeError("BREVO_API_KEY missing")
 
     to_list = normalize_emails(to_list)
     if not to_list:
-        print(f"[BREVO][SKIP] no recipients for subject: {subject}")
         return
+
+    sender_email = os.environ.get("BREVO_SENDER_EMAIL")
 
     payload = {
         "sender": {"email": sender_email, "name": "Prospection Bot"},
@@ -142,79 +103,84 @@ def send_email_brevo(subject, body, to_list, attachments):
         for filename, content_bytes in attachments:
             payload["attachment"].append({
                 "name": filename,
-                "content": base64.b64encode(content_bytes).decode("utf-8"),
+                "content": base64.b64encode(content_bytes).decode("utf-8")
             })
 
     data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(BREVO_API_URL, data=data, method="POST")
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=data,
+        method="POST"
+    )
     req.add_header("Content-Type", "application/json")
     req.add_header("api-key", api_key)
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            _ = resp.read()
-            print("[BREVO] status:", resp.status, "| to:", ",".join(to_list), "| subject:", subject)
-    except urllib.error.HTTPError as e:
-        err = e.read().decode("utf-8", errors="replace")
-        print("[BREVO][HTTPERROR]", e.code, err[:600].replace("\n", " "))
-        raise
-
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        print("[BREVO] status:", resp.status)
 
 def main():
     cfg = load_config()
-    worker = (cfg.get("worker_base_url") or "").strip().rstrip("/")
-    if not worker.startswith("https://"):
-        raise RuntimeError(f"config.yml worker_base_url must start with https:// (got: {worker})")
-
-    export_token = os.environ.get("EXPORT_TOKEN", "").strip()
-    if not export_token:
-        raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
-
+    worker = cfg["worker_base_url"].rstrip("/")
+    export_token = os.environ.get("EXPORT_TOKEN", "")
     date = os.environ.get("RUN_DATE") or datetime.utcnow().strftime("%Y-%m-%d")
 
     url = f"{worker}/dump?date={date}&kind=prospects"
     prospects = fetch_jsonl(url, export_token)
     print("[OK] prospects rows=", len(prospects))
 
-    agencies_cfg = cfg.get("agencies", {})
-    agency_records = {ag: [] for ag in agencies_cfg.keys()}
-
+    agency_records = {ag: [] for ag in cfg.get("agencies", {}).keys()}
     for p in prospects:
         ag = p.get("agency","")
         if ag in agency_records:
             agency_records[ag].append(p)
 
-    # Emails agences
+    # 📩 Emails agences (avec Excel)
     for ag, recs in agency_records.items():
-        to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
+        to_list = cfg["agencies"][ag].get("daily_to", [])
         excel = build_excel(recs)
         send_email_brevo(
             f"[PROSPECTION] {ag} — {date}",
             f"Export agence {ag}\nFiches: {len(recs)}",
             to_list,
-            [(f"{date}_{ag}.xlsx", excel)],
+            [(f"{date}_{ag}.xlsx", excel)]
         )
 
-    # Email global (toi uniquement)
-    lines = [f"Résumé global {date}", ""]
-    total = 0
-    for ag in agency_records:
-        n = len(agency_records[ag])
-        total += n
-        cmd = sum(1 for r in agency_records[ag] if (r.get("commande") or "").strip())
-        lines.append(f"{ag}: {n} fiches / {cmd} commandes")
+    # 📊 Email GLOBAL détaillé
+    lines = []
+    lines.append(f"RÉSUMÉ GLOBAL — {date}")
     lines.append("")
-    lines.append(f"TOTAL: {total} fiches")
+
+    total_prospects = 0
+    total_clients = 0
+    total_commandes = 0
+
+    for ag, recs in agency_records.items():
+        prospects_count = len(recs)
+        clients_count = sum(1 for r in recs if r.get("siret","").strip())
+        commandes_count = sum(1 for r in recs if (r.get("commande") or "").strip())
+
+        total_prospects += prospects_count
+        total_clients += clients_count
+        total_commandes += commandes_count
+
+        lines.append(f"{ag}")
+        lines.append(f"  Prospects : {prospects_count}")
+        lines.append(f"  Clients   : {clients_count}")
+        lines.append(f"  Commandes : {commandes_count}")
+        lines.append("")
+
+    lines.append("TOTAL GLOBAL")
+    lines.append(f"  Prospects : {total_prospects}")
+    lines.append(f"  Clients   : {total_clients}")
+    lines.append(f"  Commandes : {total_commandes}")
 
     global_to = cfg.get("global_to", [])
     send_email_brevo(
         f"[PROSPECTION] GLOBAL — {date}",
         "\n".join(lines),
         global_to,
-        [],
+        []
     )
-
 
 if __name__ == "__main__":
     main()
