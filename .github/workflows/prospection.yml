@@ -20,9 +20,8 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Export & mail
-        env:
-          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
-          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
-          BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
-          BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
-        run: python scripts/export_and_mail.py
+  env:
+    EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+    BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+    BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+  run: python scripts/export_and_mail.py
