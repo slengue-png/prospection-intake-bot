@@ -10,10 +10,13 @@ on:
       run_date:
         description: "Date YYYY-MM-DD (optionnel)"
         required: false
+        default: ""
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # ✅ indispensable pour git push (commit auto)
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -33,3 +36,11 @@ jobs:
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
           RUN_DATE: ${{ github.event.inputs.run_date }}
         run: python scripts/export_and_mail.py
+
+      - name: Commit monthly cumul
+        run: |
+          git config user.name "prospection-bot"
+          git config user.email "bot@pilopro.fr"
+          git add reports/
+          git commit -m "Update monthly cumul [auto]" || echo "No changes"
+          git push
