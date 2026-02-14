@@ -4,15 +4,18 @@ agencies:
   GR:
     daily_to:
       - "samuel.lengue@ras-interim.fr"
+
   VR:
     daily_to:
-      - "s.lengue@gmail.com"
+      - "samuel.lengue@ras-interim.fr"
+
   GRS:
     daily_to:
       - "samuel.lengue@ras-interim.fr"
+
   SLS:
     daily_to:
-      - "sam9999@free.fr"
+      - "samuel.lengue@ras-interim.fr"
 
 global_to:
   - "samuel.lengue@ras-interim.fr"
