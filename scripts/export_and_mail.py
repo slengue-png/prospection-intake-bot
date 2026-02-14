@@ -39,7 +39,6 @@ def fetch_jsonl(url, export_token):
     req = urllib.request.Request(url)
     for k, v in BROWSER_HEADERS.items():
         req.add_header(k, v)
-    # token via query already, but keep header (harmless)
     req.add_header("X-Export-Token", export_token)
 
     try:
@@ -91,11 +90,6 @@ def build_import_excel(records):
 
 
 def build_monthly_excel(month, prospect_rows, stats_rows):
-    """
-    Excel 'mensuel cumulé' (pour toi uniquement) :
-    - onglet PROSPECTS (toutes entrées du mois)
-    - onglet STATS (compteurs session)
-    """
     wb = Workbook()
     ws1 = wb.active
     ws1.title = "PROSPECTS"
@@ -134,6 +128,12 @@ def build_monthly_excel(month, prospect_rows, stats_rows):
     return bio.getvalue()
 
 
+def pct(n, d):
+    if d <= 0:
+        return "—"
+    return f"{(100.0 * n / d):.0f}%"
+
+
 def send_email_brevo(subject, body, to_list, attachments):
     api_key = os.environ.get("BREVO_API_KEY", "").strip()
     if not api_key:
@@ -169,7 +169,6 @@ def send_email_brevo(subject, body, to_list, attachments):
 
     with urllib.request.urlopen(req, timeout=45) as resp:
         _ = resp.read()
-        # status 201 expected
 
 
 def main():
@@ -181,13 +180,11 @@ def main():
 
     date = os.environ.get("RUN_DATE") or datetime.utcnow().strftime("%Y-%m-%d")
     month = date[:7]
-    token_q = export_token  # token in query param for worker
+    token_q = export_token
 
-    # --- day dumps ---
     prospects_day = fetch_jsonl(f"{worker}/dump?token={token_q}&date={date}&kind=prospects", export_token)
     stats_day = fetch_jsonl(f"{worker}/dump?token={token_q}&date={date}&kind=stats", export_token)
 
-    # --- month dumps (for cumulative) ---
     prospects_month = fetch_jsonl(f"{worker}/dump_month?token={token_q}&month={month}&kind=prospects", export_token)
     stats_month = fetch_jsonl(f"{worker}/dump_month?token={token_q}&month={month}&kind=stats", export_token)
 
@@ -198,7 +195,7 @@ def main():
         if ag in agency_prospects:
             agency_prospects[ag].append(p)
 
-    # --- EMAIL AGENCES : import excel (prospects only) ---
+    # Emails agences (Excel import)
     for ag, recs in agency_prospects.items():
         to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
         excel = build_import_excel(recs)
@@ -209,8 +206,7 @@ def main():
             attachments=[(f"{date}_{ag}.xlsx", excel)],
         )
 
-    # --- PERFORMANCE (stats session) ---
-    # Aggregations per agency & per user
+    # Perf aggregations
     perf_ag = {ag: {"prospects": 0, "clients": 0, "commandes": 0} for ag in agencies_cfg.keys()}
     perf_user = {}  # (ag,user_id) -> counts
 
@@ -219,6 +215,7 @@ def main():
         uid = str(s.get("user_id",""))
         if ag not in perf_ag:
             continue
+
         p = int(s.get("prospects", 0))
         c = int(s.get("clients", 0))
         k = int(s.get("commandes", 0))
@@ -234,17 +231,21 @@ def main():
         perf_user[key]["clients"] += c
         perf_user[key]["commandes"] += k
 
-    # Rankings (by commandes, then clients, then prospects)
+    # Rankings: primary commandes, then tx, then clients, then prospects
     def rank_items_for_ag(ag):
         items = []
         for (a, uid), v in perf_user.items():
             if a != ag:
                 continue
-            items.append((uid, v["prospects"], v["clients"], v["commandes"]))
-        items.sort(key=lambda x: (x[3], x[2], x[1]), reverse=True)
+            p = v["prospects"]
+            c = v["clients"]
+            k = v["commandes"]
+            tx = (k / p) if p > 0 else 0.0
+            items.append((uid, p, c, k, tx))
+        items.sort(key=lambda x: (x[3], x[4], x[2], x[1]), reverse=True)
         return items
 
-    # --- GLOBAL mail to you only (with monthly cumulative attachment) ---
+    # Global email (toi uniquement) + monthly cumulative attachment
     lines = []
     lines.append(f"RÉSUMÉ GLOBAL — {date}")
     lines.append("")
@@ -258,17 +259,18 @@ def main():
         total_c += ac
         total_k += ak
 
-        lines.append(f"{ag} — Prospects: {ap} | Clients: {ac} | Commandes: {ak}")
-        top = rank_items_for_ag(ag)[:5]
+        lines.append(f"{ag} — Prospects: {ap} | Clients: {ac} | Commandes: {ak} | Tx: {pct(ak, ap)}")
+
+        top = rank_items_for_ag(ag)[:10]
         if top:
-            lines.append("  Classement (Top 5) :")
-            for i, (uid, p, c, k) in enumerate(top, start=1):
-                lines.append(f"   {i}. user_id {uid} — Cmd {k} | Clients {c} | Prospects {p}")
+            lines.append("  Classement (Top 10) :")
+            for i, (uid, p, c, k, tx) in enumerate(top, start=1):
+                lines.append(f"   {i}. user_id {uid} — Cmd {k} | Tx {pct(k,p)} | Clients {c} | Prospects {p}")
         lines.append("")
 
-    lines.append(f"TOTAL — Prospects: {total_p} | Clients: {total_c} | Commandes: {total_k}")
+    lines.append(f"TOTAL — Prospects: {total_p} | Clients: {total_c} | Commandes: {total_k} | Tx: {pct(total_k, total_p)}")
     lines.append("")
-    lines.append("Note: le classement est basé sur les COMPTEURS SESSION (bouton 🧾).")
+    lines.append("Note: le taux et le classement sont basés sur les COMPTEURS SESSION (bouton 🧾).")
 
     monthly_xlsx = build_monthly_excel(month, prospects_month, stats_month)
 
