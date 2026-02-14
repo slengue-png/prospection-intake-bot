@@ -3,19 +3,16 @@ worker_base_url: "https://prospection-intake-worker.slengue.workers.dev"
 agencies:
   GR:
     daily_to:
-      - "jennifer.laurens@ras-interim.fr"
-
+      - "samuel.lengue@ras-interim.fr"
   VR:
     daily_to:
-      - "jelena.carrasso@ras-interim.fr"
-
+      - "s.lengue@gmail.com"
   GRS:
     daily_to:
-      - "pauline.vieira@ras-interim.fr"
-
+      - "samuel.lengue@ras-interim.fr"
   SLS:
     daily_to:
-      - "aurelie.curt@ras-interim.fr"
+      - "sam9999@free.fr"
 
 global_to:
   - "samuel.lengue@ras-interim.fr"
