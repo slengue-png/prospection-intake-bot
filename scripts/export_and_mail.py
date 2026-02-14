@@ -1,4 +1,9 @@
-import os, io, json, base64, urllib.request, urllib.error
+import os
+import io
+import json
+import base64
+import urllib.request
+import urllib.error
 from datetime import datetime
 from openpyxl import Workbook
 import yaml
@@ -10,18 +15,15 @@ IMPORT_COLUMNS = [
 ]
 
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "*/*",
+    "Accept-Language": "fr-FR,fr;q=0.9",
     "Connection": "close",
 }
-
-BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
-
 
 def load_config():
     with open("config.yml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
-
 
 def normalize_emails(x):
     if x is None:
@@ -32,10 +34,15 @@ def normalize_emails(x):
         raw = [p.strip() for p in x.split(",")]
     else:
         raw = []
-    return [e.strip() for e in raw if e.strip()]
-
+    out = []
+    for e in raw:
+        e = (e or "").strip()
+        if e:
+            out.append(e)
+    return out
 
 def fetch_jsonl(url, export_token):
+    print(f"[FETCH] {url}")
     req = urllib.request.Request(url)
     for k, v in BROWSER_HEADERS.items():
         req.add_header(k, v)
@@ -44,9 +51,12 @@ def fetch_jsonl(url, export_token):
     try:
         with urllib.request.urlopen(req, timeout=45) as resp:
             raw = resp.read().decode("utf-8", errors="replace").strip()
+            print("[HTTP]", resp.status)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"HTTPError {e.code} on {url} -> {body[:300]}")
+    except Exception as e:
+        raise RuntimeError(f"Fetch error on {url} -> {e}")
 
     if not raw:
         return []
@@ -55,11 +65,13 @@ def fetch_jsonl(url, export_token):
         line = line.strip()
         if not line:
             continue
-        rows.append(json.loads(line))
+        try:
+            rows.append(json.loads(line))
+        except:
+            pass
     return rows
 
-
-def build_import_excel(records):
+def build_excel_import(records):
     wb = Workbook()
     ws = wb.active
     ws.title = "IMPORT"
@@ -79,7 +91,7 @@ def build_import_excel(records):
             r.get("website",""),
             r.get("contact_civility",""),
             r.get("contact_firstname",""),
-            r.get("contact_lastname","") or "",
+            r.get("contact_lastname","") or r.get("interlocuteur",""),
             r.get("resume",""),
             r.get("commande",""),
         ])
@@ -87,65 +99,20 @@ def build_import_excel(records):
     bio = io.BytesIO()
     wb.save(bio)
     return bio.getvalue()
-
-
-def build_monthly_excel(month, prospect_rows, stats_rows):
-    wb = Workbook()
-    ws1 = wb.active
-    ws1.title = "PROSPECTS"
-    ws1.append(["date","agency","user_id","name","city","phone","email","resume","commande","photo_file_id"])
-
-    for r in prospect_rows:
-        ws1.append([
-            r.get("date",""),
-            r.get("agency",""),
-            str(r.get("user_id","")),
-            r.get("name",""),
-            r.get("city",""),
-            r.get("phone",""),
-            r.get("email",""),
-            r.get("resume",""),
-            r.get("commande",""),
-            r.get("card_photo_file_id",""),
-        ])
-
-    ws2 = wb.create_sheet("STATS")
-    ws2.append(["date","slot","agency","user_id","prospects","clients","commandes"])
-
-    for r in stats_rows:
-        ws2.append([
-            r.get("date",""),
-            r.get("slot",""),
-            r.get("agency",""),
-            str(r.get("user_id","")),
-            int(r.get("prospects",0)),
-            int(r.get("clients",0)),
-            int(r.get("commandes",0)),
-        ])
-
-    bio = io.BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
-
-
-def pct(n, d):
-    if d <= 0:
-        return "—"
-    return f"{(100.0 * n / d):.0f}%"
-
 
 def send_email_brevo(subject, body, to_list, attachments):
     api_key = os.environ.get("BREVO_API_KEY", "").strip()
     if not api_key:
-        raise RuntimeError("BREVO_API_KEY missing")
-
-    sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
-    if not sender_email:
-        raise RuntimeError("BREVO_SENDER_EMAIL missing")
+        raise RuntimeError("BREVO_API_KEY missing in GitHub Secrets")
 
     to_list = normalize_emails(to_list)
     if not to_list:
+        print(f"[BREVO][SKIP] no recipients for subject: {subject}")
         return
+
+    sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
+    if not sender_email:
+        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets (must be verified in Brevo)")
 
     payload = {
         "sender": {"email": sender_email, "name": "Prospection Bot"},
@@ -159,128 +126,118 @@ def send_email_brevo(subject, body, to_list, attachments):
         for filename, content_bytes in attachments:
             payload["attachment"].append({
                 "name": filename,
-                "content": base64.b64encode(content_bytes).decode("utf-8"),
+                "content": base64.b64encode(content_bytes).decode("utf-8")
             })
 
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(BREVO_API_URL, data=data, method="POST")
+    req = urllib.request.Request("https://api.brevo.com/v3/smtp/email", data=data, method="POST")
     req.add_header("Content-Type", "application/json")
     req.add_header("api-key", api_key)
 
     with urllib.request.urlopen(req, timeout=45) as resp:
+        print("[BREVO] status:", resp.status, "| to:", ",".join(to_list), "| subject:", subject)
         _ = resp.read()
 
+def pct_1dec(num, den):
+    if den <= 0:
+        return "0,0%"
+    return f"{(num/den)*100:.1f}%".replace(".", ",")
 
 def main():
     cfg = load_config()
-    worker = (cfg.get("worker_base_url") or "").strip().rstrip("/")
+
+    worker = (cfg.get("worker_base_url","") or "").strip().rstrip("/")
+    if not worker.startswith("https://"):
+        raise RuntimeError("config.yml: worker_base_url must start with https://")
+
     export_token = os.environ.get("EXPORT_TOKEN", "").strip()
     if not export_token:
-        raise RuntimeError("EXPORT_TOKEN missing")
+        raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
 
-    date = os.environ.get("RUN_DATE") or datetime.utcnow().strftime("%Y-%m-%d")
-    month = date[:7]
-    token_q = export_token
+    date = (os.environ.get("RUN_DATE") or "").strip()
+    if not date:
+        date = datetime.utcnow().strftime("%Y-%m-%d")
 
-    prospects_day = fetch_jsonl(f"{worker}/dump?token={token_q}&date={date}&kind=prospects", export_token)
-    stats_day = fetch_jsonl(f"{worker}/dump?token={token_q}&date={date}&kind=stats", export_token)
+    # ---- fetch prospects + stats
+    prospects = fetch_jsonl(f"{worker}/dump?date={date}&kind=prospects", export_token)
+    stats = fetch_jsonl(f"{worker}/dump?date={date}&kind=stats", export_token)
+    print("[OK] prospects rows=", len(prospects))
+    print("[OK] stats rows=", len(stats))
 
-    prospects_month = fetch_jsonl(f"{worker}/dump_month?token={token_q}&month={month}&kind=prospects", export_token)
-    stats_month = fetch_jsonl(f"{worker}/dump_month?token={token_q}&month={month}&kind=stats", export_token)
+    agencies = cfg.get("agencies", {})
+    agency_records = {ag: [] for ag in agencies.keys()}
+    for p in prospects:
+        ag = (p.get("agency","") or "").upper()
+        if ag in agency_records:
+            agency_records[ag].append(p)
 
-    agencies_cfg = cfg.get("agencies", {})
-    agency_prospects = {ag: [] for ag in agencies_cfg.keys()}
-    for p in prospects_day:
-        ag = p.get("agency","")
-        if ag in agency_prospects:
-            agency_prospects[ag].append(p)
+    # stats by agency + by initials
+    # We aggregate session_totals only
+    stats_ag = {ag: {"prospects":0, "clients":0, "commandes":0, "by_ini":{}} for ag in agencies.keys()}
+    for s in stats:
+        if s.get("type") != "session_totals":
+            continue
+        ag = (s.get("agency","") or "").upper()
+        ini = (s.get("initials","") or "").upper() or "??"
+        if ag not in stats_ag:
+            continue
+        stats_ag[ag]["prospects"] += int(s.get("total_prospects",0) or 0)
+        stats_ag[ag]["clients"] += int(s.get("total_clients",0) or 0)
+        stats_ag[ag]["commandes"] += int(s.get("total_commandes",0) or 0)
+        if ini not in stats_ag[ag]["by_ini"]:
+            stats_ag[ag]["by_ini"][ini] = {"prospects":0, "clients":0, "commandes":0}
+        stats_ag[ag]["by_ini"][ini]["prospects"] += int(s.get("total_prospects",0) or 0)
+        stats_ag[ag]["by_ini"][ini]["clients"] += int(s.get("total_clients",0) or 0)
+        stats_ag[ag]["by_ini"][ini]["commandes"] += int(s.get("total_commandes",0) or 0)
 
-    # Emails agences (Excel import)
-    for ag, recs in agency_prospects.items():
-        to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
-        excel = build_import_excel(recs)
-        send_email_brevo(
-            subject=f"[PROSPECTION] {ag} — {date}",
-            body=f"Export import agence {ag}\nFiches: {len(recs)}",
-            to_list=to_list,
-            attachments=[(f"{date}_{ag}.xlsx", excel)],
+    # ---- Emails agences (Excel import)
+    for ag, recs in agency_records.items():
+        to_list = agencies[ag].get("daily_to", [])
+        excel = build_excel_import(recs)
+
+        # corps simple
+        cmd_count = sum(1 for r in recs if (r.get("commande") or "").strip())
+        body = (
+            f"Export prospection inconnus — agence {ag} — {date}\n"
+            f"Fiches: {len(recs)}\n"
+            f"Commandes (dans fiches): {cmd_count}\n"
         )
 
-    # Perf aggregations
-    perf_ag = {ag: {"prospects": 0, "clients": 0, "commandes": 0} for ag in agencies_cfg.keys()}
-    perf_user = {}  # (ag,user_id) -> counts
+        send_email_brevo(
+            f"[PROSPECTION] {ag} — Export import — {date}",
+            body,
+            to_list,
+            [(f"{date}_{ag}_IMPORT.xlsx", excel)]
+        )
 
-    for s in stats_day:
-        ag = s.get("agency","")
-        uid = str(s.get("user_id",""))
-        if ag not in perf_ag:
-            continue
+    # ---- Email global (toi uniquement) : prospects + clients + commandes + taux transfo par commercial
+    global_to = cfg.get("global_to", [])
+    lines = [f"Résumé global prospection — {date}", ""]
 
-        p = int(s.get("prospects", 0))
-        c = int(s.get("clients", 0))
-        k = int(s.get("commandes", 0))
+    for ag in agencies.keys():
+        agP = stats_ag[ag]["prospects"]
+        agC = stats_ag[ag]["clients"]
+        agK = stats_ag[ag]["commandes"]
+        lines.append(f"{ag}: Prospects {agP} | Clients {agC} | Commandes {agK} | Tx {pct_1dec(agK, agP)}")
 
-        perf_ag[ag]["prospects"] += p
-        perf_ag[ag]["clients"] += c
-        perf_ag[ag]["commandes"] += k
+        by_ini = stats_ag[ag]["by_ini"]
+        if by_ini:
+            for ini in sorted(by_ini.keys()):
+                p = by_ini[ini]["prospects"]
+                c = by_ini[ini]["clients"]
+                k = by_ini[ini]["commandes"]
+                lines.append(f"  - {ini}: Prospects {p} | Clients {c} | Commandes {k} | Tx {pct_1dec(k,p)}")
+        else:
+            lines.append("  - (pas de totaux session saisis)")
 
-        key = (ag, uid)
-        if key not in perf_user:
-            perf_user[key] = {"prospects": 0, "clients": 0, "commandes": 0}
-        perf_user[key]["prospects"] += p
-        perf_user[key]["clients"] += c
-        perf_user[key]["commandes"] += k
-
-    # Rankings: primary commandes, then tx, then clients, then prospects
-    def rank_items_for_ag(ag):
-        items = []
-        for (a, uid), v in perf_user.items():
-            if a != ag:
-                continue
-            p = v["prospects"]
-            c = v["clients"]
-            k = v["commandes"]
-            tx = (k / p) if p > 0 else 0.0
-            items.append((uid, p, c, k, tx))
-        items.sort(key=lambda x: (x[3], x[4], x[2], x[1]), reverse=True)
-        return items
-
-    # Global email (toi uniquement) + monthly cumulative attachment
-    lines = []
-    lines.append(f"RÉSUMÉ GLOBAL — {date}")
-    lines.append("")
-    total_p = total_c = total_k = 0
-
-    for ag in agencies_cfg.keys():
-        ap = perf_ag[ag]["prospects"]
-        ac = perf_ag[ag]["clients"]
-        ak = perf_ag[ag]["commandes"]
-        total_p += ap
-        total_c += ac
-        total_k += ak
-
-        lines.append(f"{ag} — Prospects: {ap} | Clients: {ac} | Commandes: {ak} | Tx: {pct(ak, ap)}")
-
-        top = rank_items_for_ag(ag)[:10]
-        if top:
-            lines.append("  Classement (Top 10) :")
-            for i, (uid, p, c, k, tx) in enumerate(top, start=1):
-                lines.append(f"   {i}. user_id {uid} — Cmd {k} | Tx {pct(k,p)} | Clients {c} | Prospects {p}")
         lines.append("")
 
-    lines.append(f"TOTAL — Prospects: {total_p} | Clients: {total_c} | Commandes: {total_k} | Tx: {pct(total_k, total_p)}")
-    lines.append("")
-    lines.append("Note: le taux et le classement sont basés sur les COMPTEURS SESSION (bouton 🧾).")
-
-    monthly_xlsx = build_monthly_excel(month, prospects_month, stats_month)
-
     send_email_brevo(
-        subject=f"[PROSPECTION] GLOBAL — {date}",
-        body="\n".join(lines),
-        to_list=cfg.get("global_to", []),
-        attachments=[(f"{month}_CUMUL_PROSPECTION.xlsx", monthly_xlsx)],
+        f"[PROSPECTION] GLOBAL — {date}",
+        "\n".join(lines),
+        global_to,
+        []
     )
-
 
 if __name__ == "__main__":
     main()
