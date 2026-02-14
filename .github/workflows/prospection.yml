@@ -33,4 +33,3 @@ jobs:
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
           RUN_DATE: ${{ github.event.inputs.run_date }}
-        run: python scripts/export_and_mail.py
