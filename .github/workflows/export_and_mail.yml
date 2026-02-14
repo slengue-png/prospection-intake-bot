@@ -1,0 +1,36 @@
+name: Prospection — Export & Mail
+
+on:
+  schedule:
+    # GitHub Actions = UTC
+    - cron: "30 11 * * *"  # ~12:30 FR (hiver)
+    - cron: "0 16 * * *"   # ~17:00 FR (hiver)
+  workflow_dispatch:
+    inputs:
+      run_date:
+        description: "Date YYYY-MM-DD (vide = aujourd'hui UTC)"
+        required: false
+        default: ""
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Export & mail
+        env:
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          RUN_DATE: ${{ github.event.inputs.run_date }}
+        run: python scripts/export_and_mail.py
