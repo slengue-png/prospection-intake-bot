@@ -3,14 +3,13 @@ name: Prospection — Export & Mail
 on:
   schedule:
     # GitHub Actions = UTC
-    - cron: "30 11 * * *"  # ~12:30 FR (hiver)
-    - cron: "0 16 * * *"   # ~17:00 FR (hiver)
+    - cron: "30 11 * * *"  # 12:30 FR (hiver)
+    - cron: "0 16 * * *"   # 17:00 FR (hiver)
   workflow_dispatch:
     inputs:
       run_date:
-        description: "Date YYYY-MM-DD (vide = aujourd'hui UTC)"
+        description: "Date YYYY-MM-DD (optionnel)"
         required: false
-        default: ""
 
 jobs:
   run:
