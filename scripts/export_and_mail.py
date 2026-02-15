@@ -11,6 +11,7 @@ import yaml
 IMPORT_COLUMNS = [
     "NOM","ADRESSE","CODE POSTAL","VILLE","TELEPHONE","TELEPHONE 2","MAIL",
     "SIRET","NAF","SITE WEB","Contact: civilité","Contact : prénom","Contact : nom",
+    "DIRIGEANT",  # ✅ nouvelle colonne
     "RESUME ENTRETIEN","COMMANDE"
 ]
 
@@ -26,6 +27,13 @@ def load_config():
         return yaml.safe_load(f)
 
 def normalize_emails(x):
+    """
+    Accepte:
+      - liste ["a@b.com", ...]
+      - string "a@b.com"
+      - string "a@b.com,b@c.com"
+    Retourne une liste nettoyée.
+    """
     if x is None:
         return []
     if isinstance(x, list):
@@ -37,22 +45,18 @@ def normalize_emails(x):
     out = []
     for e in raw:
         e = (e or "").strip()
-        if e:
-            out.append(e)
+        if not e:
+            continue
+        out.append(e)
     return out
 
 def fetch_jsonl(url, export_token):
-    if not export_token:
-        raise RuntimeError("EXPORT_TOKEN is empty (GitHub Secret missing or not passed)")
-
     print(f"[FETCH] {url}")
-    print(f"[DEBUG] EXPORT_TOKEN length={len(export_token)}")
+    print(f"[DEBUG] EXPORT_TOKEN present? {'YES' if export_token else 'NO'}")
 
     req = urllib.request.Request(url)
     for k, v in BROWSER_HEADERS.items():
         req.add_header(k, v)
-
-    # ✅ Le header attendu par le Worker
     req.add_header("X-Export-Token", export_token)
 
     try:
@@ -61,24 +65,11 @@ def fetch_jsonl(url, export_token):
             print("[HTTP]", resp.status)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        print(f"[HTTPERROR] code={e.code}")
-        print(f"[HTTPERROR_BODY_300] {body[:300].replace(chr(10), ' ')}")
-        raise
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"URLError on {url} -> {e.reason}")
+        raise RuntimeError(f"HTTPError {e.code} on {url} -> {body[:300]}")
 
     if not raw:
         return []
-    rows = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except:
-            pass
-    return rows
+    return [json.loads(line) for line in raw.splitlines() if line.strip()]
 
 def build_excel(records):
     wb = Workbook()
@@ -87,6 +78,9 @@ def build_excel(records):
     ws.append(IMPORT_COLUMNS)
 
     for r in records:
+        # ✅ logique demandée :
+        # - si interlocuteur saisi -> on garde l’interlocuteur, dirigeant va dans la colonne DIRIGEANT
+        # - si pas d’interlocuteur -> Worker a déjà mis le dirigeant dans interlocuteur ET dirigeant
         ws.append([
             r.get("name",""),
             r.get("address",""),
@@ -100,7 +94,8 @@ def build_excel(records):
             r.get("website",""),
             r.get("contact_civility",""),
             r.get("contact_firstname",""),
-            r.get("contact_lastname","") or r.get("interlocuteur",""),
+            r.get("interlocuteur","") or r.get("contact_lastname",""),
+            r.get("dirigeant",""),  # ✅ nouvelle colonne remplie
             r.get("resume",""),
             r.get("commande",""),
         ])
@@ -110,7 +105,7 @@ def build_excel(records):
     return bio.getvalue()
 
 def send_email_brevo(subject, body, to_list, attachments):
-    api_key = os.environ.get("BREVO_API_KEY", "").strip()
+    api_key = os.environ.get("BREVO_API_KEY", "")
     if not api_key:
         raise RuntimeError("BREVO_API_KEY missing in GitHub Secrets")
 
@@ -119,10 +114,7 @@ def send_email_brevo(subject, body, to_list, attachments):
         print(f"[BREVO][SKIP] no recipients for subject: {subject}")
         return
 
-    sender_email = (os.environ.get("BREVO_SENDER_EMAIL") or "").strip()
-    if not sender_email:
-        # fallback: 1er destinataire (ok en test)
-        sender_email = to_list[0]
+    sender_email = os.environ.get("BREVO_SENDER_EMAIL") or to_list[0]
 
     payload = {
         "sender": {"email": sender_email, "name": "Prospection Bot"},
@@ -155,13 +147,12 @@ def send_email_brevo(subject, body, to_list, attachments):
 
 def main():
     cfg = load_config()
+    worker = cfg["worker_base_url"].rstrip("/")
+    export_token = os.environ.get("EXPORT_TOKEN", "")
+    if not export_token:
+        raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
 
-    worker = (cfg.get("worker_base_url") or "").strip().rstrip("/")
-    if not worker.startswith("https://"):
-        raise RuntimeError(f"config.yml worker_base_url must start with https:// (got: {worker})")
-
-    export_token = os.environ.get("EXPORT_TOKEN", "").strip()
-    date = (os.environ.get("RUN_DATE") or "").strip() or datetime.utcnow().strftime("%Y-%m-%d")
+    date = os.environ.get("RUN_DATE") or datetime.utcnow().strftime("%Y-%m-%d")
 
     url = f"{worker}/dump?date={date}&kind=prospects"
     prospects = fetch_jsonl(url, export_token)
@@ -173,7 +164,7 @@ def main():
         if ag in agency_records:
             agency_records[ag].append(p)
 
-    # Emails agences
+    # Emails agences (+ Excel)
     for ag, recs in agency_records.items():
         to_list = cfg["agencies"][ag].get("daily_to", [])
         excel = build_excel(recs)
@@ -181,19 +172,21 @@ def main():
             f"[PROSPECTION] {ag} — {date}",
             f"Export agence {ag}\nFiches: {len(recs)}",
             to_list,
-            [(f"{date}_{ag}.xlsx", excel)]
+            [(f"{date}_{ag}_IMPORT.xlsx", excel)]
         )
 
-    # Email global (toi)
+    # Email global (résumé)
     lines = [f"Résumé global {date}", ""]
     total = 0
+    commandes_total = 0
     for ag in agency_records:
         n = len(agency_records[ag])
         total += n
         cmd = sum(1 for r in agency_records[ag] if (r.get("commande") or "").strip())
+        commandes_total += cmd
         lines.append(f"{ag}: {n} fiches / {cmd} commandes")
     lines.append("")
-    lines.append(f"TOTAL: {total} fiches")
+    lines.append(f"TOTAL: {total} fiches / {commandes_total} commandes")
 
     global_to = cfg.get("global_to", [])
     send_email_brevo(
