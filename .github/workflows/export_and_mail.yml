@@ -2,9 +2,15 @@ name: Prospection — Export & Mail
 
 on:
   schedule:
-    - cron: "30 11 * * *"  # 12:30 FR hiver
-    - cron: "0 16 * * *"   # 17:00 FR hiver
+    # GitHub Actions = UTC
+    # 12:30 FR (hiver) = 11:30 UTC / 17:00 FR (hiver) = 16:00 UTC
+    - cron: "30 11 * * *"
+    - cron: "0 16 * * *"
   workflow_dispatch:
+    inputs:
+      run_date:
+        description: "YYYY-MM-DD (optionnel)"
+        required: false
 
 jobs:
   run:
