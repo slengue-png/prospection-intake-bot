@@ -7,9 +7,11 @@ on:
     - cron: "30 11 * * *"
     - cron: "0 16 * * *"
   workflow_dispatch:
-
-permissions:
-  contents: write
+    inputs:
+      run_date:
+        description: "YYYY-MM-DD (optionnel)"
+        required: false
+        default: ""
 
 jobs:
   run:
@@ -31,4 +33,5 @@ jobs:
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          RUN_DATE: ${{ github.event.inputs.run_date }}
         run: python scripts/export_and_mail.py
