@@ -1,0 +1,44 @@
+{
+  "month": "2026-02",
+  "days": {
+    "2026-02-16": {
+      "agencies": {
+        "GR": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "VR": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "GRS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "SLS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        }
+      },
+      "by_user": {
+        "SL|GR": {
+          "agency": "SL",
+          "initials": "GR",
+          "prospects": 2,
+          "clients": 0,
+          "commandes": 2
+        }
+      },
+      "totals": {
+        "prospects": 2,
+        "clients": 0,
+        "commandes": 2
+      }
+    }
+  },
+  "updated_at_utc": "2026-02-16T14:27:39Z"
+}
