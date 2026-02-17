@@ -1,0 +1,36 @@
+{
+  "month": "2026-03",
+  "days": {
+    "2026-03-17": {
+      "agencies": {
+        "GR": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "VR": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "GRS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "SLS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        }
+      },
+      "by_user": {},
+      "totals": {
+        "prospects": 0,
+        "clients": 0,
+        "commandes": 0
+      }
+    }
+  },
+  "updated_at_utc": "2026-02-17T16:12:55Z"
+}
