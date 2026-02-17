@@ -73,17 +73,17 @@
         "SL|GR": {
           "agency": "SL",
           "initials": "GR",
-          "prospects": 1,
+          "prospects": 12,
           "clients": 0,
-          "commandes": 0
+          "commandes": 6
         }
       },
       "totals": {
-        "prospects": 1,
+        "prospects": 12,
         "clients": 0,
-        "commandes": 0
+        "commandes": 6
       }
     }
   },
-  "updated_at_utc": "2026-02-17T08:05:48Z"
+  "updated_at_utc": "2026-02-17T13:14:19Z"
 }
