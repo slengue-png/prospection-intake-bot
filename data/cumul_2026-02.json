@@ -83,7 +83,37 @@
         "clients": 0,
         "commandes": 6
       }
+    },
+    "2026-02-18": {
+      "agencies": {
+        "GR": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "VR": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "GRS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "SLS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        }
+      },
+      "by_user": {},
+      "totals": {
+        "prospects": 0,
+        "clients": 0,
+        "commandes": 0
+      }
     }
   },
-  "updated_at_utc": "2026-02-17T13:17:46Z"
+  "updated_at_utc": "2026-02-17T13:32:37Z"
 }
