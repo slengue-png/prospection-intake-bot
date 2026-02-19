@@ -9,27 +9,31 @@ from openpyxl import Workbook
 import yaml
 import re
 from pathlib import Path
+from typing import Dict, List, Tuple, Any
 
 # =========================
-# EXCEL IMPORT (AGENCES)
+# EXCEL EXPORT (AGENCES)
 # =========================
-IMPORT_COLUMNS = [
-    "NOM",
-    "ADRESSE",
+# ✅ Mise à jour selon ton dernier tableau (on garde tes champs + on ajoute visites)
+EXPORT_COLUMNS = [
+    "NOM",                      # raison sociale
+    "ADRESSE",                  # rue
     "CODE POSTAL",
     "VILLE",
-    "TELEPHONE",
-    "TELEPHONE 2",
+    "TELEPHONE",                # fixe (ou principal)
+    "MOBILE",                   # mobile
     "MAIL",
     "SIRET",
     "NAF",
     "SITE WEB",
-    "Contact: civilité",
-    "Contact : prénom",
-    "Contact : nom",
-    "DIRIGEANT",              # ✅ validé
-    "RESUME ENTRETIEN",
+    "DIRIGEANT 1 : civilité",
+    "DIRIGEANT 1 : prénom",
+    "DIRIGEANT 1 : nom",
+    "COMMERCE",                 # (si tu veux le commercial/initiales ici)
+    "ENTRETIEN",
     "COMMANDE",
+    "NOMBRE DE VISITES CLIENTS",
+    "NOMBRE DE VISITES PROSPECTS",
 ]
 
 BROWSER_HEADERS = {
@@ -44,7 +48,7 @@ BROWSER_HEADERS = {
 # =========================
 def load_config(path="config.yml"):
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        return yaml.safe_load(f) or {}
 
 def normalize_emails(x):
     if x is None:
@@ -61,6 +65,12 @@ def normalize_emails(x):
         if e:
             out.append(e)
     return out
+
+def safe_int(x, default=0) -> int:
+    try:
+        return int(str(x).strip())
+    except:
+        return default
 
 # =========================
 # FETCH /dump (Worker)
@@ -120,15 +130,6 @@ def _stem_fr(word: str) -> str:
     return w
 
 def count_commandes(commande_text: str) -> int:
-    """
-    Règles:
-      - "1 manutentionnaire" => 1
-      - "1" => 1
-      - "1 manutentionnaire 1 chauffeur" => 2
-      - "manutentionnaire chauffeur" => 2 (2 qualifications différentes)
-      - "2 manutentionnaires" => 1 (quantité ignorée)
-    Valable pour n'importe quel métier.
-    """
     if not commande_text:
         return 0
     s = str(commande_text).strip()
@@ -168,30 +169,42 @@ def count_commandes(commande_text: str) -> int:
 # =========================
 # EXCEL
 # =========================
-def build_excel(records):
+def build_excel(records: List[dict]):
     wb = Workbook()
     ws = wb.active
     ws.title = "IMPORT"
-    ws.append(IMPORT_COLUMNS)
+    ws.append(EXPORT_COLUMNS)
 
     for r in records:
+        # ✅ si interlocuteur vide => dirigeant
+        dirigeant_civ = r.get("dirigeant_civility", "") or r.get("dirigeant1_civility", "") or ""
+        dirigeant_fn  = r.get("dirigeant_firstname", "") or r.get("dirigeant1_firstname", "") or ""
+        dirigeant_ln  = r.get("dirigeant_lastname", "") or r.get("dirigeant1_lastname", "") or ""
+
+        interlocuteur = (r.get("interlocuteur") or "").strip()
+        if not interlocuteur:
+            # on synthétise un "interlocuteur" à partir du dirigeant si besoin côté logique bot
+            pass
+
         ws.append([
             r.get("name", ""),
             r.get("address", ""),
             r.get("postal_code", ""),
             r.get("city", ""),
-            r.get("phone", ""),
-            r.get("phone2", ""),
+            r.get("phone", ""),          # fixe
+            r.get("mobile", "") or r.get("phone2", ""),  # mobile
             r.get("email", ""),
             r.get("siret", ""),
-            r.get("naf", ""),            # ex: 4669C (sans point)
+            r.get("naf", ""),
             r.get("website", ""),
-            r.get("contact_civility", ""),
-            r.get("contact_firstname", ""),
-            r.get("contact_lastname", "") or r.get("interlocuteur", ""),
-            r.get("dirigeant", ""),      # ✅
-            r.get("resume", ""),
+            dirigeant_civ,
+            dirigeant_fn,
+            dirigeant_ln,
+            r.get("initials", "") or r.get("commerce", ""),   # COMMERCE
+            r.get("resume", "") or r.get("entretien", ""),    # ENTRETIEN
             r.get("commande", ""),
+            safe_int(r.get("visites_clients", 0), 0),
+            safe_int(r.get("visites_prospects", 0), 0),
         ])
 
     bio = io.BytesIO()
@@ -213,7 +226,7 @@ def send_email_brevo(subject, body, to_list, attachments):
 
     sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
     if not sender_email:
-        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets (ex: prospection@pilopro.fr)")
+        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets")
 
     payload = {
         "sender": {"email": sender_email, "name": "Prospection Bot"},
@@ -275,17 +288,15 @@ def save_cumul(path: Path, data: dict):
     data["updated_at_utc"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def aggregate_day(prospects: list[dict], agencies: dict) -> dict:
-    # clients pas encore saisis -> 0
+def aggregate_day(prospects: List[dict], agencies: dict) -> dict:
     out = {
         "agencies": {},
         "by_user": {},   # key: "AG|INI"
-        "totals": {"prospects": 0, "clients": 0, "commandes": 0},
+        "totals": {"prospects": 0, "clients": 0, "commandes": 0, "visites_clients": 0, "visites_prospects": 0},
     }
 
-    # init agences
     for ag in agencies.keys():
-        out["agencies"][ag] = {"prospects": 0, "clients": 0, "commandes": 0}
+        out["agencies"][ag] = {"prospects": 0, "clients": 0, "commandes": 0, "visites_clients": 0, "visites_prospects": 0}
 
     for r in prospects:
         ag = (r.get("agency") or "").strip()
@@ -293,58 +304,29 @@ def aggregate_day(prospects: list[dict], agencies: dict) -> dict:
 
         cmds = count_commandes(r.get("commande", ""))
 
+        vc = safe_int(r.get("visites_clients", 0), 0)
+        vp = safe_int(r.get("visites_prospects", 0), 0)
+
         if ag in out["agencies"]:
             out["agencies"][ag]["prospects"] += 1
             out["agencies"][ag]["commandes"] += cmds
+            out["agencies"][ag]["visites_clients"] += vc
+            out["agencies"][ag]["visites_prospects"] += vp
 
         key = f"{ag}|{ini}"
-        out["by_user"].setdefault(key, {"agency": ag, "initials": ini, "prospects": 0, "clients": 0, "commandes": 0})
+        out["by_user"].setdefault(key, {"agency": ag, "initials": ini, "prospects": 0, "clients": 0, "commandes": 0,
+                                        "visites_clients": 0, "visites_prospects": 0})
         out["by_user"][key]["prospects"] += 1
         out["by_user"][key]["commandes"] += cmds
+        out["by_user"][key]["visites_clients"] += vc
+        out["by_user"][key]["visites_prospects"] += vp
 
         out["totals"]["prospects"] += 1
         out["totals"]["commandes"] += cmds
+        out["totals"]["visites_clients"] += vc
+        out["totals"]["visites_prospects"] += vp
 
     return out
-
-def aggregate_period(cumul: dict, start_day: int, end_day: int) -> dict:
-    # cumul["days"] = { "YYYY-MM-DD": day_agg }
-    res = {
-        "agencies": {},
-        "by_user": {},
-        "totals": {"prospects": 0, "clients": 0, "commandes": 0},
-    }
-
-    for day_str, day_data in cumul.get("days", {}).items():
-        try:
-            dd = parse_date_yyyy_mm_dd(day_str)
-        except:
-            continue
-        if not (start_day <= dd.day <= end_day):
-            continue
-
-        # totals
-        t = day_data.get("totals", {})
-        res["totals"]["prospects"] += int(t.get("prospects", 0))
-        res["totals"]["clients"] += int(t.get("clients", 0))
-        res["totals"]["commandes"] += int(t.get("commandes", 0))
-
-        # agencies
-        for ag, a in (day_data.get("agencies", {}) or {}).items():
-            res["agencies"].setdefault(ag, {"prospects": 0, "clients": 0, "commandes": 0})
-            res["agencies"][ag]["prospects"] += int(a.get("prospects", 0))
-            res["agencies"][ag]["clients"] += int(a.get("clients", 0))
-            res["agencies"][ag]["commandes"] += int(a.get("commandes", 0))
-
-        # users
-        for k, u in (day_data.get("by_user", {}) or {}).items():
-            res["by_user"].setdefault(k, {"agency": u.get("agency",""), "initials": u.get("initials","NA"),
-                                          "prospects": 0, "clients": 0, "commandes": 0})
-            res["by_user"][k]["prospects"] += int(u.get("prospects", 0))
-            res["by_user"][k]["clients"] += int(u.get("clients", 0))
-            res["by_user"][k]["commandes"] += int(u.get("commandes", 0))
-
-    return res
 
 def make_ranking(by_user: dict) -> list[dict]:
     rows = []
@@ -360,16 +342,34 @@ def make_ranking(by_user: dict) -> list[dict]:
             "clients": c,
             "commandes": cmd,
             "tx": tx,
+            "visites_clients": int(u.get("visites_clients", 0)),
+            "visites_prospects": int(u.get("visites_prospects", 0)),
         })
-    # tri: commandes desc, tx desc, prospects desc
     rows.sort(key=lambda r: (r["commandes"], r["tx"], r["prospects"]), reverse=True)
     return rows
+
+# =========================
+# UTIL: MODE + payload
+# =========================
+def get_mode() -> str:
+    m = (os.environ.get("MODE") or "").strip()
+    return m or "agency_digest"
+
+def get_client_payload() -> dict:
+    raw = (os.environ.get("CLIENT_PAYLOAD_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except:
+        return {}
 
 # =========================
 # MAIN
 # =========================
 def main():
     cfg = load_config()
+
     worker = (cfg.get("worker_base_url") or "").strip().rstrip("/")
     if not worker.startswith("https://"):
         raise RuntimeError("config.yml: worker_base_url must start with https://")
@@ -378,174 +378,196 @@ def main():
     if not export_token:
         raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
 
-    run_date_str = (os.environ.get("RUN_DATE") or "").strip()
+    mode = get_mode()
+    payload = get_client_payload()
+    print("[MODE]", mode)
+    if payload:
+        print("[PAYLOAD] keys:", list(payload.keys()))
+
+    # Date (priorité: payload.date -> RUN_DATE -> today UTC)
+    run_date_str = (payload.get("date") or os.environ.get("RUN_DATE") or "").strip()
     if run_date_str:
         d = parse_date_yyyy_mm_dd(run_date_str)
     else:
         d = datetime.utcnow().date()
     date_str = d.strftime("%Y-%m-%d")
 
-    agencies_cfg = cfg.get("agencies", {})
+    agencies_cfg = cfg.get("agencies", {}) or {}
+    global_to = cfg.get("global_to", []) or []
 
-    # ===== dump prospects du jour =====
+    # ===== 1) close_session : envoi immédiat par commercial =====
+    if mode == "close_session":
+        # On attend du payload au minimum : agency, initials, email_to (ou on le retrouve via config)
+        ag = (payload.get("agency") or "").strip()
+        ini = (payload.get("initials") or "").strip().upper()
+
+        if not ag or not ini:
+            raise RuntimeError("close_session requires payload {agency, initials}.")
+        # Destinataire immédiat = email du commercial (config > payload)
+        user_mail = None
+        if agencies_cfg.get(ag, {}).get("users", {}).get(ini):
+            user_mail = agencies_cfg[ag]["users"][ini].get("email")
+        if not user_mail:
+            user_mail = payload.get("user_email")
+
+        if not user_mail:
+            raise RuntimeError(f"Missing user email for {ag}/{ini}. Add it in config.yml agencies.{ag}.users.{ini}.email")
+
+        # On peut joindre l'export de SA journée uniquement
+        url = f"{worker}/dump?date={date_str}&kind=prospects&agency={ag}&initials={ini}"
+        prospects = fetch_jsonl(url, export_token)
+        print("[OK] prospects rows=", len(prospects))
+
+        # On injecte les compteurs saisis en fin de session dans chaque ligne (pour Excel + cumul)
+        visites_clients = safe_int(payload.get("visites_clients", 0), 0)
+        visites_prospects = safe_int(payload.get("visites_prospects", 0), 0)
+        for r in prospects:
+            r["visites_clients"] = visites_clients
+            r["visites_prospects"] = visites_prospects
+
+        excel = build_excel(prospects)
+        nb_prospects = len(prospects)
+        nb_commandes = sum(count_commandes(r.get("commande", "")) for r in prospects)
+
+        subject = f"[PROSPECTION] Clôture session — {ag}/{ini} — {date_str}"
+        body = (
+            f"Clôture session {ag}/{ini}\n"
+            f"Date: {date_str}\n"
+            f"Prospects saisis: {nb_prospects}\n"
+            f"Commandes: {nb_commandes}\n"
+            f"Visites clients (déclaré): {visites_clients}\n"
+            f"Visites prospects (déclaré): {visites_prospects}\n"
+        )
+        send_email_brevo(subject, body, [user_mail], [(f"{date_str}_{ag}_{ini}_IMPORT.xlsx", excel)])
+
+        # Cumul mensuel (on merge le jour, mais au moins on met à jour)
+        cumul_file = cumul_path_for(d)
+        cumul = load_cumul(cumul_file)
+
+        # On stocke un mini-agrégat "par user" du close_session en plus (sans casser ton cumul)
+        day = cumul["days"].get(date_str) or {"by_user_close": {}}
+        day.setdefault("by_user_close", {})
+        day["by_user_close"][f"{ag}|{ini}"] = {
+            "visites_clients": visites_clients,
+            "visites_prospects": visites_prospects,
+            "updated_at_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        }
+        cumul["days"][date_str] = day
+        save_cumul(cumul_file, cumul)
+        print("[CUMUL] updated (close_session):", str(cumul_file))
+        return
+
+    # ===== 2) agency_digest / global_digest : on part du dump global du jour =====
     url = f"{worker}/dump?date={date_str}&kind=prospects"
     prospects = fetch_jsonl(url, export_token)
     print("[OK] prospects rows=", len(prospects))
 
+    # Regroupement par agence
     agency_records = {ag: [] for ag in agencies_cfg.keys()}
     for p in prospects:
-        ag = p.get("agency", "")
+        ag = (p.get("agency") or "").strip()
         if ag in agency_records:
             agency_records[ag].append(p)
 
-    # ===== emails agences (excel import) =====
-    for ag, recs in agency_records.items():
-        to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
-        excel = build_excel(recs)
+    # ===== 2a) agency_digest (17:45) : 1 mail par agence vers le "leader" =====
+    if mode == "agency_digest":
+        for ag, recs in agency_records.items():
+            # ✅ destinataire récap agence : agencies.{AG}.daily_digest_to
+            to_list = agencies_cfg.get(ag, {}).get("daily_digest_to", []) or []
+            if not to_list:
+                print(f"[SKIP] No daily_digest_to configured for agency {ag}")
+                continue
 
-        nb_prospects = len(recs)
-        nb_clients = 0  # en attente de ta saisie "clients"
-        nb_commandes = sum(count_commandes(r.get("commande", "")) for r in recs)
+            excel = build_excel(recs)
 
-        send_email_brevo(
-            f"[PROSPECTION] {ag} — {date_str}",
-            f"Export agence {ag}\n"
-            f"Prospects: {nb_prospects}\n"
-            f"Clients: {nb_clients}\n"
-            f"Commandes: {nb_commandes}\n",
-            to_list,
-            [(f"{date_str}_{ag}_IMPORT.xlsx", excel)],
-        )
+            nb_prospects = len(recs)
+            nb_commandes = sum(count_commandes(r.get("commande", "")) for r in recs)
 
-    # ===== email global quotidien (toi) =====
-    lines = [f"Résumé global prospection — {date_str}", ""]
-    total_p = 0
-    total_c = 0
-    total_cmd = 0
+            # stats visites (addition des champs stockés par ligne si présents)
+            vc = sum(safe_int(r.get("visites_clients", 0), 0) for r in recs)
+            vp = sum(safe_int(r.get("visites_prospects", 0), 0) for r in recs)
 
-    for ag in agency_records.keys():
-        recs = agency_records[ag]
-        nb_p = len(recs)
-        nb_c = 0
-        nb_cmd = sum(count_commandes(r.get("commande", "")) for r in recs)
+            # Détail par commercial
+            by_init = {}
+            for r in recs:
+                ini = (r.get("initials") or "NA").strip().upper()
+                by_init.setdefault(ini, []).append(r)
 
-        total_p += nb_p
-        total_c += nb_c
-        total_cmd += nb_cmd
+            lines = [f"Récap agence {ag} — {date_str}", ""]
+            lines.append(f"TOTAL — Prospects: {nb_prospects} | Commandes: {nb_commandes} | Visites clients: {vc} | Visites prospects: {vp}")
+            lines.append("")
+            for ini, rr in sorted(by_init.items()):
+                pcount = len(rr)
+                cmdcount = sum(count_commandes(x.get("commande", "")) for x in rr)
+                tx = (cmdcount / pcount * 100.0) if pcount else 0.0
+                vc_u = sum(safe_int(x.get("visites_clients", 0), 0) for x in rr)
+                vp_u = sum(safe_int(x.get("visites_prospects", 0), 0) for x in rr)
+                lines.append(f"- {ini}: {pcount} prospects | {cmdcount} commandes | Tx {tx:.1f}% | VC {vc_u} | VP {vp_u}")
 
-        lines.append(f"{ag} — Prospects: {nb_p} | Clients: {nb_c} | Commandes: {nb_cmd}")
+            send_email_brevo(
+                f"[PROSPECTION] {ag} — RÉCAP — {date_str}",
+                "\n".join(lines),
+                to_list,
+                [(f"{date_str}_{ag}_IMPORT.xlsx", excel)],
+            )
+        return
 
-        by_init = {}
-        for r in recs:
-            ini = (r.get("initials") or "NA").strip().upper()
-            by_init.setdefault(ini, []).append(r)
+    # ===== 2b) global_digest (17:47) : 1 mail pour toi (global_to) =====
+    if mode == "global_digest":
+        lines = [f"Récap GLOBAL — {date_str}", ""]
+        total_p = 0
+        total_cmd = 0
+        total_vc = 0
+        total_vp = 0
 
-        for ini, rr in sorted(by_init.items()):
-            pcount = len(rr)
-            ccount = 0
-            cmdcount = sum(count_commandes(x.get("commande", "")) for x in rr)
-            tx = (cmdcount / pcount * 100.0) if pcount else 0.0
-            lines.append(f"  - {ini}: {pcount} prospects | {ccount} clients | {cmdcount} commandes | Tx: {tx:.1f}%")
+        for ag in agency_records.keys():
+            recs = agency_records[ag]
+            nb_p = len(recs)
+            nb_cmd = sum(count_commandes(r.get("commande", "")) for r in recs)
+            vc = sum(safe_int(r.get("visites_clients", 0), 0) for r in recs)
+            vp = sum(safe_int(r.get("visites_prospects", 0), 0) for r in recs)
 
-        lines.append("")
+            total_p += nb_p
+            total_cmd += nb_cmd
+            total_vc += vc
+            total_vp += vp
 
-    lines.append(f"TOTAL GLOBAL — Prospects: {total_p} | Clients: {total_c} | Commandes: {total_cmd}")
+            lines.append(f"{ag} — Prospects: {nb_p} | Commandes: {nb_cmd} | VC: {vc} | VP: {vp}")
 
-    global_to = cfg.get("global_to", [])
-    send_email_brevo(
-        f"[PROSPECTION] GLOBAL — {date_str}",
-        "\n".join(lines),
-        global_to,
-        [],
-    )
+            by_init = {}
+            for r in recs:
+                ini = (r.get("initials") or "NA").strip().upper()
+                by_init.setdefault(ini, []).append(r)
 
-    # ===== cumul mensuel dans repo =====
-    cumul_file = cumul_path_for(d)
-    cumul = load_cumul(cumul_file)
+            for ini, rr in sorted(by_init.items()):
+                pcount = len(rr)
+                cmdcount = sum(count_commandes(x.get("commande", "")) for x in rr)
+                tx = (cmdcount / pcount * 100.0) if pcount else 0.0
+                vc_u = sum(safe_int(x.get("visites_clients", 0), 0) for x in rr)
+                vp_u = sum(safe_int(x.get("visites_prospects", 0), 0) for x in rr)
+                lines.append(f"  - {ini}: {pcount} prospects | {cmdcount} commandes | Tx {tx:.1f}% | VC {vc_u} | VP {vp_u}")
+            lines.append("")
 
-    day_agg = aggregate_day(prospects, agencies_cfg)
-    cumul["days"][date_str] = day_agg
-    save_cumul(cumul_file, cumul)
-    print("[CUMUL] updated:", str(cumul_file))
-
-    # ===== envois 15/15 et fin de mois =====
-    # - 15 => période 01->15
-    # - dernier jour => période 16->fin
-    ld = last_day_of_month(d)
-
-    send_mid = (d.day == 15)
-    send_end = (d == ld)
-
-    # mail périodique AGENCES (uniquement leur agence)
-    def send_agency_period(ag: str, start_day: int, end_day: int, label: str):
-        period = aggregate_period(cumul, start_day, end_day)
-        a = (period.get("agencies", {}) or {}).get(ag, {"prospects":0,"clients":0,"commandes":0})
-        # détail par commerciaux de l'agence
-        lines_ag = [f"Récap {label} — {month_key(d)} — agence {ag}", ""]
-        lines_ag.append(f"Prospects: {a.get('prospects',0)} | Clients: {a.get('clients',0)} | Commandes: {a.get('commandes',0)}")
-        lines_ag.append("")
-        # ranking uniquement agence
-        users = {}
-        for k, u in (period.get("by_user", {}) or {}).items():
-            if (u.get("agency") or "") == ag:
-                users[k] = u
-        rank = make_ranking(users)
-        if rank:
-            lines_ag.append("Classement commerciaux (agence)")
-            for i, r in enumerate(rank, 1):
-                lines_ag.append(f"{i}. {r['initials']} — {r['prospects']} prospects | {r['commandes']} commandes | Tx: {r['tx']:.1f}%")
-        else:
-            lines_ag.append("Aucune donnée sur la période.")
-
-        to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
-        send_email_brevo(
-            f"[PROSPECTION] {ag} — {label} — {month_key(d)}",
-            "\n".join(lines_ag),
-            to_list,
-            [],
-        )
-
-    # mail périodique GLOBAL (toi uniquement) + classement global
-    def send_global_period(start_day: int, end_day: int, label: str):
-        period = aggregate_period(cumul, start_day, end_day)
-        t = period.get("totals", {"prospects":0,"clients":0,"commandes":0})
-        lines_g = [f"Récap GLOBAL {label} — {month_key(d)}", ""]
-        # par agence
-        lines_g.append("Par agence")
-        for ag in agencies_cfg.keys():
-            a = (period.get("agencies", {}) or {}).get(ag, {"prospects":0,"clients":0,"commandes":0})
-            lines_g.append(f"- {ag}: Prospects {a.get('prospects',0)} | Clients {a.get('clients',0)} | Commandes {a.get('commandes',0)}")
-        lines_g.append("")
-        lines_g.append(f"TOTAL: Prospects {t.get('prospects',0)} | Clients {t.get('clients',0)} | Commandes {t.get('commandes',0)}")
-        lines_g.append("")
-        # classement global
-        rank = make_ranking(period.get("by_user", {}) or {})
-        lines_g.append("Classement commerciaux (global)")
-        if rank:
-            for i, r in enumerate(rank, 1):
-                lines_g.append(f"{i}. {r['agency']} / {r['initials']} — {r['prospects']} prospects | {r['commandes']} commandes | Tx: {r['tx']:.1f}%")
-        else:
-            lines_g.append("Aucune donnée sur la période.")
+        lines.append(f"TOTAL — Prospects: {total_p} | Commandes: {total_cmd} | VC: {total_vc} | VP: {total_vp}")
 
         send_email_brevo(
-            f"[PROSPECTION] GLOBAL — {label} — {month_key(d)}",
-            "\n".join(lines_g),
+            f"[PROSPECTION] GLOBAL — {date_str}",
+            "\n".join(lines),
             global_to,
             [],
         )
 
-    if send_mid:
-        # 01 -> 15
-        for ag in agencies_cfg.keys():
-            send_agency_period(ag, 1, 15, "01-15")
-        send_global_period(1, 15, "01-15")
+        # Cumul mensuel (on garde ta logique)
+        cumul_file = cumul_path_for(d)
+        cumul = load_cumul(cumul_file)
+        day_agg = aggregate_day(prospects, agencies_cfg)
+        cumul["days"][date_str] = day_agg
+        save_cumul(cumul_file, cumul)
+        print("[CUMUL] updated:", str(cumul_file))
+        return
 
-    if send_end:
-        # 16 -> fin
-        for ag in agencies_cfg.keys():
-            send_agency_period(ag, 16, ld.day, "16-fin")
-        send_global_period(16, ld.day, "16-fin")
-
+    # Fallback
+    raise RuntimeError(f"Unknown MODE={mode}")
 
 if __name__ == "__main__":
     main()
