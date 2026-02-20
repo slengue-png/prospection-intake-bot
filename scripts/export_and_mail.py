@@ -9,7 +9,6 @@ from openpyxl import Workbook
 import yaml
 import re
 from pathlib import Path
-import zipfile
 
 # =========================
 # EXCEL IMPORT (AGENCES)
@@ -100,6 +99,52 @@ pass
 return rows
 
 # =========================
+# DATE PARSING (ROBUSTE)
+# =========================
+def parse_date_flexible(s: str) -> date:
+"""
+Accepte:
+- YYYY-MM-DD
+- DD/MM/YYYY
+- DD-MM-YYYY
+Rejette le reste avec une erreur claire.
+"""
+s = (s or "").strip()
+if not s:
+raise ValueError("Empty date")
+
+# 1) YYYY-MM-DD
+try:
+return datetime.strptime(s, "%Y-%m-%d").date()
+except:
+pass
+
+# 2) DD/MM/YYYY
+try:
+return datetime.strptime(s, "%d/%m/%Y").date()
+except:
+pass
+
+# 3) DD-MM-YYYY
+try:
+return datetime.strptime(s, "%d-%m-%Y").date()
+except:
+pass
+
+raise ValueError(
+f"RUN_DATE invalide: '{s}'. Formats acceptés: YYYY-MM-DD (ex: 2026-02-19) ou DD/MM/YYYY (ex: 19/02/2026)."
+)
+
+def last_day_of_month(d: date) -> date:
+if d.month == 12:
+return date(d.year, 12, 31)
+nxt = date(d.year, d.month + 1, 1)
+return nxt.fromordinal(nxt.toordinal() - 1)
+
+def month_key(d: date) -> str:
+return f"{d.year:04d}-{d.month:02d}"
+
+# =========================
 # COMMANDES -> comptage intelligent
 # =========================
 PARASITE_WORDS = {
@@ -121,15 +166,6 @@ break
 return w
 
 def count_commandes(commande_text: str) -> int:
-"""
-Règles:
-- "1 manutentionnaire" => 1
-- "1" => 1
-- "1 manutentionnaire 1 chauffeur" => 2
-- "manutentionnaire chauffeur" => 2 (2 qualifications différentes)
-- "2 manutentionnaires" => 1 (quantité ignorée)
-Valable pour n'importe quel métier.
-"""
 if not commande_text:
 return 0
 s = str(commande_text).strip()
@@ -185,7 +221,7 @@ r.get("phone", ""),
 r.get("phone2", ""),
 r.get("email", ""),
 r.get("siret", ""),
-r.get("naf", ""), # ex: 4669C
+r.get("naf", ""),
 r.get("website", ""),
 r.get("contact_civility", ""),
 r.get("contact_firstname", ""),
@@ -198,61 +234,6 @@ r.get("commande", ""),
 bio = io.BytesIO()
 wb.save(bio)
 return bio.getvalue()
-
-# =========================
-# TELEGRAM PHOTO ZIP (agences only)
-# =========================
-def tg_get_file_path(file_id: str) -> str | None:
-token = os.environ.get("TELEGRAM_TOKEN", "").strip()
-if not token:
-return None
-url = f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}"
-try:
-raw = urllib.request.urlopen(url, timeout=20).read().decode("utf-8", errors="replace")
-j = json.loads(raw)
-if not j.get("ok"):
-return None
-return j["result"]["file_path"]
-except:
-return None
-
-def tg_download_file(file_id: str) -> bytes | None:
-token = os.environ.get("TELEGRAM_TOKEN", "").strip()
-if not token:
-return None
-path = tg_get_file_path(file_id)
-if not path:
-return None
-file_url = f"https://api.telegram.org/file/bot{token}/{path}"
-try:
-return urllib.request.urlopen(file_url, timeout=30).read()
-except:
-return None
-
-def build_photos_zip(records: list[dict], agency: str, date_str: str) -> bytes | None:
-def get_file_id(r):
-return (r.get("card_photo_file_id") or r.get("photo_file_id") or "").strip()
-
-with io.BytesIO() as bio:
-with zipfile.ZipFile(bio, mode="w", compression=zipfile.ZIP_DEFLATED) as z:
-n = 0
-for i, r in enumerate(records, 1):
-file_id = get_file_id(r)
-if not file_id:
-continue
-content = tg_download_file(file_id)
-if not content:
-continue
-
-ini = (r.get("initials") or "NA").upper()
-name = (r.get("name") or "entreprise").strip()
-name = re.sub(r"[^A-Za-z0-9 _-]", "", name)[:40].strip().replace(" ", "_") or "entreprise"
-filename = f"{date_str}_{agency}_{ini}_{i:02d}_{name}.jpg"
-z.writestr(filename, content)
-n += 1
-
-data = bio.getvalue()
-return data if len(data) > 100 and n > 0 else None
 
 # =========================
 # EMAIL (Brevo API)
@@ -269,7 +250,7 @@ return
 
 sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
 if not sender_email:
-raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets (ex: prospection@pilopro.fr)")
+raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets")
 
 payload = {
 "sender": {"email": sender_email, "name": "Prospection Bot"},
@@ -303,18 +284,6 @@ raise
 # =========================
 # CUMUL MENSUEL (repo)
 # =========================
-def parse_date_yyyy_mm_dd(s: str) -> date:
-return datetime.strptime(s, "%Y-%m-%d").date()
-
-def last_day_of_month(d: date) -> date:
-if d.month == 12:
-return date(d.year, 12, 31)
-nxt = date(d.year, d.month + 1, 1)
-return nxt.fromordinal(nxt.toordinal() - 1)
-
-def month_key(d: date) -> str:
-return f"{d.year:04d}-{d.month:02d}"
-
 def cumul_path_for(d: date) -> Path:
 Path("data").mkdir(parents=True, exist_ok=True)
 return Path("data") / f"cumul_{month_key(d)}.json"
@@ -362,11 +331,15 @@ out["totals"]["commandes"] += cmds
 return out
 
 def aggregate_period(cumul: dict, start_day: int, end_day: int) -> dict:
-res = {"agencies": {}, "by_user": {}, "totals": {"prospects": 0, "clients": 0, "commandes": 0}}
+res = {
+"agencies": {},
+"by_user": {},
+"totals": {"prospects": 0, "clients": 0, "commandes": 0},
+}
 
 for day_str, day_data in cumul.get("days", {}).items():
 try:
-dd = parse_date_yyyy_mm_dd(day_str)
+dd = datetime.strptime(day_str, "%Y-%m-%d").date()
 except:
 continue
 if not (start_day <= dd.day <= end_day):
@@ -399,8 +372,14 @@ p = int(u.get("prospects", 0))
 c = int(u.get("clients", 0))
 cmd = int(u.get("commandes", 0))
 tx = (cmd / p * 100.0) if p else 0.0
-rows.append({"agency": u.get("agency", ""), "initials": u.get("initials", "NA"),
-"prospects": p, "clients": c, "commandes": cmd, "tx": tx})
+rows.append({
+"agency": u.get("agency", ""),
+"initials": u.get("initials", "NA"),
+"prospects": p,
+"clients": c,
+"commandes": cmd,
+"tx": tx,
+})
 rows.sort(key=lambda r: (r["commandes"], r["tx"], r["prospects"]), reverse=True)
 return rows
 
@@ -417,14 +396,13 @@ export_token = os.environ.get("EXPORT_TOKEN", "").strip()
 if not export_token:
 raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
 
-mode = (os.environ.get("MODE") or "nightly").strip().lower()
-agency_only = (os.environ.get("AGENCY_ONLY") or "").strip().upper()
-
 run_date_str = (os.environ.get("RUN_DATE") or "").strip()
+
 if run_date_str:
-d = parse_date_yyyy_mm_dd(run_date_str)
+d = parse_date_flexible(run_date_str)
 else:
 d = datetime.utcnow().date()
+
 date_str = d.strftime("%Y-%m-%d")
 
 agencies_cfg = cfg.get("agencies", {})
@@ -434,79 +412,36 @@ url = f"{worker}/dump?date={date_str}&kind=prospects"
 prospects = fetch_jsonl(url, export_token)
 print("[OK] prospects rows=", len(prospects))
 
-# split par agence
 agency_records = {ag: [] for ag in agencies_cfg.keys()}
 for p in prospects:
-ag = (p.get("agency") or "").strip().upper()
+ag = p.get("agency", "")
 if ag in agency_records:
 agency_records[ag].append(p)
 
-# =========================
-# MODE INSTANT: une agence, mails "instant_to", PAS de global
-# =========================
-if mode == "instant":
-if not agency_only:
-raise RuntimeError("MODE=instant requires AGENCY_ONLY input (GR/VR/GRS/SLS)")
-if agency_only not in agencies_cfg:
-raise RuntimeError(f"Unknown agency: {agency_only}")
-
-recs = agency_records.get(agency_only, [])
-excel = build_excel(recs)
-photos_zip = build_photos_zip(recs, agency_only, date_str)
-
-nb_prospects = len(recs)
-nb_clients = 0
-nb_commandes = sum(count_commandes(r.get("commande", "")) for r in recs)
-
-attachments = [(f"{date_str}_{agency_only}_IMPORT.xlsx", excel)]
-if photos_zip:
-attachments.append((f"{date_str}_{agency_only}_cartes_de_visite.zip", photos_zip))
-
-to_list = agencies_cfg.get(agency_only, {}).get("instant_to", [])
-send_email_brevo(
-f"[PROSPECTION] {agency_only} — EXPORT IMMÉDIAT — {date_str}",
-f"Export immédiat agence {agency_only}\n"
-f"Prospects: {nb_prospects}\n"
-f"Clients: {nb_clients}\n"
-f"Commandes: {nb_commandes}\n",
-to_list,
-attachments,
-)
-print("[DONE] instant export sent for", agency_only)
-return
-
-# =========================
-# MODE NIGHTLY: recap agences (nightly_to) + global + cumul + 15/15 + fin
-# =========================
-
-# envois recap agences (nightly_to)
+# ===== emails agences (excel import) =====
 for ag, recs in agency_records.items():
+to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
 excel = build_excel(recs)
-photos_zip = build_photos_zip(recs, ag, date_str)
 
 nb_prospects = len(recs)
 nb_clients = 0
 nb_commandes = sum(count_commandes(r.get("commande", "")) for r in recs)
 
-attachments = [(f"{date_str}_{ag}_IMPORT.xlsx", excel)]
-if photos_zip:
-attachments.append((f"{date_str}_{ag}_cartes_de_visite.zip", photos_zip))
-
-to_list = agencies_cfg.get(ag, {}).get("nightly_to", [])
 send_email_brevo(
-f"[PROSPECTION] {ag} — RÉCAP JOUR — {date_str}",
-f"Récap agence {ag}\n"
+f"[PROSPECTION] {ag} — {date_str}",
+f"Export agence {ag}\n"
 f"Prospects: {nb_prospects}\n"
 f"Clients: {nb_clients}\n"
 f"Commandes: {nb_commandes}\n",
 to_list,
-attachments,
+[(f"{date_str}_{ag}_IMPORT.xlsx", excel)],
 )
 
-# mail global (toi uniquement)
-global_to = cfg.get("global_to", [])
+# ===== email global quotidien =====
 lines = [f"Résumé global prospection — {date_str}", ""]
-total_p = total_c = total_cmd = 0
+total_p = 0
+total_c = 0
+total_cmd = 0
 
 for ag in agency_records.keys():
 recs = agency_records[ag]
@@ -536,6 +471,7 @@ lines.append("")
 
 lines.append(f"TOTAL GLOBAL — Prospects: {total_p} | Clients: {total_c} | Commandes: {total_cmd}")
 
+global_to = cfg.get("global_to", [])
 send_email_brevo(
 f"[PROSPECTION] GLOBAL — {date_str}",
 "\n".join(lines),
@@ -543,15 +479,16 @@ global_to,
 [],
 )
 
-# cumul mensuel
+# ===== cumul mensuel =====
 cumul_file = cumul_path_for(d)
 cumul = load_cumul(cumul_file)
+
 day_agg = aggregate_day(prospects, agencies_cfg)
 cumul["days"][date_str] = day_agg
 save_cumul(cumul_file, cumul)
 print("[CUMUL] updated:", str(cumul_file))
 
-# 15/15 et fin de mois
+# ===== envois 15/15 et fin de mois =====
 ld = last_day_of_month(d)
 send_mid = (d.day == 15)
 send_end = (d == ld)
@@ -569,18 +506,14 @@ for k, u in (period.get("by_user", {}) or {}).items():
 if (u.get("agency") or "") == ag:
 users[k] = u
 rank = make_ranking(users)
-
-lines_ag.append("Classement commerciaux (agence)")
 if rank:
+lines_ag.append("Classement commerciaux (agence)")
 for i, r in enumerate(rank, 1):
 lines_ag.append(f"{i}. {r['initials']} — {r['prospects']} prospects | {r['commandes']} commandes | Tx: {r['tx']:.1f}%")
 else:
 lines_ag.append("Aucune donnée sur la période.")
 
-# IMPORTANT: tes règles
-# - le 15 : agences reçoivent leur 01-15
-# - fin de mois : agences ne reçoivent PAS le 16-fin (toi uniquement)
-to_list = agencies_cfg.get(ag, {}).get("nightly_to", [])
+to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
 send_email_brevo(
 f"[PROSPECTION] {ag} — {label} — {month_key(d)}",
 "\n".join(lines_ag),
@@ -622,8 +555,10 @@ send_agency_period(ag, 1, 15, "01-15")
 send_global_period(1, 15, "01-15")
 
 if send_end:
-# 16-fin => UNIQUEMENT toi (pas agences)
+for ag in agencies_cfg.keys():
+send_agency_period(ag, 16, ld.day, "16-fin")
 send_global_period(16, ld.day, "16-fin")
+
 
 if __name__ == "__main__":
 main()
