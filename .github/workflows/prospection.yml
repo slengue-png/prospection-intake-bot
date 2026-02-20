@@ -4,22 +4,9 @@ on:
 workflow_dispatch:
 inputs:
 run_date:
-description: "Date optionnelle : YYYY-MM-DD ou DD/MM/YYYY ou DD-MM-YYYY (ex: 2026-02-19 ou 19/02/2026)"
+description: "Date optionnelle: YYYY-MM-DD ou DD/MM/YYYY (ex: 2026-02-20 ou 20/02/2026)"
 required: false
 default: ""
-mode:
-description: "daily = exports agences + mails / single = export 1 commercial / global = mail global uniquement"
-required: false
-default: "daily"
-agency:
-description: "Agence (ex: GR, VR, GRS, SLS) — requis si mode=single"
-required: false
-default: ""
-initials:
-description: "Initiales (ex: JL) — requis si mode=single"
-required: false
-default: ""
-
 schedule:
 # GitHub Actions = UTC
 # 17:45 FR (hiver) = 16:45 UTC
@@ -49,19 +36,18 @@ EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
 BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
 RUN_DATE: ${{ github.event.inputs.run_date }}
-MODE: ${{ github.event.inputs.mode }}
-AGENCY: ${{ github.event.inputs.agency }}
-INITIALS: ${{ github.event.inputs.initials }}
 run: python scripts/export_and_mail.py
 
 - name: Commit monthly cumul (data/)
 run: |
 git config user.name "prospection-bot"
 git config user.email "prospection-bot@users.noreply.github.com"
+
 git add data/ || true
 if git diff --cached --quiet; then
 echo "No cumul changes to commit."
 exit 0
 fi
+
 git commit -m "Update monthly cumul"
 git push
