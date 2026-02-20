@@ -4,15 +4,26 @@ on:
 workflow_dispatch:
 inputs:
 run_date:
-description: "Date (optionnel) : YYYY-MM-DD ou DD/MM/YYYY (ex: 2026-02-19 ou 19/02/2026)"
+description: "Date optionnelle : YYYY-MM-DD ou DD/MM/YYYY ou DD-MM-YYYY (ex: 2026-02-19 ou 19/02/2026)"
 required: false
 default: ""
+mode:
+description: "daily = exports agences + mails / single = export 1 commercial / global = mail global uniquement"
+required: false
+default: "daily"
+agency:
+description: "Agence (ex: GR, VR, GRS, SLS) — requis si mode=single"
+required: false
+default: ""
+initials:
+description: "Initiales (ex: JL) — requis si mode=single"
+required: false
+default: ""
+
 schedule:
 # GitHub Actions = UTC
-# 12:30 FR (hiver) = 11:30 UTC
-# 17:00 FR (hiver) = 16:00 UTC
-- cron: "30 11 * * *"
-- cron: "0 16 * * *"
+# 17:45 FR (hiver) = 16:45 UTC
+- cron: "45 16 * * *"
 
 permissions:
 contents: write
@@ -20,7 +31,6 @@ contents: write
 jobs:
 run:
 runs-on: ubuntu-latest
-
 steps:
 - name: Checkout
 uses: actions/checkout@v4
@@ -31,8 +41,7 @@ with:
 python-version: "3.11"
 
 - name: Install deps
-run: |
-pip install -r requirements.txt
+run: pip install -r requirements.txt
 
 - name: Export & mail
 env:
@@ -40,19 +49,19 @@ EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
 BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
 RUN_DATE: ${{ github.event.inputs.run_date }}
-run: |
-python scripts/export_and_mail.py
+MODE: ${{ github.event.inputs.mode }}
+AGENCY: ${{ github.event.inputs.agency }}
+INITIALS: ${{ github.event.inputs.initials }}
+run: python scripts/export_and_mail.py
 
 - name: Commit monthly cumul (data/)
 run: |
 git config user.name "prospection-bot"
 git config user.email "prospection-bot@users.noreply.github.com"
-
 git add data/ || true
 if git diff --cached --quiet; then
 echo "No cumul changes to commit."
 exit 0
 fi
-
 git commit -m "Update monthly cumul"
 git push
