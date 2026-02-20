@@ -1,4 +1,4 @@
-name: Prospection
+name: Prospection — Export & Mail
 
 on:
 workflow_dispatch:
