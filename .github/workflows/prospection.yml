@@ -8,19 +8,19 @@ on:
         required: false
         default: "close_session"
       agency:
-        description: "Agence (ex: GR, VR, GRS, SLS)"
+        description: "Agence (ex: GR)"
         required: false
         default: ""
       initials:
-        description: "Initiales collaborateur (ex: JL)"
+        description: "Initiales (ex: JL)"
         required: false
         default: ""
       clients:
-        description: "Nb visites clients (ex: 2)"
+        description: "Nb visites clients"
         required: false
         default: "0"
       prospects:
-        description: "Nb visites prospects (ex: 3)"
+        description: "Nb visites prospects"
         required: false
         default: "0"
       run_date:
@@ -29,9 +29,6 @@ on:
         default: ""
 
   schedule:
-    # GitHub Actions = UTC
-    # 12:30 FR (hiver) = 11:30 UTC
-    # 17:00 FR (hiver) = 16:00 UTC
     - cron: "30 11 * * *"
     - cron: "0 16 * * *"
 
@@ -51,15 +48,25 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+
+      # OCR tesseract (gratuit) pour carte de visite
+      - name: Install OCR engine
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr
 
       - name: Export & mail
         env:
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
 
-          # inputs du dispatch (Worker -> GitHub)
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
           MODE: ${{ github.event.inputs.mode }}
           AGENCY: ${{ github.event.inputs.agency }}
           INITIALS: ${{ github.event.inputs.initials }}
