@@ -1,35 +1,25 @@
-worker_base_url: "https://prospection-intake-worker.slengue.workers.dev"
-
-# ✅ toi uniquement (mail global nightly + 15/15 + 16-fin)
-global_to:
-- "samuel.lengue@ras-interim.fr"
+worker_base_url: "https://TON-WORKER.TON-SOUS-DOMAINE.workers.dev"
 
 agencies:
-GR:
-# ✅ export immédiat (Clore session) => JL + CZ
-instant_to:
-- "samuel.lengue@ras-interim.fr"
-- "cz@pilopro.fr"
-# ✅ recap nightly (17:45) => JL uniquement
-nightly_to:
-- "jl@pilopro.fr"
+  GR:
+    daily_to:
+      - "JL@exemple.fr"
+      - "CZ@exemple.fr"
 
-VR:
-instant_to:
-- "jb@pilopro.fr"
-- "lb@pilopro.fr"
-nightly_to:
-- "jb@pilopro.fr"
+  VR:
+    daily_to:
+      - "JB@exemple.fr"
+      - "LB@exemple.fr"
 
-GRS:
-instant_to:
-- "pv@pilopro.fr"
-- "st@pilopro.fr"
-nightly_to:
-- "pv@pilopro.fr"
+  GRS:
+    daily_to:
+      - "PV@exemple.fr"
+      - "ST@exemple.fr"
 
-SLS:
-instant_to:
-- "ac@pilopro.fr"
-nightly_to:
-- "ac@pilopro.fr"
+  SLS:
+    daily_to:
+      - "AC@exemple.fr"
+
+# Mail global (toi) à 17:47 via le schedule (ou quand "clore session" déclenche un run)
+global_to:
+  - "TOI@exemple.fr"
