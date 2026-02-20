@@ -3,10 +3,10 @@ name: Prospection — Export & Mail
 on:
   workflow_dispatch:
     inputs:
-      mode:
-        description: "Mode (daily | close_session)"
+      run_date:
+        description: "Date (YYYY-MM-DD). Vide = aujourd’hui."
         required: false
-        default: "close_session"
+        default: ""
       agency:
         description: "Agence (ex: GR)"
         required: false
@@ -16,21 +16,22 @@ on:
         required: false
         default: ""
       clients:
-        description: "Nb visites clients"
+        description: "Visites clients (nombre)"
         required: false
         default: "0"
       prospects:
-        description: "Nb visites prospects"
+        description: "Visites prospects (nombre)"
         required: false
         default: "0"
-      run_date:
-        description: "Date optionnelle (YYYY-MM-DD) - vide = aujourd'hui UTC"
+      mode:
+        description: "daily"
         required: false
-        default: ""
+        default: "daily"
 
   schedule:
-    - cron: "30 11 * * *"
-    - cron: "0 16 * * *"
+    # UTC (en hiver FR = UTC+1)
+    - cron: "30 11 * * *"  # 12:30 FR
+    - cron: "00 16 * * *"  # 17:00 FR
 
 permissions:
   contents: write
@@ -51,41 +52,20 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      # OCR tesseract (gratuit) pour carte de visite
-      - name: Install OCR engine
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr
-
       - name: Export & mail
         env:
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
-
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          # tes destinataires & config (si tu en as)
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
 
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-
-          MODE: ${{ github.event.inputs.mode }}
-          AGENCY: ${{ github.event.inputs.agency }}
-          INITIALS: ${{ github.event.inputs.initials }}
-          CLIENTS: ${{ github.event.inputs.clients }}
-          PROSPECTS: ${{ github.event.inputs.prospects }}
-          RUN_DATE: ${{ github.event.inputs.run_date }}
-
-        run: python scripts/export_and_mail.py
-
-      - name: Commit monthly cumul (data/)
+          RUN_DATE: ${{ inputs.run_date }}
+          AGENCY: ${{ inputs.agency }}
+          INITIALS: ${{ inputs.initials }}
+          CLIENTS: ${{ inputs.clients }}
+          PROSPECTS: ${{ inputs.prospects }}
+          MODE: ${{ inputs.mode }}
         run: |
-          git config user.name "prospection-bot"
-          git config user.email "prospection-bot@users.noreply.github.com"
-
-          git add data/ || true
-          if git diff --cached --quiet; then
-            echo "No cumul changes to commit."
-            exit 0
-          fi
-
-          git commit -m "Update monthly cumul"
-          git push
+          python scripts/export_and_mail.py
