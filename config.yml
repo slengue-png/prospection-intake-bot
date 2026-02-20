@@ -14,16 +14,16 @@ global_to:
 agencies:
   GR:
     daily_to:
-      - "JL@domaine.fr"
-      - "CZ@domaine.fr"
+      - "samuel.lengue@ras-interim.fr"
+      - "samuel.lengue@ras-interim.fr"
   VR:
     daily_to:
-      - "JB@domaine.fr"
-      - "LB@domaine.fr"
+      - "samuel.lengue@ras-interim.fr"
+      - "samuel.lengue@ras-interim.fr"
   GRS:
     daily_to:
-      - "PV@domaine.fr"
-      - "ST@domaine.fr"
+      - "samuel.lengue@ras-interim.fr"
+      - "samuel.lengue@ras-interim.fr"
   SLS:
     daily_to:
-      - "AC@domaine.fr"
+      - "samuel.lengue@ras-interim.frr"
