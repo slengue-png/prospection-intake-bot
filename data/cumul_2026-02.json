@@ -113,7 +113,52 @@
         "clients": 0,
         "commandes": 0
       }
+    },
+    "2026-02-20": {
+      "agencies": {
+        "GR": {
+          "prospects": 6,
+          "clients": 0,
+          "commandes": 6
+        },
+        "VR": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "GRS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "SLS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        }
+      },
+      "by_user": {
+        "SL|GR": {
+          "agency": "SL",
+          "initials": "GR",
+          "prospects": 2,
+          "clients": 0,
+          "commandes": 1
+        },
+        "GR|JL": {
+          "agency": "GR",
+          "initials": "JL",
+          "prospects": 6,
+          "clients": 0,
+          "commandes": 6
+        }
+      },
+      "totals": {
+        "prospects": 8,
+        "clients": 0,
+        "commandes": 7
+      }
     }
   },
-  "updated_at_utc": "2026-02-17T18:38:00Z"
+  "updated_at_utc": "2026-02-20T23:45:17Z"
 }
