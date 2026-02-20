@@ -1,21 +1,18 @@
 name: Prospection — Export & Mail
 
 on:
-schedule:
-# 17:45 FR (hiver) = 16:45 UTC
-- cron: "45 16 * * *"
 workflow_dispatch:
 inputs:
 run_date:
-description: "Date YYYY-MM-DD (optionnel)"
+description: "Date (optionnel) : YYYY-MM-DD ou DD/MM/YYYY (ex: 2026-02-19 ou 19/02/2026)"
 required: false
-agency:
-description: "Agence (optionnel) ex: GR / VR / GRS / SLS"
-required: false
-mode:
-description: "nightly ou instant"
-required: false
-default: "nightly"
+default: ""
+schedule:
+# GitHub Actions = UTC
+# 12:30 FR (hiver) = 11:30 UTC
+# 17:00 FR (hiver) = 16:00 UTC
+- cron: "30 11 * * *"
+- cron: "0 16 * * *"
 
 permissions:
 contents: write
@@ -23,6 +20,7 @@ contents: write
 jobs:
 run:
 runs-on: ubuntu-latest
+
 steps:
 - name: Checkout
 uses: actions/checkout@v4
@@ -33,18 +31,17 @@ with:
 python-version: "3.11"
 
 - name: Install deps
-run: pip install -r requirements.txt
+run: |
+pip install -r requirements.txt
 
 - name: Export & mail
 env:
 EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
 BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
-TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
 RUN_DATE: ${{ github.event.inputs.run_date }}
-AGENCY_ONLY: ${{ github.event.inputs.agency }}
-MODE: ${{ github.event.inputs.mode }}
-run: python scripts/export_and_mail.py
+run: |
+python scripts/export_and_mail.py
 
 - name: Commit monthly cumul (data/)
 run: |
