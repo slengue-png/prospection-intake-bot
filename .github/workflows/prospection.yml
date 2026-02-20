@@ -1,37 +1,18 @@
 name: Prospection — Export & Mail
 
 on:
+  schedule:
+    # GitHub Actions = UTC
+    # 12:30 FR (hiver) = 11:30 UTC
+    # 17:00 FR (hiver) = 16:00 UTC
+    - cron: "30 11 * * *"
+    - cron: "0 16 * * *"
   workflow_dispatch:
     inputs:
       run_date:
-        description: "Date (YYYY-MM-DD). Vide = aujourd’hui."
+        description: "Date (optionnel) : YYYY-MM-DD"
         required: false
         default: ""
-      agency:
-        description: "Agence (ex: GR)"
-        required: false
-        default: ""
-      initials:
-        description: "Initiales (ex: JL)"
-        required: false
-        default: ""
-      clients:
-        description: "Visites clients (nombre)"
-        required: false
-        default: "0"
-      prospects:
-        description: "Visites prospects (nombre)"
-        required: false
-        default: "0"
-      mode:
-        description: "daily"
-        required: false
-        default: "daily"
-
-  schedule:
-    # UTC (en hiver FR = UTC+1)
-    - cron: "30 11 * * *"  # 12:30 FR
-    - cron: "00 16 * * *"  # 17:00 FR
 
 permissions:
   contents: write
@@ -49,23 +30,48 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
+        run: pip install -r requirements.txt
+
+      # ✅ DEBUG béton : on vérifie l'URL du worker et la résolution DNS côté GitHub
+      - name: Debug worker connectivity
+        env:
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
         run: |
-          pip install -r requirements.txt
+          echo "WORKER_BASE_URL=$WORKER_BASE_URL"
+          python - <<'PY'
+          import os, socket, urllib.parse
+          u = os.environ.get("WORKER_BASE_URL","").strip()
+          print("RAW:", repr(u))
+          if not u:
+            raise SystemExit("Missing WORKER_BASE_URL secret")
+          p = urllib.parse.urlparse(u)
+          print("PARSED:", p)
+          host = p.hostname
+          print("HOST:", host)
+          print("DNS:", socket.gethostbyname(host))
+          PY
+          echo "---- curl /health ----"
+          curl -i "$WORKER_BASE_URL/health" || true
 
       - name: Export & mail
         env:
-          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
-          # tes destinataires & config (si tu en as)
-          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+          RUN_DATE: ${{ github.event.inputs.run_date }}
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+        run: python scripts/export_and_mail.py
 
-          RUN_DATE: ${{ inputs.run_date }}
-          AGENCY: ${{ inputs.agency }}
-          INITIALS: ${{ inputs.initials }}
-          CLIENTS: ${{ inputs.clients }}
-          PROSPECTS: ${{ inputs.prospects }}
-          MODE: ${{ inputs.mode }}
+      - name: Commit monthly cumul (data/)
         run: |
-          python scripts/export_and_mail.py
+          git config user.name "prospection-bot"
+          git config user.email "prospection-bot@users.noreply.github.com"
+
+          git add data/ || true
+          if git diff --cached --quiet; then
+            echo "No cumul changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update monthly cumul"
+          git push
