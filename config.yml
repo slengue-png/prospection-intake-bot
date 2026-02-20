@@ -1,5 +1,5 @@
-# URL de ton Worker Cloudflare (sera prioritairement lue depuis WORKER_BASE_URL secret GitHub)
-worker_base_url: "https://TON-WORKER.workers.dev"
+worker_base_url: "https://prospection-intake-worker.slengue.workers.dev"# URL de ton Worker Cloudflare (sera prioritairement lue depuis WORKER_BASE_URL secret GitHub)
+
 
 # Destinataire du récap global
 global_to:
