@@ -1,50 +1,16 @@
+# URL de ton Worker Cloudflare (sera prioritairement lue depuis WORKER_BASE_URL secret GitHub)
 worker_base_url: "https://TON-WORKER.workers.dev"
 
-# Mail global (toi)
+# Destinataire du récap global
 global_to:
-- "s.lengue@gmail.com"
+  - "samuel.lengue@ras-interim.fr"
 
+# Emails des agences (export quotidien + récap 01-15 / 16-fin)
 agencies:
-GR:
-daily_to:
-- "samuel.lengue@ras-interim.fr"
-- "cz@domaine.fr"
-recap_to:
-- "jl@domaine.fr"
+  GR:
+    daily_to:
+      - "samuel.lengue@ras-interim.fr"
 
-VR:
-daily_to:
-- "jb@domaine.fr"
-- "lb@domaine.fr"
-recap_to:
-- "jb@domaine.fr"
-
-GRS:
-daily_to:
-- "pv@domaine.fr"
-- "st@domaine.fr"
-recap_to:
-- "pv@domaine.fr"
-
-SLS:
-daily_to:
-- "ac@domaine.fr"
-recap_to:
-- "ac@domaine.fr"
-
-# mapping pour envoi immédiat (clore session)
-users:
-GR_JL:
-email: "sam9999@free.fr"
-GR_CZ:
-email: "cz@domaine.fr"
-VR_JB:
-email: "jb@domaine.fr"
-VR_LB:
-email: "lb@domaine.fr"
-GRS_PV:
-email: "pv@domaine.fr"
-GRS_ST:
-email: "st@domaine.fr"
-SLS_AC:
-email: "ac@domaine.fr"
+  SL:
+    daily_to:
+      - "agence.salaise@domaine.fr"
