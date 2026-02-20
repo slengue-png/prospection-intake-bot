@@ -9,8 +9,7 @@ on:
         default: ""
 
   schedule:
-    # GitHub Actions = UTC
-    # 17:45 FR (hiver) = 16:45 UTC
+    # 17:45 FR (hiver) = 16:45 UTC (lun-ven)
     - cron: "45 16 * * 1-5"
 
 permissions:
