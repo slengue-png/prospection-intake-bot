@@ -1,25 +1,50 @@
-worker_base_url: "https://TON-WORKER.TON-SOUS-DOMAINE.workers.dev"
+worker_base_url: "https://TON-WORKER.workers.dev"
+
+# Mail global (toi)
+global_to:
+- "s.lengue@gmail.com"
 
 agencies:
-  GR:
-    daily_to:
-      - "JL@exemple.fr"
-      - "CZ@exemple.fr"
+GR:
+daily_to:
+- "samuel.lengue@ras-interim.fr"
+- "cz@domaine.fr"
+recap_to:
+- "jl@domaine.fr"
 
-  VR:
-    daily_to:
-      - "JB@exemple.fr"
-      - "LB@exemple.fr"
+VR:
+daily_to:
+- "jb@domaine.fr"
+- "lb@domaine.fr"
+recap_to:
+- "jb@domaine.fr"
 
-  GRS:
-    daily_to:
-      - "PV@exemple.fr"
-      - "ST@exemple.fr"
+GRS:
+daily_to:
+- "pv@domaine.fr"
+- "st@domaine.fr"
+recap_to:
+- "pv@domaine.fr"
 
-  SLS:
-    daily_to:
-      - "AC@exemple.fr"
+SLS:
+daily_to:
+- "ac@domaine.fr"
+recap_to:
+- "ac@domaine.fr"
 
-# Mail global (toi) à 17:47 via le schedule (ou quand "clore session" déclenche un run)
-global_to:
-  - "TOI@exemple.fr"
+# mapping pour envoi immédiat (clore session)
+users:
+GR_JL:
+email: "sam9999@free.fr"
+GR_CZ:
+email: "cz@domaine.fr"
+VR_JB:
+email: "jb@domaine.fr"
+VR_LB:
+email: "lb@domaine.fr"
+GRS_PV:
+email: "pv@domaine.fr"
+GRS_ST:
+email: "st@domaine.fr"
+SLS_AC:
+email: "ac@domaine.fr"
