@@ -4,13 +4,12 @@ import json
 import base64
 import urllib.request
 import urllib.error
-import socket
 from datetime import datetime, date
 from openpyxl import Workbook
 import yaml
 import re
 from pathlib import Path
-from urllib.parse import urlparse
+from typing import List, Dict, Any, Optional, Tuple
 
 # =========================
 # EXCEL IMPORT (AGENCES)
@@ -29,9 +28,11 @@ IMPORT_COLUMNS = [
     "Contact: civilité",
     "Contact : prénom",
     "Contact : nom",
-    "DIRIGEANT",              # ✅ validé
+    "DIRIGEANT",
     "RESUME ENTRETIEN",
     "COMMANDE",
+    "INFOS COMMERCIALES",   # ✅ colonne supplémentaire demandée (resume + commande + interlocuteur + mobile)
+    "CARTE_VISITE_OCR",     # ✅ texte OCR brut (utile)
 ]
 
 BROWSER_HEADERS = {
@@ -46,7 +47,7 @@ BROWSER_HEADERS = {
 # =========================
 def load_config(path="config.yml"):
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        return yaml.safe_load(f)
 
 def normalize_emails(x):
     if x is None:
@@ -64,30 +65,11 @@ def normalize_emails(x):
             out.append(e)
     return out
 
-def normalize_base_url(u: str) -> str:
-    u = (u or "").strip()
-    u = u.rstrip("/")
-    return u
-
-def debug_dns_for_url(u: str):
-    try:
-        p = urlparse(u)
-        host = p.hostname
-        if not host:
-            print("[DNS][WARN] no hostname parsed from:", repr(u))
-            return
-        ip = socket.gethostbyname(host)
-        print("[DNS] host:", host, "->", ip)
-    except Exception as e:
-        print("[DNS][WARN] failed:", repr(e), "for:", repr(u))
-
 # =========================
 # FETCH /dump (Worker)
 # =========================
 def fetch_jsonl(url, export_token):
-    print(f"[FETCH] {repr(url)}")
-    debug_dns_for_url(url)
-
+    print(f"[FETCH] {url}")
     if not export_token:
         raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
 
@@ -102,10 +84,9 @@ def fetch_jsonl(url, export_token):
             print("[HTTP]", resp.status)
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTPError {e.code} on {repr(url)} -> {body[:300]}")
+        raise RuntimeError(f"HTTPError {e.code} on {url} -> {body[:300]}")
     except urllib.error.URLError as e:
-        # e.reason peut être gaierror (DNS) ou autre
-        raise RuntimeError(f"URLError on {repr(url)} -> {repr(e.reason)}")
+        raise RuntimeError(f"URLError on {url} -> {e.reason}")
 
     if not raw:
         return []
@@ -149,6 +130,7 @@ def count_commandes(commande_text: str) -> int:
       - "1 manutentionnaire 1 chauffeur" => 2
       - "manutentionnaire chauffeur" => 2 (2 qualifications différentes)
       - "2 manutentionnaires" => 1 (quantité ignorée)
+    Valable pour n'importe quel métier.
     """
     if not commande_text:
         return 0
@@ -187,6 +169,160 @@ def count_commandes(commande_text: str) -> int:
     return len(uniq) if uniq else 1
 
 # =========================
+# OCR (100% gratuit) via Tesseract
+# =========================
+def _safe_import_ocr():
+    try:
+        from PIL import Image
+        import pytesseract
+        return Image, pytesseract
+    except Exception as e:
+        raise RuntimeError("OCR deps missing. Add pillow+pytesseract in requirements.txt and install tesseract in workflow.") from e
+
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
+
+# FR phones: accept +33 / 0; we later filter to 04/06/07 only
+PHONE_RE = re.compile(r"(?:(?:\+|00)33|0)\s*[1-9](?:[\s.\-]*\d{2}){4}")
+
+def normalize_phone(raw: str) -> str:
+    if not raw:
+        return ""
+    s = raw.strip()
+    s = s.replace("(0)", "")
+    s = re.sub(r"[^\d+]", "", s)
+    if s.startswith("+33"):
+        s = "0" + s[3:]
+    digits = re.sub(r"\D", "", s)
+    if len(digits) < 10:
+        return ""
+    return digits[:10]
+
+def is_allowed_phone(num: str) -> bool:
+    return bool(num) and len(num) == 10 and (num.startswith("04") or num.startswith("06") or num.startswith("07"))
+
+def extract_emails(text: str) -> List[str]:
+    if not text:
+        return []
+    found = [m.group(0).lower() for m in EMAIL_RE.finditer(text)]
+    # blacklist basique
+    bad = ["noreply", "no-reply", "donotreply", "example", "exemple"]
+    out = []
+    for e in found:
+        local = e.split("@", 1)[0]
+        if any(b in local for b in bad):
+            continue
+        out.append(e)
+    # dedupe keep order
+    seen = set()
+    res = []
+    for e in out:
+        if e not in seen:
+            seen.add(e)
+            res.append(e)
+    return res
+
+def extract_phones(text: str) -> List[str]:
+    if not text:
+        return []
+    nums = []
+    for m in PHONE_RE.finditer(text):
+        n = normalize_phone(m.group(0))
+        if is_allowed_phone(n):
+            nums.append(n)
+    # dedupe keep order
+    seen = set()
+    res = []
+    for n in nums:
+        if n not in seen:
+            seen.add(n)
+            res.append(n)
+    return res
+
+def extract_address_block(text: str) -> str:
+    """
+    Heuristique simple: on cherche une ligne contenant un CP (5 chiffres)
+    et on prend +/- 1 ligne autour.
+    """
+    if not text:
+        return ""
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    for i, l in enumerate(lines):
+        if re.search(r"\b\d{5}\b", l):
+            prev = lines[i-1] if i-1 >= 0 else ""
+            nxt = lines[i+1] if i+1 < len(lines) else ""
+            block = " ".join([prev, l, nxt]).strip()
+            block = re.sub(r"\s+", " ", block)
+            return block[:180]
+    return ""
+
+def ocr_business_card(image_bytes: bytes) -> str:
+    Image, pytesseract = _safe_import_ocr()
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    # OCR FR + fallback ENG
+    txt = pytesseract.image_to_string(img, lang="fra+eng")
+    # clean
+    txt = txt.replace("\x0c", "").strip()
+    return txt
+
+# =========================
+# TELEGRAM: download file by file_id
+# =========================
+def telegram_get_file_path(telegram_token: str, file_id: str) -> str:
+    url = f"https://api.telegram.org/bot{telegram_token}/getFile?file_id={urllib.parse.quote(file_id)}"
+    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        js = json.loads(resp.read().decode("utf-8"))
+    if not js.get("ok"):
+        raise RuntimeError(f"Telegram getFile failed: {js}")
+    return js["result"]["file_path"]
+
+def telegram_download_file(telegram_token: str, file_path: str) -> bytes:
+    url = f"https://api.telegram.org/file/bot{telegram_token}/{file_path}"
+    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
+    with urllib.request.urlopen(req, timeout=45) as resp:
+        return resp.read()
+
+def enrich_from_card_if_missing(record: Dict[str, Any], telegram_token: str) -> Tuple[Dict[str, Any], str]:
+    """
+    B = Remplir uniquement les champs vides:
+      - email si vide
+      - phone (fixe/standard) si vide
+      - address si vide
+    On ne touche pas à ce que le commercial a saisi.
+    """
+    file_id = (record.get("card_file_id") or "").strip()
+    if not file_id:
+        return record, ""
+
+    try:
+        file_path = telegram_get_file_path(telegram_token, file_id)
+        img_bytes = telegram_download_file(telegram_token, file_path)
+        txt = ocr_business_card(img_bytes)
+    except Exception as e:
+        return record, f"OCR_ERROR: {e}"
+
+    # extract
+    emails = extract_emails(txt)
+    phones = extract_phones(txt)
+    addr = extract_address_block(txt)
+
+    # fill only if missing
+    if not (record.get("email") or "").strip() and emails:
+        record["email"] = emails[0]
+
+    # fixe prioritaire: on veut 04 en priorité si on trouve plusieurs
+    if not (record.get("phone") or "").strip() and phones:
+        phone04 = [p for p in phones if p.startswith("04")]
+        record["phone"] = (phone04[0] if phone04 else phones[0])
+
+    if not (record.get("address") or "").strip() and addr:
+        record["address"] = addr
+
+    return record, txt
+
+# =========================
 # EXCEL
 # =========================
 def build_excel(records):
@@ -196,6 +332,13 @@ def build_excel(records):
     ws.append(IMPORT_COLUMNS)
 
     for r in records:
+        infos_com = (
+            f"Interlocuteur: {r.get('interlocuteur','')}\n"
+            f"Mobile: {r.get('phone2','')}\n"
+            f"Résumé: {r.get('resume','')}\n"
+            f"Commande: {r.get('commande','')}"
+        ).strip()
+
         ws.append([
             r.get("name", ""),
             r.get("address", ""),
@@ -205,7 +348,7 @@ def build_excel(records):
             r.get("phone2", ""),
             r.get("email", ""),
             r.get("siret", ""),
-            r.get("naf", ""),
+            r.get("naf", ""),            # ex: 4669C (sans point)
             r.get("website", ""),
             r.get("contact_civility", ""),
             r.get("contact_firstname", ""),
@@ -213,6 +356,8 @@ def build_excel(records):
             r.get("dirigeant", ""),
             r.get("resume", ""),
             r.get("commande", ""),
+            infos_com,
+            r.get("card_ocr_text", ""),
         ])
 
     bio = io.BytesIO()
@@ -234,7 +379,7 @@ def send_email_brevo(subject, body, to_list, attachments):
 
     sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
     if not sender_email:
-        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets")
+        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets (ex: prospection@pilopro.fr)")
 
     payload = {
         "sender": {"email": sender_email, "name": "Prospection Bot"},
@@ -302,14 +447,12 @@ def aggregate_day(prospects: list[dict], agencies: dict) -> dict:
         "by_user": {},
         "totals": {"prospects": 0, "clients": 0, "commandes": 0},
     }
-
     for ag in agencies.keys():
         out["agencies"][ag] = {"prospects": 0, "clients": 0, "commandes": 0}
 
     for r in prospects:
         ag = (r.get("agency") or "").strip()
         ini = (r.get("initials") or "NA").strip().upper()
-
         cmds = count_commandes(r.get("commande", ""))
 
         if ag in out["agencies"]:
@@ -384,22 +527,15 @@ def make_ranking(by_user: dict) -> list[dict]:
 # =========================
 def main():
     cfg = load_config()
-
-    # ✅ Priorité à l'env (workflow) : beaucoup plus robuste que config.yml
-    base_from_env = os.environ.get("WORKER_BASE_URL", "").strip()
-    if base_from_env:
-        worker = normalize_base_url(base_from_env)
-        print("[CFG] worker_base_url from ENV WORKER_BASE_URL =", repr(worker))
-    else:
-        worker = normalize_base_url(cfg.get("worker_base_url") or "")
-        print("[CFG] worker_base_url from config.yml =", repr(worker))
-
+    worker = (cfg.get("worker_base_url") or "").strip().rstrip("/")
     if not worker.startswith("https://"):
-        raise RuntimeError(f"worker_base_url must start with https:// ; got {repr(worker)}")
+        raise RuntimeError("config.yml: worker_base_url must start with https://")
 
     export_token = os.environ.get("EXPORT_TOKEN", "").strip()
     if not export_token:
         raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
+
+    telegram_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
 
     run_date_str = (os.environ.get("RUN_DATE") or "").strip()
     if run_date_str:
@@ -410,10 +546,20 @@ def main():
 
     agencies_cfg = cfg.get("agencies", {})
 
-    # ===== dump prospects du jour =====
     url = f"{worker}/dump?date={date_str}&kind=prospects"
     prospects = fetch_jsonl(url, export_token)
     print("[OK] prospects rows=", len(prospects))
+
+    # ===== OCR carte de visite (B = remplir uniquement si vide) =====
+    if telegram_token:
+        for p in prospects:
+            # on stocke le texte OCR brut si dispo (utile)
+            p["card_ocr_text"] = ""
+            p2, txt = enrich_from_card_if_missing(p, telegram_token)
+            if txt:
+                p2["card_ocr_text"] = txt[:4000]  # limite raisonnable
+    else:
+        print("[OCR][SKIP] TELEGRAM_TOKEN missing in workflow secrets")
 
     agency_records = {ag: [] for ag in agencies_cfg.keys()}
     for p in prospects:
@@ -502,6 +648,7 @@ def main():
         lines_ag = [f"Récap {label} — {month_key(d)} — agence {ag}", ""]
         lines_ag.append(f"Prospects: {a.get('prospects',0)} | Clients: {a.get('clients',0)} | Commandes: {a.get('commandes',0)}")
         lines_ag.append("")
+
         users = {}
         for k, u in (period.get("by_user", {}) or {}).items():
             if (u.get("agency") or "") == ag:
@@ -554,10 +701,8 @@ def main():
         send_global_period(1, 15, "01-15")
 
     if send_end:
-        for ag in agencies_cfg.keys():
-            send_agency_period(ag, 16, ld.day, "16-fin")
+        # ⚠️ selon ton dernier cadrage: 16-fin agences ne reçoivent pas, toi oui
         send_global_period(16, ld.day, "16-fin")
-
 
 if __name__ == "__main__":
     main()
