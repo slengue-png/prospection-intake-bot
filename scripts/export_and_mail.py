@@ -5,11 +5,15 @@ import base64
 import urllib.request
 import urllib.error
 from datetime import datetime, date
-from openpyxl import Workbook
-import yaml
-import re
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Tuple, Optional
+import re
+
+import yaml
+import requests
+from openpyxl import Workbook
+from PIL import Image
+import pytesseract
 
 # =========================
 # EXCEL IMPORT (AGENCES)
@@ -31,15 +35,25 @@ IMPORT_COLUMNS = [
     "DIRIGEANT",
     "RESUME ENTRETIEN",
     "COMMANDE",
-    "INFOS COMMERCIALES",   # ✅ colonne supplémentaire demandée (resume + commande + interlocuteur + mobile)
-    "CARTE_VISITE_OCR",     # ✅ texte OCR brut (utile)
+    "INFOS_COMMERCIALES",
+    "CARTE_VISITE_FILE_ID",
 ]
 
 BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Accept-Language": "fr-FR,fr;q=0.9",
     "Connection": "close",
+}
+
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+PHONE_RE = re.compile(r"(?:(?:\+|00)33|0)\s*[1-9](?:[\s.\-]*\d{2}){4}")
+
+PARASITE_WORDS = {
+    "besoin","poste","postes","profil","profils","recherche","recherchons",
+    "urgent","urgente","asap","svp","stp","merci","cdi","cdd","interim",
+    "intérim","mission","missions","pour","de","des","du","la","le","les",
+    "a","à","au","aux","et","ou","sur","en","d","l","un","une",
 }
 
 # =========================
@@ -90,6 +104,7 @@ def fetch_jsonl(url, export_token):
 
     if not raw:
         return []
+
     rows = []
     for line in raw.splitlines():
         line = line.strip()
@@ -97,20 +112,189 @@ def fetch_jsonl(url, export_token):
             continue
         try:
             rows.append(json.loads(line))
-        except:
+        except Exception:
             pass
     return rows
 
 # =========================
-# COMMANDES -> comptage intelligent
+# TEL / EMAIL PARSING
 # =========================
-PARASITE_WORDS = {
-    "besoin","poste","postes","profil","profils","recherche","recherchons",
-    "urgent","urgente","asap","svp","stp","merci","cdi","cdd","interim",
-    "intérim","mission","missions","pour","de","des","du","la","le","les",
-    "a","à","au","aux","et","ou","sur","en","d","l","un","une",
-}
+def normalize_phone(raw: str) -> str:
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    s = s.replace("(0)", "")
+    s = re.sub(r"[^\d+]", "", s)
+    if s.startswith("+33"):
+        s = "0" + s[3:]
+    digits = re.sub(r"\D", "", s)
+    if len(digits) < 10:
+        return ""
+    return digits[:10]
 
+def phone_allowed(num: str) -> bool:
+    return bool(num) and len(num) == 10 and (num.startswith("04") or num.startswith("06") or num.startswith("07"))
+
+def pick_best_phones(nums: List[str]) -> Tuple[str, str]:
+    fixed = ""
+    mobile = ""
+    for n in nums:
+        if not phone_allowed(n):
+            continue
+        if n.startswith("04") and not fixed:
+            fixed = n
+        if (n.startswith("06") or n.startswith("07")) and not mobile:
+            mobile = n
+    return fixed, mobile
+
+def extract_emails(text: str) -> List[str]:
+    if not text:
+        return []
+    emails = [e.lower() for e in EMAIL_RE.findall(text)]
+    bad = ["noreply", "no-reply", "donotreply", "example", "exemple"]
+    out = []
+    for e in emails:
+        if any(b in e for b in bad):
+            continue
+        out.append(e)
+    seen = set()
+    res = []
+    for e in out:
+        if e not in seen:
+            seen.add(e)
+            res.append(e)
+    return res
+
+def extract_phones(text: str) -> List[str]:
+    if not text:
+        return []
+    found = []
+    for m in PHONE_RE.findall(text):
+        n = normalize_phone(m)
+        if n:
+            found.append(n)
+    seen = set()
+    res = []
+    for n in found:
+        if n not in seen:
+            seen.add(n)
+            res.append(n)
+    return res
+
+# =========================
+# TELEGRAM DOWNLOAD (card photo)
+# =========================
+def tg_api_get_file(token: str, file_id: str) -> Optional[str]:
+    url = f"https://api.telegram.org/bot{token}/getFile"
+    r = requests.get(url, params={"file_id": file_id}, timeout=20)
+    r.raise_for_status()
+    j = r.json()
+    if not j.get("ok"):
+        return None
+    return j["result"].get("file_path")
+
+def tg_download_file(token: str, file_path: str) -> bytes:
+    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    return r.content
+
+# =========================
+# OCR TESSERACT
+# =========================
+def ocr_card_image(img_bytes: bytes) -> str:
+    with Image.open(io.BytesIO(img_bytes)) as im:
+        im = im.convert("RGB")
+        # tesseract FR (installé par workflow)
+        text = pytesseract.image_to_string(im, lang="fra")
+        return text or ""
+
+def enrich_from_ocr(record: dict, ocr_text: str):
+    emails = extract_emails(ocr_text)
+    phones = extract_phones(ocr_text)
+    fixed, mobile = pick_best_phones(phones)
+
+    if not str(record.get("email", "")).strip() and emails:
+        record["email"] = emails[0]
+
+    # fixe prioritaire 04
+    if not str(record.get("phone", "")).strip() and fixed:
+        record["phone"] = fixed
+
+    # mobile
+    if not str(record.get("phone2", "")).strip() and mobile:
+        record["phone2"] = mobile
+
+# =========================
+# FREE EMAIL GRAB (site scrape) - GARDE FOU
+# =========================
+def fetch_text(url: str, timeout=10) -> str:
+    try:
+        r = requests.get(url, headers=BROWSER_HEADERS, timeout=timeout, allow_redirects=True)
+        if r.status_code != 200:
+            return ""
+        return r.text or ""
+    except Exception:
+        return ""
+
+def find_contact_pages(home_html: str, base: str) -> List[str]:
+    links = set()
+    for m in re.finditer(r'href=["\']([^"\']+)["\']', home_html or "", flags=re.IGNORECASE):
+        href = m.group(1).strip()
+        if not href or href.startswith("#"):
+            continue
+        if href.startswith("//"):
+            href = "https:" + href
+        if href.startswith("/"):
+            href = base.rstrip("/") + href
+        if not href.startswith(base):
+            continue
+
+        low = href.lower()
+        if any(k in low for k in ["contact", "mentions", "legal", "rgpd", "privacy"]):
+            links.add(href.split("#")[0])
+        if len(links) >= 6:
+            break
+    return list(links)
+
+def enrich_email_from_website(record: dict):
+    if record.get("email"):
+        return
+    website = (record.get("website") or "").strip()
+    if not website.startswith("http"):
+        return
+
+    base = website.rstrip("/")
+    home = fetch_text(base, timeout=10)
+    if not home:
+        return
+
+    candidates = [
+        base,
+        base + "/contact",
+        base + "/contactez-nous",
+        base + "/nous-contacter",
+        base + "/mentions-legales",
+        base + "/mentions",
+    ]
+    candidates.extend(find_contact_pages(home, base))
+
+    checked = 0
+    for u in candidates:
+        if checked >= 4:
+            break
+        checked += 1
+        html = fetch_text(u, timeout=10)
+        if not html:
+            continue
+        emails = extract_emails(html)
+        if emails:
+            record["email"] = emails[0]
+            return
+
+# =========================
+# COMMANDES
+# =========================
 def _stem_fr(word: str) -> str:
     w = word.strip().lower()
     w = re.sub(r"[^a-zàâäéèêëîïôöùûüç0-9\-]", "", w)
@@ -123,21 +307,11 @@ def _stem_fr(word: str) -> str:
     return w
 
 def count_commandes(commande_text: str) -> int:
-    """
-    Règles:
-      - "1 manutentionnaire" => 1
-      - "1" => 1
-      - "1 manutentionnaire 1 chauffeur" => 2
-      - "manutentionnaire chauffeur" => 2 (2 qualifications différentes)
-      - "2 manutentionnaires" => 1 (quantité ignorée)
-    Valable pour n'importe quel métier.
-    """
     if not commande_text:
         return 0
     s = str(commande_text).strip()
     if not s:
         return 0
-
     if re.fullmatch(r"\d+", s):
         return 1
 
@@ -158,169 +332,11 @@ def count_commandes(commande_text: str) -> int:
     uniq = set()
     for w in words:
         ww = _stem_fr(w)
-        if not ww:
-            continue
-        if ww in PARASITE_WORDS:
-            continue
-        if ww.isdigit():
+        if not ww or ww in PARASITE_WORDS or ww.isdigit():
             continue
         uniq.add(ww)
 
     return len(uniq) if uniq else 1
-
-# =========================
-# OCR (100% gratuit) via Tesseract
-# =========================
-def _safe_import_ocr():
-    try:
-        from PIL import Image
-        import pytesseract
-        return Image, pytesseract
-    except Exception as e:
-        raise RuntimeError("OCR deps missing. Add pillow+pytesseract in requirements.txt and install tesseract in workflow.") from e
-
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
-
-# FR phones: accept +33 / 0; we later filter to 04/06/07 only
-PHONE_RE = re.compile(r"(?:(?:\+|00)33|0)\s*[1-9](?:[\s.\-]*\d{2}){4}")
-
-def normalize_phone(raw: str) -> str:
-    if not raw:
-        return ""
-    s = raw.strip()
-    s = s.replace("(0)", "")
-    s = re.sub(r"[^\d+]", "", s)
-    if s.startswith("+33"):
-        s = "0" + s[3:]
-    digits = re.sub(r"\D", "", s)
-    if len(digits) < 10:
-        return ""
-    return digits[:10]
-
-def is_allowed_phone(num: str) -> bool:
-    return bool(num) and len(num) == 10 and (num.startswith("04") or num.startswith("06") or num.startswith("07"))
-
-def extract_emails(text: str) -> List[str]:
-    if not text:
-        return []
-    found = [m.group(0).lower() for m in EMAIL_RE.finditer(text)]
-    # blacklist basique
-    bad = ["noreply", "no-reply", "donotreply", "example", "exemple"]
-    out = []
-    for e in found:
-        local = e.split("@", 1)[0]
-        if any(b in local for b in bad):
-            continue
-        out.append(e)
-    # dedupe keep order
-    seen = set()
-    res = []
-    for e in out:
-        if e not in seen:
-            seen.add(e)
-            res.append(e)
-    return res
-
-def extract_phones(text: str) -> List[str]:
-    if not text:
-        return []
-    nums = []
-    for m in PHONE_RE.finditer(text):
-        n = normalize_phone(m.group(0))
-        if is_allowed_phone(n):
-            nums.append(n)
-    # dedupe keep order
-    seen = set()
-    res = []
-    for n in nums:
-        if n not in seen:
-            seen.add(n)
-            res.append(n)
-    return res
-
-def extract_address_block(text: str) -> str:
-    """
-    Heuristique simple: on cherche une ligne contenant un CP (5 chiffres)
-    et on prend +/- 1 ligne autour.
-    """
-    if not text:
-        return ""
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-    if not lines:
-        return ""
-    for i, l in enumerate(lines):
-        if re.search(r"\b\d{5}\b", l):
-            prev = lines[i-1] if i-1 >= 0 else ""
-            nxt = lines[i+1] if i+1 < len(lines) else ""
-            block = " ".join([prev, l, nxt]).strip()
-            block = re.sub(r"\s+", " ", block)
-            return block[:180]
-    return ""
-
-def ocr_business_card(image_bytes: bytes) -> str:
-    Image, pytesseract = _safe_import_ocr()
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    # OCR FR + fallback ENG
-    txt = pytesseract.image_to_string(img, lang="fra+eng")
-    # clean
-    txt = txt.replace("\x0c", "").strip()
-    return txt
-
-# =========================
-# TELEGRAM: download file by file_id
-# =========================
-def telegram_get_file_path(telegram_token: str, file_id: str) -> str:
-    url = f"https://api.telegram.org/bot{telegram_token}/getFile?file_id={urllib.parse.quote(file_id)}"
-    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        js = json.loads(resp.read().decode("utf-8"))
-    if not js.get("ok"):
-        raise RuntimeError(f"Telegram getFile failed: {js}")
-    return js["result"]["file_path"]
-
-def telegram_download_file(telegram_token: str, file_path: str) -> bytes:
-    url = f"https://api.telegram.org/file/bot{telegram_token}/{file_path}"
-    req = urllib.request.Request(url, headers=BROWSER_HEADERS)
-    with urllib.request.urlopen(req, timeout=45) as resp:
-        return resp.read()
-
-def enrich_from_card_if_missing(record: Dict[str, Any], telegram_token: str) -> Tuple[Dict[str, Any], str]:
-    """
-    B = Remplir uniquement les champs vides:
-      - email si vide
-      - phone (fixe/standard) si vide
-      - address si vide
-    On ne touche pas à ce que le commercial a saisi.
-    """
-    file_id = (record.get("card_file_id") or "").strip()
-    if not file_id:
-        return record, ""
-
-    try:
-        file_path = telegram_get_file_path(telegram_token, file_id)
-        img_bytes = telegram_download_file(telegram_token, file_path)
-        txt = ocr_business_card(img_bytes)
-    except Exception as e:
-        return record, f"OCR_ERROR: {e}"
-
-    # extract
-    emails = extract_emails(txt)
-    phones = extract_phones(txt)
-    addr = extract_address_block(txt)
-
-    # fill only if missing
-    if not (record.get("email") or "").strip() and emails:
-        record["email"] = emails[0]
-
-    # fixe prioritaire: on veut 04 en priorité si on trouve plusieurs
-    if not (record.get("phone") or "").strip() and phones:
-        phone04 = [p for p in phones if p.startswith("04")]
-        record["phone"] = (phone04[0] if phone04 else phones[0])
-
-    if not (record.get("address") or "").strip() and addr:
-        record["address"] = addr
-
-    return record, txt
 
 # =========================
 # EXCEL
@@ -332,12 +348,11 @@ def build_excel(records):
     ws.append(IMPORT_COLUMNS)
 
     for r in records:
-        infos_com = (
-            f"Interlocuteur: {r.get('interlocuteur','')}\n"
-            f"Mobile: {r.get('phone2','')}\n"
-            f"Résumé: {r.get('resume','')}\n"
-            f"Commande: {r.get('commande','')}"
-        ).strip()
+        infos_com = " | ".join([x for x in [
+            f"Interlocuteur: {r.get('interlocuteur','')}".strip(),
+            f"Entretien: {r.get('resume','')}".strip(),
+            f"Commande: {r.get('commande','')}".strip(),
+        ] if x and x not in ["Interlocuteur:", "Entretien:", "Commande:"]])
 
         ws.append([
             r.get("name", ""),
@@ -348,7 +363,7 @@ def build_excel(records):
             r.get("phone2", ""),
             r.get("email", ""),
             r.get("siret", ""),
-            r.get("naf", ""),            # ex: 4669C (sans point)
+            r.get("naf", ""),
             r.get("website", ""),
             r.get("contact_civility", ""),
             r.get("contact_firstname", ""),
@@ -357,7 +372,7 @@ def build_excel(records):
             r.get("resume", ""),
             r.get("commande", ""),
             infos_com,
-            r.get("card_ocr_text", ""),
+            r.get("card_photo_file_id", ""),
         ])
 
     bio = io.BytesIO()
@@ -365,7 +380,7 @@ def build_excel(records):
     return bio.getvalue()
 
 # =========================
-# EMAIL (Brevo API)
+# EMAIL (Brevo)
 # =========================
 def send_email_brevo(subject, body, to_list, attachments):
     api_key = os.environ.get("BREVO_API_KEY", "").strip()
@@ -379,7 +394,7 @@ def send_email_brevo(subject, body, to_list, attachments):
 
     sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
     if not sender_email:
-        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets (ex: prospection@pilopro.fr)")
+        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets")
 
     payload = {
         "sender": {"email": sender_email, "name": "Prospection Bot"},
@@ -401,26 +416,15 @@ def send_email_brevo(subject, body, to_list, attachments):
     req.add_header("Content-Type", "application/json")
     req.add_header("api-key", api_key)
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            print("[BREVO] status:", resp.status, "| to:", ",".join(to_list), "| subject:", subject)
-            _ = resp.read()
-    except urllib.error.HTTPError as e:
-        err = e.read().decode("utf-8", errors="replace")
-        print("[BREVO][HTTPERROR]", e.code, err[:400].replace("\n", " "))
-        raise
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        print("[BREVO] status:", resp.status, "| to:", ",".join(to_list), "| subject:", subject)
+        _ = resp.read()
 
 # =========================
-# CUMUL MENSUEL (repo)
+# CUMUL MENSUEL
 # =========================
 def parse_date_yyyy_mm_dd(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
-
-def last_day_of_month(d: date) -> date:
-    if d.month == 12:
-        return date(d.year, 12, 31)
-    nxt = date(d.year, d.month + 1, 1)
-    return nxt.fromordinal(nxt.toordinal() - 1)
 
 def month_key(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
@@ -434,19 +438,15 @@ def load_cumul(path: Path) -> dict:
         return {"month": path.stem.replace("cumul_", ""), "days": {}, "updated_at_utc": ""}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except:
+    except Exception:
         return {"month": path.stem.replace("cumul_", ""), "days": {}, "updated_at_utc": ""}
 
 def save_cumul(path: Path, data: dict):
     data["updated_at_utc"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def aggregate_day(prospects: list[dict], agencies: dict) -> dict:
-    out = {
-        "agencies": {},
-        "by_user": {},
-        "totals": {"prospects": 0, "clients": 0, "commandes": 0},
-    }
+def aggregate_day(prospects: List[dict], agencies: dict) -> dict:
+    out = {"agencies": {}, "by_user": {}, "totals": {"prospects": 0, "clients": 0, "commandes": 0}}
     for ag in agencies.keys():
         out["agencies"][ag] = {"prospects": 0, "clients": 0, "commandes": 0}
 
@@ -469,59 +469,6 @@ def aggregate_day(prospects: list[dict], agencies: dict) -> dict:
 
     return out
 
-def aggregate_period(cumul: dict, start_day: int, end_day: int) -> dict:
-    res = {
-        "agencies": {},
-        "by_user": {},
-        "totals": {"prospects": 0, "clients": 0, "commandes": 0},
-    }
-
-    for day_str, day_data in cumul.get("days", {}).items():
-        try:
-            dd = parse_date_yyyy_mm_dd(day_str)
-        except:
-            continue
-        if not (start_day <= dd.day <= end_day):
-            continue
-
-        t = day_data.get("totals", {})
-        res["totals"]["prospects"] += int(t.get("prospects", 0))
-        res["totals"]["clients"] += int(t.get("clients", 0))
-        res["totals"]["commandes"] += int(t.get("commandes", 0))
-
-        for ag, a in (day_data.get("agencies", {}) or {}).items():
-            res["agencies"].setdefault(ag, {"prospects": 0, "clients": 0, "commandes": 0})
-            res["agencies"][ag]["prospects"] += int(a.get("prospects", 0))
-            res["agencies"][ag]["clients"] += int(a.get("clients", 0))
-            res["agencies"][ag]["commandes"] += int(a.get("commandes", 0))
-
-        for k, u in (day_data.get("by_user", {}) or {}).items():
-            res["by_user"].setdefault(k, {"agency": u.get("agency",""), "initials": u.get("initials","NA"),
-                                          "prospects": 0, "clients": 0, "commandes": 0})
-            res["by_user"][k]["prospects"] += int(u.get("prospects", 0))
-            res["by_user"][k]["clients"] += int(u.get("clients", 0))
-            res["by_user"][k]["commandes"] += int(u.get("commandes", 0))
-
-    return res
-
-def make_ranking(by_user: dict) -> list[dict]:
-    rows = []
-    for _, u in by_user.items():
-        p = int(u.get("prospects", 0))
-        c = int(u.get("clients", 0))
-        cmd = int(u.get("commandes", 0))
-        tx = (cmd / p * 100.0) if p else 0.0
-        rows.append({
-            "agency": u.get("agency", ""),
-            "initials": u.get("initials", "NA"),
-            "prospects": p,
-            "clients": c,
-            "commandes": cmd,
-            "tx": tx,
-        })
-    rows.sort(key=lambda r: (r["commandes"], r["tx"], r["prospects"]), reverse=True)
-    return rows
-
 # =========================
 # MAIN
 # =========================
@@ -532,177 +479,88 @@ def main():
         raise RuntimeError("config.yml: worker_base_url must start with https://")
 
     export_token = os.environ.get("EXPORT_TOKEN", "").strip()
-    if not export_token:
-        raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
-
     telegram_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    if not telegram_token:
+        raise RuntimeError("TELEGRAM_TOKEN missing in GitHub Secrets (needed for card photos download)")
 
     run_date_str = (os.environ.get("RUN_DATE") or "").strip()
-    if run_date_str:
-        d = parse_date_yyyy_mm_dd(run_date_str)
-    else:
-        d = datetime.utcnow().date()
+    d = parse_date_yyyy_mm_dd(run_date_str) if run_date_str else datetime.utcnow().date()
     date_str = d.strftime("%Y-%m-%d")
 
     agencies_cfg = cfg.get("agencies", {})
 
+    # ===== dump prospects du jour =====
     url = f"{worker}/dump?date={date_str}&kind=prospects"
     prospects = fetch_jsonl(url, export_token)
     print("[OK] prospects rows=", len(prospects))
 
-    # ===== OCR carte de visite (B = remplir uniquement si vide) =====
-    if telegram_token:
-        for p in prospects:
-            # on stocke le texte OCR brut si dispo (utile)
-            p["card_ocr_text"] = ""
-            p2, txt = enrich_from_card_if_missing(p, telegram_token)
-            if txt:
-                p2["card_ocr_text"] = txt[:4000]  # limite raisonnable
-    else:
-        print("[OCR][SKIP] TELEGRAM_TOKEN missing in workflow secrets")
+    # ===== OCR + enrich =====
+    for r in prospects:
+        file_id = (r.get("card_photo_file_id") or "").strip()
+        if file_id:
+            try:
+                fp = tg_api_get_file(telegram_token, file_id)
+                if fp:
+                    img_bytes = tg_download_file(telegram_token, fp)
+                    txt = ocr_card_image(img_bytes)
+                    enrich_from_ocr(r, txt)
+            except Exception as e:
+                print("[OCR][WARN]", str(e)[:160])
 
+        # email gratuit via site (si vide)
+        try:
+            enrich_email_from_website(r)
+        except Exception as e:
+            print("[WEB][WARN]", str(e)[:160])
+
+    # ===== split par agence =====
     agency_records = {ag: [] for ag in agencies_cfg.keys()}
     for p in prospects:
         ag = p.get("agency", "")
         if ag in agency_records:
             agency_records[ag].append(p)
 
-    # ===== emails agences (excel import) =====
+    # ===== emails agences (excel + PJ cartes) =====
     for ag, recs in agency_records.items():
         to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
         excel = build_excel(recs)
+
+        card_attachments = []
+        for i, r in enumerate(recs, 1):
+            file_id = (r.get("card_photo_file_id") or "").strip()
+            if not file_id:
+                continue
+            try:
+                fp = tg_api_get_file(telegram_token, file_id)
+                if not fp:
+                    continue
+                img = tg_download_file(telegram_token, fp)
+                card_attachments.append((f"{date_str}_{ag}_carte_{i}.jpg", img))
+            except Exception as e:
+                print("[CARD][WARN]", str(e)[:160])
 
         nb_prospects = len(recs)
         nb_clients = 0
         nb_commandes = sum(count_commandes(r.get("commande", "")) for r in recs)
 
+        attachments = [(f"{date_str}_{ag}_IMPORT.xlsx", excel)]
+        attachments.extend(card_attachments)
+
         send_email_brevo(
             f"[PROSPECTION] {ag} — {date_str}",
-            f"Export agence {ag}\n"
-            f"Prospects: {nb_prospects}\n"
-            f"Clients: {nb_clients}\n"
-            f"Commandes: {nb_commandes}\n",
+            f"Export agence {ag}\nProspects: {nb_prospects}\nClients: {nb_clients}\nCommandes: {nb_commandes}\n\n"
+            f"Cartes de visite jointes: {len(card_attachments)}\n",
             to_list,
-            [(f"{date_str}_{ag}_IMPORT.xlsx", excel)],
+            attachments,
         )
 
-    # ===== email global quotidien (toi) =====
-    lines = [f"Résumé global prospection — {date_str}", ""]
-    total_p = 0
-    total_c = 0
-    total_cmd = 0
-
-    for ag in agency_records.keys():
-        recs = agency_records[ag]
-        nb_p = len(recs)
-        nb_c = 0
-        nb_cmd = sum(count_commandes(r.get("commande", "")) for r in recs)
-
-        total_p += nb_p
-        total_c += nb_c
-        total_cmd += nb_cmd
-
-        lines.append(f"{ag} — Prospects: {nb_p} | Clients: {nb_c} | Commandes: {nb_cmd}")
-
-        by_init = {}
-        for r in recs:
-            ini = (r.get("initials") or "NA").strip().upper()
-            by_init.setdefault(ini, []).append(r)
-
-        for ini, rr in sorted(by_init.items()):
-            pcount = len(rr)
-            ccount = 0
-            cmdcount = sum(count_commandes(x.get("commande", "")) for x in rr)
-            tx = (cmdcount / pcount * 100.0) if pcount else 0.0
-            lines.append(f"  - {ini}: {pcount} prospects | {ccount} clients | {cmdcount} commandes | Tx: {tx:.1f}%")
-
-        lines.append("")
-
-    lines.append(f"TOTAL GLOBAL — Prospects: {total_p} | Clients: {total_c} | Commandes: {total_cmd}")
-
-    global_to = cfg.get("global_to", [])
-    send_email_brevo(
-        f"[PROSPECTION] GLOBAL — {date_str}",
-        "\n".join(lines),
-        global_to,
-        [],
-    )
-
-    # ===== cumul mensuel dans repo =====
+    # ===== cumul mensuel =====
     cumul_file = cumul_path_for(d)
     cumul = load_cumul(cumul_file)
-
     day_agg = aggregate_day(prospects, agencies_cfg)
     cumul["days"][date_str] = day_agg
     save_cumul(cumul_file, cumul)
     print("[CUMUL] updated:", str(cumul_file))
-
-    # ===== envois 15/15 et fin de mois =====
-    ld = last_day_of_month(d)
-    send_mid = (d.day == 15)
-    send_end = (d == ld)
-
-    def send_agency_period(ag: str, start_day: int, end_day: int, label: str):
-        period = aggregate_period(cumul, start_day, end_day)
-        a = (period.get("agencies", {}) or {}).get(ag, {"prospects":0,"clients":0,"commandes":0})
-        lines_ag = [f"Récap {label} — {month_key(d)} — agence {ag}", ""]
-        lines_ag.append(f"Prospects: {a.get('prospects',0)} | Clients: {a.get('clients',0)} | Commandes: {a.get('commandes',0)}")
-        lines_ag.append("")
-
-        users = {}
-        for k, u in (period.get("by_user", {}) or {}).items():
-            if (u.get("agency") or "") == ag:
-                users[k] = u
-        rank = make_ranking(users)
-        if rank:
-            lines_ag.append("Classement commerciaux (agence)")
-            for i, r in enumerate(rank, 1):
-                lines_ag.append(f"{i}. {r['initials']} — {r['prospects']} prospects | {r['commandes']} commandes | Tx: {r['tx']:.1f}%")
-        else:
-            lines_ag.append("Aucune donnée sur la période.")
-
-        to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
-        send_email_brevo(
-            f"[PROSPECTION] {ag} — {label} — {month_key(d)}",
-            "\n".join(lines_ag),
-            to_list,
-            [],
-        )
-
-    def send_global_period(start_day: int, end_day: int, label: str):
-        period = aggregate_period(cumul, start_day, end_day)
-        t = period.get("totals", {"prospects":0,"clients":0,"commandes":0})
-        lines_g = [f"Récap GLOBAL {label} — {month_key(d)}", ""]
-        lines_g.append("Par agence")
-        for ag in agencies_cfg.keys():
-            a = (period.get("agencies", {}) or {}).get(ag, {"prospects":0,"clients":0,"commandes":0})
-            lines_g.append(f"- {ag}: Prospects {a.get('prospects',0)} | Clients {a.get('clients',0)} | Commandes {a.get('commandes',0)}")
-        lines_g.append("")
-        lines_g.append(f"TOTAL: Prospects {t.get('prospects',0)} | Clients {t.get('clients',0)} | Commandes {t.get('commandes',0)}")
-        lines_g.append("")
-        rank = make_ranking(period.get("by_user", {}) or {})
-        lines_g.append("Classement commerciaux (global)")
-        if rank:
-            for i, r in enumerate(rank, 1):
-                lines_g.append(f"{i}. {r['agency']} / {r['initials']} — {r['prospects']} prospects | {r['commandes']} commandes | Tx: {r['tx']:.1f}%")
-        else:
-            lines_g.append("Aucune donnée sur la période.")
-
-        send_email_brevo(
-            f"[PROSPECTION] GLOBAL — {label} — {month_key(d)}",
-            "\n".join(lines_g),
-            global_to,
-            [],
-        )
-
-    if send_mid:
-        for ag in agencies_cfg.keys():
-            send_agency_period(ag, 1, 15, "01-15")
-        send_global_period(1, 15, "01-15")
-
-    if send_end:
-        # ⚠️ selon ton dernier cadrage: 16-fin agences ne reçoivent pas, toi oui
-        send_global_period(16, ld.day, "16-fin")
 
 if __name__ == "__main__":
     main()
