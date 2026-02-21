@@ -1,29 +1,15 @@
-# =========================
-# Prospection Intake Bot
-# =========================
-
-# URL publique du Worker Cloudflare (OBLIGATOIRE)
-# Doit commencer par https:// et NE PAS finir par /
 worker_base_url: "https://prospection-intake-worker.slengue.workers.dev"
 
-# Email global (toi) : reçoit le récap global quotidien + les récap périodiques
+# destinataire global (toi)
 global_to:
   - "samuel.lengue@ras-interim.fr"
 
-# Paramétrage des agences (destinataires des exports immédiats + récap)
 agencies:
   GR:
-    daily_to:
-      - "samuel.lengue@ras-interim.fr"
-      - "samuel.lengue@ras-interim.fr"
+    daily_to: ["samuel.lengue@ras-interim.fr", "cz@domaine.fr"]
   VR:
-    daily_to:
-      - "samuel.lengue@ras-interim.fr"
-      - "samuel.lengue@ras-interim.fr"
+    daily_to: ["jb@domaine.fr", "lb@domaine.fr"]
   GRS:
-    daily_to:
-      - "samuel.lengue@ras-interim.fr"
-      - "samuel.lengue@ras-interim.fr"
+    daily_to: ["pv@domaine.fr", "st@domaine.fr"]
   SLS:
-    daily_to:
-      - "samuel.lengue@ras-interim.frr"
+    daily_to: ["ac@domaine.fr"]
