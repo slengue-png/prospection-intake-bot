@@ -3,16 +3,13 @@ name: Prospection — Export & Mail
 on:
   schedule:
     # GitHub Actions = UTC
-    # 12:30 FR (hiver) = 11:30 UTC
-    # 17:00 FR (hiver) = 16:00 UTC
-    - cron: "30 11 * * *"
-    - cron: "0 16 * * *"
+    - cron: "30 11 * * *"   # 12:30 FR (hiver)
+    - cron: "0 16 * * *"    # 17:00 FR (hiver)
   workflow_dispatch:
     inputs:
       run_date:
-        description: "Date (optionnel) : YYYY-MM-DD"
+        description: "Date YYYY-MM-DD (optionnel)"
         required: false
-        default: ""
 
 permissions:
   contents: write
@@ -29,37 +26,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install deps
-        run: pip install -r requirements.txt
-
-      # ✅ DEBUG béton : on vérifie l'URL du worker et la résolution DNS côté GitHub
-      - name: Debug worker connectivity
-        env:
-          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+      - name: Install system deps (Tesseract OCR)
         run: |
-          echo "WORKER_BASE_URL=$WORKER_BASE_URL"
-          python - <<'PY'
-          import os, socket, urllib.parse
-          u = os.environ.get("WORKER_BASE_URL","").strip()
-          print("RAW:", repr(u))
-          if not u:
-            raise SystemExit("Missing WORKER_BASE_URL secret")
-          p = urllib.parse.urlparse(u)
-          print("PARSED:", p)
-          host = p.hostname
-          print("HOST:", host)
-          print("DNS:", socket.gethostbyname(host))
-          PY
-          echo "---- curl /health ----"
-          curl -i "$WORKER_BASE_URL/health" || true
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
+
+      - name: Install python deps
+        run: pip install -r requirements.txt
 
       - name: Export & mail
         env:
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           RUN_DATE: ${{ github.event.inputs.run_date }}
-          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
         run: python scripts/export_and_mail.py
 
       - name: Commit monthly cumul (data/)
