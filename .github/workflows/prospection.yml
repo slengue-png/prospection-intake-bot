@@ -10,6 +10,7 @@ on:
       run_date:
         description: "Date YYYY-MM-DD (optionnel)"
         required: false
+        default: ""
 
 permissions:
   contents: write
@@ -32,7 +33,8 @@ jobs:
           sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
 
       - name: Install python deps
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
 
       - name: Export & mail
         env:
@@ -41,7 +43,8 @@ jobs:
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           RUN_DATE: ${{ github.event.inputs.run_date }}
-        run: python scripts/export_and_mail.py
+        run: |
+          python scripts/export_and_mail.py
 
       - name: Commit monthly cumul (data/)
         run: |
