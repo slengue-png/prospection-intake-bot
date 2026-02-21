@@ -162,9 +162,9 @@
     "2026-02-21": {
       "agencies": {
         "GR": {
-          "prospects": 3,
+          "prospects": 4,
           "clients": 0,
-          "commandes": 1
+          "commandes": 2
         },
         "VR": {
           "prospects": 0,
@@ -189,14 +189,21 @@
           "prospects": 3,
           "clients": 0,
           "commandes": 1
+        },
+        "GR|CZ": {
+          "agency": "GR",
+          "initials": "CZ",
+          "prospects": 1,
+          "clients": 0,
+          "commandes": 1
         }
       },
       "totals": {
-        "prospects": 3,
+        "prospects": 4,
         "clients": 0,
-        "commandes": 1
+        "commandes": 2
       }
     }
   },
-  "updated_at_utc": "2026-02-21T09:20:18Z"
+  "updated_at_utc": "2026-02-21T09:31:48Z"
 }
