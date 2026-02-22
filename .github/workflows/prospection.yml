@@ -4,19 +4,18 @@ on:
   schedule:
     # GitHub Actions = UTC
     - cron: "30 11 * * *"   # 12:30 FR (hiver)
-    - cron: "00 16 * * *"   # 17:00 FR (hiver)
+    - cron: "0 16 * * *"    # 17:00 FR (hiver)
   workflow_dispatch:
     inputs:
       run_date:
         description: "Date YYYY-MM-DD (optionnel)"
         required: false
-        default: ""
 
 permissions:
   contents: write
 
 jobs:
-  export_mail:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,21 +26,33 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system deps (Tesseract OCR + FR)
+      - name: Install system deps (Tesseract OCR)
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
 
       - name: Install python deps
-        run: |
-          pip install -r requirements.txt
+        run: pip install -r requirements.txt
 
       - name: Export & mail
         env:
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           RUN_DATE: ${{ github.event.inputs.run_date }}
+        run: python scripts/export_and_mail.py
+
+      - name: Commit monthly cumul (data/)
         run: |
-          python scripts/export_and_mail.py
+          git config user.name "prospection-bot"
+          git config user.email "prospection-bot@users.noreply.github.com"
+
+          git add data/ || true
+          if git diff --cached --quiet; then
+            echo "No cumul changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update monthly cumul"
+          git push
