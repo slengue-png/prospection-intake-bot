@@ -48,6 +48,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Compute RUN_DATE (Europe/Paris) if empty
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.run_date }}" ]; then
+            echo "RUN_DATE=${{ inputs.run_date }}" >> $GITHUB_ENV
+          else
+            echo "RUN_DATE=$(TZ=Europe/Paris date +%F)" >> $GITHUB_ENV
+          fi
+
+          echo "AGENCY=${{ inputs.agency }}" >> $GITHUB_ENV
+          echo "INITIALS=${{ inputs.initials }}" >> $GITHUB_ENV
+          echo "VISITS_CLIENTS=${{ inputs.visits_clients }}" >> $GITHUB_ENV
+          echo "VISITS_PROSPECTS=${{ inputs.visits_prospects }}" >> $GITHUB_ENV
+          echo "COMMANDES=${{ inputs.commandes }}" >> $GITHUB_ENV
+
       - name: Install system deps (Tesseract OCR)
         run: |
           sudo apt-get update
@@ -62,12 +77,12 @@ jobs:
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          RUN_DATE: ${{ inputs.run_date }}
-          AGENCY: ${{ inputs.agency }}
-          INITIALS: ${{ inputs.initials }}
-          VISITS_CLIENTS: ${{ inputs.visits_clients }}
-          VISITS_PROSPECTS: ${{ inputs.visits_prospects }}
-          COMMANDES: ${{ inputs.commandes }}
+          RUN_DATE: ${{ env.RUN_DATE }}
+          AGENCY: ${{ env.AGENCY }}
+          INITIALS: ${{ env.INITIALS }}
+          VISITS_CLIENTS: ${{ env.VISITS_CLIENTS }}
+          VISITS_PROSPECTS: ${{ env.VISITS_PROSPECTS }}
+          COMMANDES: ${{ env.COMMANDES }}
         run: python scripts/export_and_mail.py
 
       - name: Commit monthly cumul (data/)
