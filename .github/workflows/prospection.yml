@@ -3,28 +3,34 @@ name: Prospection — Export & Mail
 on:
   schedule:
     # GitHub Actions = UTC
-    # 17:45 FR (hiver) = 16:45 UTC
-    - cron: "45 16 * * *"
+    - cron: "30 11 * * *"   # 12:30 FR (hiver)
+    - cron: "0 16 * * *"    # 17:00 FR (hiver)
   workflow_dispatch:
     inputs:
       run_date:
-        description: "Date YYYY-MM-DD (optionnel) — sinon aujourd’hui"
+        description: "Date YYYY-MM-DD (optionnel)"
         required: false
+        default: ""
       agency:
         description: "Agence (optionnel)"
         required: false
+        default: ""
       initials:
         description: "Initiales (optionnel)"
         required: false
+        default: ""
       visits_clients:
-        description: "Nb visites clients (optionnel)"
+        description: "Clôture: visites clients (optionnel)"
         required: false
+        default: ""
       visits_prospects:
-        description: "Nb visites prospects (optionnel)"
+        description: "Clôture: visites prospects (optionnel)"
         required: false
-      visites_commandes:
-        description: "Nb visites commandes (optionnel)"
+        default: ""
+      commandes:
+        description: "Clôture: commandes (optionnel)"
         required: false
+        default: ""
 
 permissions:
   contents: write
@@ -55,12 +61,16 @@ jobs:
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
+          # IMPORTANT: RUN_DATE taken from dispatch input if provided
           RUN_DATE: ${{ github.event.inputs.run_date }}
-          AGENCY: ${{ github.event.inputs.agency }}
-          INITIALS: ${{ github.event.inputs.initials }}
-          VISITS_CLIENTS: ${{ github.event.inputs.visits_clients }}
-          VISITS_PROSPECTS: ${{ github.event.inputs.visits_prospects }}
-          VISITES_COMMANDES: ${{ github.event.inputs.visites_commandes }}
+
+          # Optional close stats (if you want to inject into email later)
+          CLOSE_AGENCY: ${{ github.event.inputs.agency }}
+          CLOSE_INITIALS: ${{ github.event.inputs.initials }}
+          CLOSE_VISITS_CLIENTS: ${{ github.event.inputs.visits_clients }}
+          CLOSE_VISITS_PROSPECTS: ${{ github.event.inputs.visits_prospects }}
+          CLOSE_COMMANDES: ${{ github.event.inputs.commandes }}
         run: python scripts/export_and_mail.py
 
       - name: Commit monthly cumul (data/)
