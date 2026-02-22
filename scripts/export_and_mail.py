@@ -1,6 +1,5 @@
 import os, io, json, base64, re, urllib.request, urllib.error
 from datetime import datetime, date
-from pathlib import Path
 from typing import List, Optional, Tuple
 
 import yaml
@@ -13,8 +12,11 @@ import pytesseract
 # EXCEL COLUMNS (agences)
 # =========================
 IMPORT_COLUMNS = [
-    "NOM","ADRESSE","CODE POSTAL","VILLE","TELEPHONE","TELEPHONE 2","MAIL","SIRET","NAF","SITE WEB",
-    "Contact: civilité","Contact : prénom","Contact : nom","DIRIGEANT","RESUME ENTRETIEN","COMMANDE",
+    "NOM","ADRESSE","CODE POSTAL","VILLE",
+    "TELEPHONE","TELEPHONE 2","MAIL",
+    "SIRET","NAF","SITE WEB",
+    "Contact: civilité","Contact : prénom","Contact : nom",
+    "DIRIGEANT","RESUME ENTRETIEN","COMMANDE",
     "INFOS_COMMERCIALES",
     "CARTE_VISITE_FILE_ID",
 ]
@@ -189,7 +191,6 @@ def tg_download_file(token: str, file_path: str) -> Optional[bytes]:
 def ocr_card_image(img_bytes: bytes) -> str:
     with Image.open(io.BytesIO(img_bytes)) as im:
         im = im.convert("RGB")
-        # si tu veux améliorer: resize/contrast; on reste stable
         txt = pytesseract.image_to_string(im, lang="fra")
         return txt or ""
 
@@ -382,7 +383,6 @@ def main():
 
     # OCR + enrich + website scrape
     for r in prospects:
-        # 1) OCR carte si file_id présent
         file_id = (r.get("card_photo_file_id") or "").strip()
         if file_id:
             fp = tg_api_get_file(telegram_token, file_id)
@@ -399,7 +399,6 @@ def main():
                     except Exception as e:
                         print("[OCR][WARN]", str(e)[:160])
 
-        # 2) email via site si toujours vide
         try:
             enrich_email_from_website(r)
         except Exception as e:
@@ -434,8 +433,10 @@ def main():
 
             ext = "jpg"
             low = fp.lower()
-            if low.endswith(".png"): ext = "png"
-            elif low.endswith(".webp"): ext = "webp"
+            if low.endswith(".png"):
+                ext = "png"
+            elif low.endswith(".webp"):
+                ext = "webp"
             card_attachments.append((f"{date_str}_{ag}_carte_{i}.{ext}", img))
 
         print(f"[CARD] agency={ag} attachments={len(card_attachments)} / records={len(recs)}")
