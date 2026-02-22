@@ -1,15 +1,37 @@
 name: Prospection — Export & Mail
 
 on:
+  # exécution automatique (UTC)
   schedule:
-    # GitHub Actions = UTC
-    - cron: "30 11 * * *"   # 12:30 FR (hiver)
-    - cron: "0 16 * * *"    # 17:00 FR (hiver)
+    - cron: "30 11 * * *"   # 12:30 FR hiver
+    - cron: "0 16 * * *"    # 17:00 FR hiver
+  # déclenchement manuel + via Worker (workflow_dispatch)
   workflow_dispatch:
     inputs:
       run_date:
-        description: "Date YYYY-MM-DD (optionnel)"
+        description: "Date YYYY-MM-DD (optionnel, sinon aujourd'hui UTC)"
         required: false
+        default: ""
+      agency:
+        description: "Code agence (optionnel)"
+        required: false
+        default: ""
+      initials:
+        description: "Initiales commercial (optionnel)"
+        required: false
+        default: ""
+      visits_clients:
+        description: "Nb visites clients (optionnel)"
+        required: false
+        default: "0"
+      visits_prospects:
+        description: "Nb visites prospects (optionnel)"
+        required: false
+        default: "0"
+      commandes:
+        description: "Nb commandes (optionnel)"
+        required: false
+        default: "0"
 
 permissions:
   contents: write
@@ -17,6 +39,8 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,16 +56,37 @@ jobs:
           sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
 
       - name: Install python deps
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Export & mail
         env:
+          # Worker -> /dump
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+
+          # Brevo
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+
+          # Telegram (pour download cartes)
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
+          # Optionnel si ton script l'utilise
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+
+          # date fournie par dispatch (ou vide)
           RUN_DATE: ${{ github.event.inputs.run_date }}
-        run: python scripts/export_and_mail.py
+
+          # stats clôture (optionnelles)
+          AGENCY: ${{ github.event.inputs.agency }}
+          INITIALS: ${{ github.event.inputs.initials }}
+          VISITS_CLIENTS: ${{ github.event.inputs.visits_clients }}
+          VISITS_PROSPECTS: ${{ github.event.inputs.visits_prospects }}
+          COMMANDES: ${{ github.event.inputs.commandes }}
+
+        run: |
+          python scripts/export_and_mail.py
 
       - name: Commit monthly cumul (data/)
         run: |
