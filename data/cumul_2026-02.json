@@ -207,9 +207,9 @@
     "2026-02-22": {
       "agencies": {
         "GR": {
-          "prospects": 15,
+          "prospects": 17,
           "clients": 0,
-          "commandes": 12
+          "commandes": 13
         },
         "VR": {
           "prospects": 0,
@@ -231,9 +231,9 @@
         "GR|JL": {
           "agency": "GR",
           "initials": "JL",
-          "prospects": 9,
+          "prospects": 11,
           "clients": 0,
-          "commandes": 7
+          "commandes": 8
         },
         "GR|SL": {
           "agency": "GR",
@@ -251,11 +251,11 @@
         }
       },
       "totals": {
-        "prospects": 15,
+        "prospects": 17,
         "clients": 0,
-        "commandes": 12
+        "commandes": 13
       }
     }
   },
-  "updated_at_utc": "2026-02-22T21:30:55Z"
+  "updated_at_utc": "2026-02-22T21:40:45Z"
 }
