@@ -1,71 +1,74 @@
-name: Prospection - Cloture Session
+name: Prospection Export & Mail
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "session | agency_daily | global_daily"
+        required: true
+        default: "session"
       run_date:
-        description: "Date au format YYYY-MM-DD"
+        description: "Date au format YYYY-MM-DD (Europe/Paris)"
         required: true
-        type: string
       agency:
-        description: "Agence (GR, VR, GRS, SLS)"
-        required: true
-        type: string
+        description: "Agence (GR|VR|GRS|SLS) requis si mode=session ou agency_daily"
+        required: false
       initials:
-        description: "Initiales collaborateur"
-        required: true
-        type: string
-
-      # ✅ AJOUT OBLIGATOIRE (sinon 422)
+        description: "Initiales (JL, CZ, ...) requis si mode=session"
+        required: false
       visits_clients:
-        description: "Nombre de visites clients"
+        description: "Clôture: nb visites clients (optionnel)"
         required: false
-        default: ""
-        type: string
       visits_prospects:
-        description: "Nombre de visites prospects"
+        description: "Clôture: nb visites prospects (optionnel)"
         required: false
-        default: ""
-        type: string
       commandes:
-        description: "Nombre de commandes"
+        description: "Clôture: nb commandes (optionnel)"
         required: false
-        default: ""
-        type: string
+
+  schedule:
+    # Récaps du soir (heure UTC)
+    # 17:45 Paris = 16:45 UTC (en hiver) / 15:45 UTC (en été)
+    # On reste simple: tu ajusteras si besoin.
+    - cron: "45 16 * * 1-5"   # ~17:45 FR en hiver (lun-ven)
+    - cron: "59 22 * * 1-5"   # 23:59 FR approx en hiver (optionnel)
 
 jobs:
   run-export:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
+      - name: Install system deps (tesseract)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
+
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run export session
+      - name: Run export and mail
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          EXPORT_BASE_URL: ${{ secrets.EXPORT_BASE_URL }}
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
 
-          MODE: "session"
-          RUN_DATE: ${{ inputs.run_date }}
-          AGENCY: ${{ inputs.agency }}
-          INITIALS: ${{ inputs.initials }}
-
-          # on les passe au script (même si pas encore exploités)
-          VISITS_CLIENTS: ${{ inputs.visits_clients }}
-          VISITS_PROSPECTS: ${{ inputs.visits_prospects }}
-          COMMANDES: ${{ inputs.commandes }}
-
+          MODE: ${{ github.event.inputs.mode }}
+          RUN_DATE: ${{ github.event.inputs.run_date }}
+          AGENCY: ${{ github.event.inputs.agency }}
+          INITIALS: ${{ github.event.inputs.initials }}
+          VISITS_CLIENTS: ${{ github.event.inputs.visits_clients }}
+          VISITS_PROSPECTS: ${{ github.event.inputs.visits_prospects }}
+          COMMANDES: ${{ github.event.inputs.commandes }}
         run: |
           python scripts/export_and_mail.py
