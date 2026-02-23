@@ -6,12 +6,32 @@ on:
       run_date:
         description: "Date au format YYYY-MM-DD"
         required: true
+        type: string
       agency:
         description: "Agence (GR, VR, GRS, SLS)"
         required: true
+        type: string
       initials:
         description: "Initiales collaborateur"
         required: true
+        type: string
+
+      # ✅ AJOUT OBLIGATOIRE (sinon 422)
+      visits_clients:
+        description: "Nombre de visites clients"
+        required: false
+        default: ""
+        type: string
+      visits_prospects:
+        description: "Nombre de visites prospects"
+        required: false
+        default: ""
+        type: string
+      commandes:
+        description: "Nombre de commandes"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   run-export:
@@ -33,13 +53,19 @@ jobs:
       - name: Run export session
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           EXPORT_BASE_URL: ${{ secrets.EXPORT_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
           MODE: "session"
           RUN_DATE: ${{ inputs.run_date }}
           AGENCY: ${{ inputs.agency }}
           INITIALS: ${{ inputs.initials }}
+
+          # on les passe au script (même si pas encore exploités)
+          VISITS_CLIENTS: ${{ inputs.visits_clients }}
+          VISITS_PROSPECTS: ${{ inputs.visits_prospects }}
+          COMMANDES: ${{ inputs.commandes }}
+
         run: |
           python scripts/export_and_mail.py
