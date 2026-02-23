@@ -5,16 +5,20 @@ import base64
 import urllib.request
 import urllib.error
 from datetime import datetime, date
-from zoneinfo import ZoneInfo
-from openpyxl import Workbook
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional
+
 import yaml
 import re
-from pathlib import Path
-from typing import List, Tuple, Optional
-
 import requests
+from openpyxl import Workbook
 from PIL import Image
 import pytesseract
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 
 # =========================
 # EXCEL IMPORT (AGENCES)
@@ -47,10 +51,13 @@ BROWSER_HEADERS = {
     "Connection": "close",
 }
 
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+PHONE_RE = re.compile(r"(?:(?:\+|00)33|0)\s*[1-9](?:[\s.\-]*\d{2}){4}")
+
 # =========================
 # CONFIG
 # =========================
-def load_config(path="config.yml"):
+def load_config(path="config.yml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
@@ -70,11 +77,10 @@ def normalize_emails(x):
             out.append(e)
     return out
 
-# =========================
-# DATE (Europe/Paris by default)
-# =========================
-def paris_today() -> date:
-    return datetime.now(ZoneInfo("Europe/Paris")).date()
+def today_fr_yyyymmdd() -> str:
+    if ZoneInfo is None:
+        return datetime.utcnow().date().strftime("%Y-%m-%d")
+    return datetime.now(ZoneInfo("Europe/Paris")).date().strftime("%Y-%m-%d")
 
 def parse_date_yyyy_mm_dd(s: str) -> date:
     return datetime.strptime(s, "%Y-%m-%d").date()
@@ -82,7 +88,7 @@ def parse_date_yyyy_mm_dd(s: str) -> date:
 # =========================
 # FETCH /dump (Worker)
 # =========================
-def fetch_jsonl(url, export_token):
+def fetch_jsonl(url: str, export_token: str) -> List[dict]:
     print(f"[FETCH] {url}")
     if not export_token:
         raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
@@ -111,16 +117,13 @@ def fetch_jsonl(url, export_token):
             continue
         try:
             rows.append(json.loads(line))
-        except:
+        except Exception:
             pass
     return rows
 
 # =========================
 # TEL / EMAIL PARSING
 # =========================
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-PHONE_RE = re.compile(r"(?:(?:\+|00)33|0)\s*[1-9](?:[\s.\-]*\d{2}){4}")
-
 def normalize_phone(raw: str) -> str:
     if not raw:
         return ""
@@ -141,6 +144,7 @@ def pick_best_phones(nums: List[str]) -> Tuple[str, str]:
     fixed = ""
     mobile = ""
     for n in nums:
+        n = normalize_phone(n)
         if not phone_allowed(n):
             continue
         if n.startswith("04") and not fixed:
@@ -225,7 +229,7 @@ def enrich_from_ocr(record: dict, ocr_text: str):
         record["phone2"] = mobile
 
 # =========================
-# FREE EMAIL GRAB (site scrape) - GARDE FOU
+# FREE EMAIL GRAB (website scrape) - GARDE FOU
 # =========================
 def fetch_text(url: str, timeout=10) -> str:
     try:
@@ -233,7 +237,7 @@ def fetch_text(url: str, timeout=10) -> str:
         if r.status_code != 200:
             return ""
         return r.text or ""
-    except:
+    except Exception:
         return ""
 
 def find_contact_pages(home_html: str, base: str) -> List[str]:
@@ -291,7 +295,7 @@ def enrich_email_from_website(record: dict):
             return
 
 # =========================
-# COMMANDES -> comptage intelligent
+# COMMANDES -> comptage intelligent (simple)
 # =========================
 PARASITE_WORDS = {
     "besoin","poste","postes","profil","profils","recherche","recherchons",
@@ -346,7 +350,7 @@ def count_commandes(commande_text: str) -> int:
 # =========================
 # EXCEL
 # =========================
-def build_excel(records):
+def build_excel(records: List[dict]) -> bytes:
     wb = Workbook()
     ws = wb.active
     ws.title = "IMPORT"
@@ -387,7 +391,7 @@ def build_excel(records):
 # =========================
 # EMAIL (Brevo)
 # =========================
-def send_email_brevo(subject, body, to_list, attachments):
+def send_email_brevo(subject: str, body: str, to_list, attachments: List[Tuple[str, bytes]]):
     api_key = os.environ.get("BREVO_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("BREVO_API_KEY missing in GitHub Secrets")
@@ -440,15 +444,19 @@ def load_cumul(path: Path) -> dict:
         return {"month": path.stem.replace("cumul_", ""), "days": {}, "updated_at_utc": ""}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except:
+    except Exception:
         return {"month": path.stem.replace("cumul_", ""), "days": {}, "updated_at_utc": ""}
 
 def save_cumul(path: Path, data: dict):
     data["updated_at_utc"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def aggregate_day(prospects: List[dict], agencies: dict) -> dict:
-    out = {"agencies": {}, "by_user": {}, "totals": {"prospects": 0, "clients": 0, "commandes": 0}}
+def aggregate_day(prospects: List[dict], agencies: dict, closes: List[dict]) -> dict:
+    out = {
+        "agencies": {},
+        "by_user": {},
+        "totals": {"prospects": 0, "clients": 0, "commandes": 0, "close_visits_clients": 0, "close_visits_prospects": 0, "close_commandes": 0},
+    }
     for ag in agencies.keys():
         out["agencies"][ag] = {"prospects": 0, "clients": 0, "commandes": 0}
 
@@ -469,6 +477,15 @@ def aggregate_day(prospects: List[dict], agencies: dict) -> dict:
         out["totals"]["prospects"] += 1
         out["totals"]["commandes"] += cmds
 
+    # close stats (optionnel)
+    for c in closes:
+        try:
+            out["totals"]["close_visits_clients"] += int(str(c.get("visits_clients", "0")).strip() or "0")
+            out["totals"]["close_visits_prospects"] += int(str(c.get("visits_prospects", "0")).strip() or "0")
+            out["totals"]["close_commandes"] += int(str(c.get("commandes", "0")).strip() or "0")
+        except Exception:
+            pass
+
     return out
 
 # =========================
@@ -485,19 +502,20 @@ def main():
     if not telegram_token:
         raise RuntimeError("TELEGRAM_TOKEN missing in GitHub Secrets (needed for card photos download)")
 
-    # ✅ FIX: date Europe/Paris par défaut
     run_date_str = (os.environ.get("RUN_DATE") or "").strip()
-    d = parse_date_yyyy_mm_dd(run_date_str) if run_date_str else paris_today()
-    date_str = d.strftime("%Y-%m-%d")
-
-    # ✅ anti-confusion Gmail: on met un timestamp d'exécution
-    run_ts = datetime.now(ZoneInfo("Europe/Paris")).strftime("%Y%m%d-%H%M%S")
+    date_str = run_date_str if run_date_str else today_fr_yyyymmdd()
 
     agencies_cfg = cfg.get("agencies", {})
 
+    # ===== dump prospects du jour =====
     url = f"{worker}/dump?date={date_str}&kind=prospects"
     prospects = fetch_jsonl(url, export_token)
-    print("[OK] date=", date_str, "| prospects rows=", len(prospects))
+    print("[OK] prospects rows=", len(prospects))
+
+    # ===== dump closes du jour =====
+    closes_url = f"{worker}/dump?date={date_str}&kind=closes"
+    closes = fetch_jsonl(closes_url, export_token)
+    print("[OK] closes rows=", len(closes))
 
     # ===== OCR + enrich =====
     for r in prospects:
@@ -518,7 +536,7 @@ def main():
             print("[WEB][WARN]", str(e)[:160])
 
     # ===== split par agence =====
-    agency_records = {ag: [] for ag in agencies_cfg.keys()}
+    agency_records: Dict[str, List[dict]] = {ag: [] for ag in agencies_cfg.keys()}
     for p in prospects:
         ag = (p.get("agency") or "").strip()
         if ag in agency_records:
@@ -527,7 +545,6 @@ def main():
     # ===== emails agences (excel + PJ cartes) =====
     for ag, recs in agency_records.items():
         to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
-
         excel = build_excel(recs)
 
         # PJ cartes: toutes les cartes de l'agence
@@ -539,11 +556,9 @@ def main():
             try:
                 fp = tg_api_get_file(telegram_token, file_id)
                 if not fp:
-                    print(f"[CARD][WARN] getFile failed agency={ag} i={i} file_id={file_id[:12]}...")
                     continue
                 img = tg_download_file(telegram_token, fp)
-                # ✅ nom unique
-                card_attachments.append((f"{date_str}_{ag}_{run_ts}_carte_{i}.jpg", img))
+                card_attachments.append((f"{date_str}_{ag}_carte_{i}.jpg", img))
             except Exception as e:
                 print("[CARD][WARN]", str(e)[:160])
 
@@ -551,28 +566,37 @@ def main():
         nb_clients = 0
         nb_commandes = sum(count_commandes(r.get("commande", "")) for r in recs)
 
-        attachments = [(f"{date_str}_{ag}_{run_ts}_IMPORT.xlsx", excel)]
+        attachments = [(f"{date_str}_{ag}_IMPORT.xlsx", excel)]
         attachments.extend(card_attachments)
 
-        subject = f"[PROSPECTION] {ag} — {date_str} ({run_ts})"
-        body = (
-            f"Export agence {ag}\n"
-            f"Date: {date_str}\n"
-            f"Run: {run_ts}\n\n"
-            f"Prospects: {nb_prospects}\n"
-            f"Clients: {nb_clients}\n"
-            f"Commandes: {nb_commandes}\n"
+        # close recap (global, informatif)
+        close_txt = ""
+        if closes:
+            # dernier close de l'agence si présent
+            last = None
+            for c in closes:
+                if (c.get("agency") or "").strip() == ag:
+                    last = c
+            if last:
+                close_txt = (
+                    f"\nClôture (dernier): VC={last.get('visits_clients','')}, "
+                    f"VP={last.get('visits_prospects','')}, CMD={last.get('commandes','')}\n"
+                )
+
+        send_email_brevo(
+            f"[PROSPECTION] {ag} — {date_str}",
+            f"Export agence {ag}\nProspects: {nb_prospects}\nClients: {nb_clients}\nCommandes: {nb_commandes}\n"
             f"Cartes de visite jointes: {len(card_attachments)}\n"
+            f"{close_txt}",
+            to_list,
+            attachments,
         )
 
-        print(f"[SEND] {ag} -> prospects={nb_prospects} cards={len(card_attachments)} to={to_list}")
-
-        send_email_brevo(subject, body, to_list, attachments)
-
     # ===== cumul mensuel =====
+    d = parse_date_yyyy_mm_dd(date_str)
     cumul_file = cumul_path_for(d)
     cumul = load_cumul(cumul_file)
-    day_agg = aggregate_day(prospects, agencies_cfg)
+    day_agg = aggregate_day(prospects, agencies_cfg, closes)
     cumul["days"][date_str] = day_agg
     save_cumul(cumul_file, cumul)
     print("[CUMUL] updated:", str(cumul_file))
