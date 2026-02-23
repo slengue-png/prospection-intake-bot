@@ -7,10 +7,10 @@ on:
         description: "Date YYYY-MM-DD (optionnel). Si vide: date Europe/Paris."
         required: false
       agency:
-        description: "Agence (optionnel, informatif)"
+        description: "Agence (optionnel)"
         required: false
       initials:
-        description: "Initiales (optionnel, informatif)"
+        description: "Initiales (optionnel)"
         required: false
       visits_clients:
         description: "Visites clients (optionnel)"
@@ -22,11 +22,6 @@ on:
         description: "Commandes (optionnel)"
         required: false
 
-  schedule:
-    # UTC. Ajuste si tu veux 12:30 FR / 17:00 FR en hiver :
-    - cron: "30 11 * * *"
-    - cron: "00 16 * * *"
-
 permissions:
   contents: write
 
@@ -34,6 +29,15 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
+      - name: Show inputs
+        run: |
+          echo "run_date=${{ github.event.inputs.run_date }}"
+          echo "agency=${{ github.event.inputs.agency }}"
+          echo "initials=${{ github.event.inputs.initials }}"
+          echo "visits_clients=${{ github.event.inputs.visits_clients }}"
+          echo "visits_prospects=${{ github.event.inputs.visits_prospects }}"
+          echo "commandes=${{ github.event.inputs.commandes }}"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -59,7 +63,6 @@ jobs:
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
 
           RUN_DATE: ${{ github.event.inputs.run_date }}
-
           CLOSE_AGENCY: ${{ github.event.inputs.agency }}
           CLOSE_INITIALS: ${{ github.event.inputs.initials }}
           CLOSE_VISITS_CLIENTS: ${{ github.event.inputs.visits_clients }}
@@ -71,12 +74,10 @@ jobs:
         run: |
           git config user.name "prospection-bot"
           git config user.email "prospection-bot@users.noreply.github.com"
-
           git add data/ || true
           if git diff --cached --quiet; then
             echo "No cumul changes to commit."
             exit 0
           fi
-
           git commit -m "Update monthly cumul"
           git push
