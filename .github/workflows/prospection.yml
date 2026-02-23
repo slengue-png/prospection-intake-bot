@@ -4,58 +4,79 @@ on:
   workflow_dispatch:
     inputs:
       run_date:
-        description: "Date YYYY-MM-DD"
+        description: "Date YYYY-MM-DD (optionnel). Si vide: date Europe/Paris."
         required: false
-        default: ""
       agency:
-        description: "Agence"
+        description: "Agence (optionnel, informatif)"
         required: false
-        default: ""
       initials:
-        description: "Initiales"
+        description: "Initiales (optionnel, informatif)"
         required: false
-        default: ""
       visits_clients:
-        description: "Visites clients"
+        description: "Visites clients (optionnel)"
         required: false
-        default: ""
       visits_prospects:
-        description: "Visites prospects"
+        description: "Visites prospects (optionnel)"
         required: false
-        default: ""
       commandes:
-        description: "Commandes"
+        description: "Commandes (optionnel)"
         required: false
-        default: ""
+
+  schedule:
+    # UTC. Ajuste si tu veux 12:30 FR / 17:00 FR en hiver :
+    - cron: "30 11 * * *"
+    - cron: "00 16 * * *"
+
+permissions:
+  contents: write
 
 jobs:
-  export_mail:
+  run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install system deps (Tesseract OCR)
         run: |
-          pip install -r requirements.txt
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
 
-      - name: Run export
+      - name: Install python deps
+        run: pip install -r requirements.txt
+
+      - name: Export & mail
         env:
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
-          WORKER_DUMP_URL: ${{ secrets.WORKER_DUMP_URL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
-          BREVO_TO_EMAILS: ${{ secrets.BREVO_TO_EMAILS }}
 
           RUN_DATE: ${{ github.event.inputs.run_date }}
+
           CLOSE_AGENCY: ${{ github.event.inputs.agency }}
           CLOSE_INITIALS: ${{ github.event.inputs.initials }}
           CLOSE_VISITS_CLIENTS: ${{ github.event.inputs.visits_clients }}
           CLOSE_VISITS_PROSPECTS: ${{ github.event.inputs.visits_prospects }}
           CLOSE_COMMANDES: ${{ github.event.inputs.commandes }}
+        run: python scripts/export_and_mail.py
+
+      - name: Commit monthly cumul (data/)
         run: |
-          python scripts/export_and_mail.py
+          git config user.name "prospection-bot"
+          git config user.email "prospection-bot@users.noreply.github.com"
+
+          git add data/ || true
+          if git diff --cached --quiet; then
+            echo "No cumul changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Update monthly cumul"
+          git push
