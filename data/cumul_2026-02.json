@@ -248,7 +248,64 @@
         "clients": 0,
         "commandes": 4
       }
+    },
+    "2026-02-23": {
+      "agencies": {
+        "GR": {
+          "prospects": 1,
+          "clients": 0,
+          "commandes": 1
+        },
+        "SL": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "VR": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "SLS": {
+          "prospects": 0,
+          "clients": 0,
+          "commandes": 0
+        },
+        "GRS": {
+          "prospects": 4,
+          "clients": 0,
+          "commandes": 2
+        }
+      },
+      "by_user": {
+        "GR|JL": {
+          "agency": "GR",
+          "initials": "JL",
+          "prospects": 1,
+          "clients": 0,
+          "commandes": 1
+        },
+        "GRS|SL": {
+          "agency": "GRS",
+          "initials": "SL",
+          "prospects": 3,
+          "clients": 0,
+          "commandes": 1
+        },
+        "GRS|PV": {
+          "agency": "GRS",
+          "initials": "PV",
+          "prospects": 1,
+          "clients": 0,
+          "commandes": 1
+        }
+      },
+      "totals": {
+        "prospects": 5,
+        "clients": 0,
+        "commandes": 3
+      }
     }
   },
-  "updated_at_utc": "2026-02-22T22:43:50Z"
+  "updated_at_utc": "2026-02-23T17:23:26Z"
 }
