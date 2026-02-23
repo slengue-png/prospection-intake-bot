@@ -267,9 +267,9 @@
           "commandes": 0
         },
         "SLS": {
-          "prospects": 0,
+          "prospects": 1,
           "clients": 0,
-          "commandes": 0
+          "commandes": 1
         },
         "GRS": {
           "prospects": 4,
@@ -298,14 +298,21 @@
           "prospects": 1,
           "clients": 0,
           "commandes": 1
+        },
+        "SLS|SL": {
+          "agency": "SLS",
+          "initials": "SL",
+          "prospects": 1,
+          "clients": 0,
+          "commandes": 1
         }
       },
       "totals": {
-        "prospects": 5,
+        "prospects": 6,
         "clients": 0,
-        "commandes": 3
+        "commandes": 4
       }
     }
   },
-  "updated_at_utc": "2026-02-23T17:23:26Z"
+  "updated_at_utc": "2026-02-23T17:38:04Z"
 }
