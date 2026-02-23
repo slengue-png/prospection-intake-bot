@@ -5,20 +5,16 @@ import base64
 import urllib.request
 import urllib.error
 from datetime import datetime, date
+import re
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
-import yaml
-import re
 import requests
-from openpyxl import Workbook
-from PIL import Image
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 import pytesseract
+from openpyxl import Workbook
+import yaml
 
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
 
 # =========================
 # EXCEL IMPORT (AGENCES)
@@ -51,15 +47,14 @@ BROWSER_HEADERS = {
     "Connection": "close",
 }
 
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-PHONE_RE = re.compile(r"(?:(?:\+|00)33|0)\s*[1-9](?:[\s.\-]*\d{2}){4}")
 
 # =========================
 # CONFIG
 # =========================
-def load_config(path="config.yml") -> dict:
+def load_config(path="config.yml"):
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
+
 
 def normalize_emails(x):
     if x is None:
@@ -77,18 +72,11 @@ def normalize_emails(x):
             out.append(e)
     return out
 
-def today_fr_yyyymmdd() -> str:
-    if ZoneInfo is None:
-        return datetime.utcnow().date().strftime("%Y-%m-%d")
-    return datetime.now(ZoneInfo("Europe/Paris")).date().strftime("%Y-%m-%d")
-
-def parse_date_yyyy_mm_dd(s: str) -> date:
-    return datetime.strptime(s, "%Y-%m-%d").date()
 
 # =========================
 # FETCH /dump (Worker)
 # =========================
-def fetch_jsonl(url: str, export_token: str) -> List[dict]:
+def fetch_jsonl(url, export_token):
     print(f"[FETCH] {url}")
     if not export_token:
         raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
@@ -117,13 +105,20 @@ def fetch_jsonl(url: str, export_token: str) -> List[dict]:
             continue
         try:
             rows.append(json.loads(line))
-        except Exception:
+        except:
             pass
     return rows
+
 
 # =========================
 # TEL / EMAIL PARSING
 # =========================
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+# FR phone broad, then filter
+PHONE_RE = re.compile(r"(?:(?:\+|00)33|0)\s*[1-9](?:[\s.\-]*\d{2}){4}")
+
+
 def normalize_phone(raw: str) -> str:
     if not raw:
         return ""
@@ -137,21 +132,34 @@ def normalize_phone(raw: str) -> str:
         return ""
     return digits[:10]
 
+
 def phone_allowed(num: str) -> bool:
     return bool(num) and len(num) == 10 and (num.startswith("04") or num.startswith("06") or num.startswith("07"))
 
+
 def pick_best_phones(nums: List[str]) -> Tuple[str, str]:
+    """
+    Retourne (fixed04_or_otherFixed, mobile06_07)
+    """
     fixed = ""
     mobile = ""
     for n in nums:
-        n = normalize_phone(n)
         if not phone_allowed(n):
             continue
         if n.startswith("04") and not fixed:
             fixed = n
         if (n.startswith("06") or n.startswith("07")) and not mobile:
             mobile = n
+    # si pas de 04, on accepte un fixe non-01 si présent
+    if not fixed:
+        for n in nums:
+            if not n or len(n) != 10:
+                continue
+            if n.startswith(("02", "03", "05", "08", "09")):
+                fixed = n
+                break
     return fixed, mobile
+
 
 def extract_emails(text: str) -> List[str]:
     if not text:
@@ -171,6 +179,7 @@ def extract_emails(text: str) -> List[str]:
             res.append(e)
     return res
 
+
 def extract_phones(text: str) -> List[str]:
     if not text:
         return []
@@ -187,6 +196,7 @@ def extract_phones(text: str) -> List[str]:
             res.append(n)
     return res
 
+
 # =========================
 # TELEGRAM DOWNLOAD (card photo)
 # =========================
@@ -199,37 +209,108 @@ def tg_api_get_file(token: str, file_id: str) -> Optional[str]:
         return None
     return j["result"].get("file_path")
 
+
 def tg_download_file(token: str, file_path: str) -> bytes:
     url = f"https://api.telegram.org/file/bot{token}/{file_path}"
     r = requests.get(url, timeout=30)
     r.raise_for_status()
     return r.content
 
+
 # =========================
-# OCR TESSERACT
+# OCR TESSERACT (✅ correction complète)
 # =========================
+def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
+    """
+    Prétraitement "robuste" pour photos Telegram:
+    - rotation auto via EXIF
+    - upscale
+    - gris + autocontrast
+    - sharpen léger
+    - binarisation douce (seuil)
+    """
+    im = ImageOps.exif_transpose(im)  # corrige rotation iPhone/Android
+    im = im.convert("RGB")
+
+    # upscale pour aider Tesseract
+    w, h = im.size
+    scale = 2.0 if max(w, h) < 2200 else 1.5
+    im = im.resize((int(w * scale), int(h * scale)))
+
+    # grayscale + contraste
+    gray = im.convert("L")
+    gray = ImageOps.autocontrast(gray)
+
+    # réduction bruit / sharp
+    gray = gray.filter(ImageFilter.MedianFilter(size=3))
+    gray = ImageEnhance.Sharpness(gray).enhance(1.6)
+    gray = ImageEnhance.Contrast(gray).enhance(1.4)
+
+    # binarisation douce
+    # seuil adaptatif simple: moyenne * 0.95
+    hist = gray.histogram()
+    total = sum(hist)
+    acc = 0
+    mean = 0
+    for i, v in enumerate(hist):
+        acc += v
+        mean += i * v
+    mean = mean / total if total else 128
+    thr = int(mean * 0.95)
+    bw = gray.point(lambda x: 255 if x > thr else 0)
+
+    return bw
+
+
 def ocr_card_image(img_bytes: bytes) -> str:
+    """
+    OCR gratuit via tesseract (installé via apt).
+    Amélioré pour cartes de visite.
+    """
     with Image.open(io.BytesIO(img_bytes)) as im:
-        im = im.convert("RGB")
-        text = pytesseract.image_to_string(im, lang="fra")
+        proc = _preprocess_for_ocr(im)
+
+        # config tesseract: psm 6 = bloc de texte
+        config = "--oem 1 --psm 6"
+        text = pytesseract.image_to_string(proc, lang="fra", config=config)
+
+        # fallback: parfois mieux en psm 11 (texte épars)
+        if not text or len(text.strip()) < 10:
+            text2 = pytesseract.image_to_string(proc, lang="fra", config="--oem 1 --psm 11")
+            if len((text2 or "").strip()) > len((text or "").strip()):
+                text = text2
+
         return text or ""
 
+
 def enrich_from_ocr(record: dict, ocr_text: str):
+    """
+    ✅ Remplit email/phones si manquants.
+    ✅ Remplit aussi record["mobile"] (champ Telegram) si présent.
+    """
     emails = extract_emails(ocr_text)
     phones = extract_phones(ocr_text)
     fixed, mobile = pick_best_phones(phones)
 
+    # email
     if not str(record.get("email", "")).strip() and emails:
         record["email"] = emails[0]
 
+    # téléphone fixe prioritaire
     if not str(record.get("phone", "")).strip() and fixed:
         record["phone"] = fixed
 
+    # téléphone2 = mobile
     if not str(record.get("phone2", "")).strip() and mobile:
         record["phone2"] = mobile
 
+    # ✅ champ mobile (si ton worker le remplit / si tu l’attends)
+    if not str(record.get("mobile", "")).strip() and mobile:
+        record["mobile"] = mobile
+
+
 # =========================
-# FREE EMAIL GRAB (website scrape) - GARDE FOU
+# FREE EMAIL GRAB (site scrape) - GARDE FOU
 # =========================
 def fetch_text(url: str, timeout=10) -> str:
     try:
@@ -237,8 +318,9 @@ def fetch_text(url: str, timeout=10) -> str:
         if r.status_code != 200:
             return ""
         return r.text or ""
-    except Exception:
+    except:
         return ""
+
 
 def find_contact_pages(home_html: str, base: str) -> List[str]:
     links = set()
@@ -259,7 +341,13 @@ def find_contact_pages(home_html: str, base: str) -> List[str]:
             break
     return list(links)
 
+
 def enrich_email_from_website(record: dict):
+    """
+    Gratuit, mais limité pour éviter de planter:
+    - 1 domaine / fiche
+    - max 4 pages
+    """
     if record.get("email"):
         return
     website = (record.get("website") or "").strip()
@@ -294,8 +382,9 @@ def enrich_email_from_website(record: dict):
             record["email"] = emails[0]
             return
 
+
 # =========================
-# COMMANDES -> comptage intelligent (simple)
+# COMMANDES -> comptage intelligent (inchangé)
 # =========================
 PARASITE_WORDS = {
     "besoin","poste","postes","profil","profils","recherche","recherchons",
@@ -347,10 +436,11 @@ def count_commandes(commande_text: str) -> int:
 
     return len(uniq) if uniq else 1
 
+
 # =========================
 # EXCEL
 # =========================
-def build_excel(records: List[dict]) -> bytes:
+def build_excel(records):
     wb = Workbook()
     ws = wb.active
     ws.title = "IMPORT"
@@ -361,7 +451,11 @@ def build_excel(records: List[dict]) -> bytes:
             f"Interlocuteur: {r.get('interlocuteur','')}".strip(),
             f"Entretien: {r.get('resume','')}".strip(),
             f"Commande: {r.get('commande','')}".strip(),
-        ] if x and x not in ("Interlocuteur:", "Entretien:", "Commande:")])
+        ] if x and x != "Interlocuteur:" and x != "Entretien:" and x != "Commande:"])
+
+        # NAF -> sans point (2312Z)
+        naf = str(r.get("naf","") or "").strip().upper()
+        naf = re.sub(r"[^0-9A-Z]", "", naf)
 
         ws.append([
             r.get("name", ""),
@@ -372,7 +466,7 @@ def build_excel(records: List[dict]) -> bytes:
             r.get("phone2", ""),
             r.get("email", ""),
             r.get("siret", ""),
-            r.get("naf", ""),
+            naf,
             r.get("website", ""),
             r.get("contact_civility", ""),
             r.get("contact_firstname", ""),
@@ -388,10 +482,11 @@ def build_excel(records: List[dict]) -> bytes:
     wb.save(bio)
     return bio.getvalue()
 
+
 # =========================
 # EMAIL (Brevo)
 # =========================
-def send_email_brevo(subject: str, body: str, to_list, attachments: List[Tuple[str, bytes]]):
+def send_email_brevo(subject, body, to_list, attachments):
     api_key = os.environ.get("BREVO_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("BREVO_API_KEY missing in GitHub Secrets")
@@ -429,9 +524,13 @@ def send_email_brevo(subject: str, body: str, to_list, attachments: List[Tuple[s
         print("[BREVO] status:", resp.status, "| to:", ",".join(to_list), "| subject:", subject)
         _ = resp.read()
 
+
 # =========================
 # CUMUL MENSUEL
 # =========================
+def parse_date_yyyy_mm_dd(s: str) -> date:
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
 def month_key(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
@@ -444,19 +543,15 @@ def load_cumul(path: Path) -> dict:
         return {"month": path.stem.replace("cumul_", ""), "days": {}, "updated_at_utc": ""}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except:
         return {"month": path.stem.replace("cumul_", ""), "days": {}, "updated_at_utc": ""}
 
 def save_cumul(path: Path, data: dict):
     data["updated_at_utc"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def aggregate_day(prospects: List[dict], agencies: dict, closes: List[dict]) -> dict:
-    out = {
-        "agencies": {},
-        "by_user": {},
-        "totals": {"prospects": 0, "clients": 0, "commandes": 0, "close_visits_clients": 0, "close_visits_prospects": 0, "close_commandes": 0},
-    }
+def aggregate_day(prospects: List[dict], agencies: dict) -> dict:
+    out = {"agencies": {}, "by_user": {}, "totals": {"prospects": 0, "clients": 0, "commandes": 0}}
     for ag in agencies.keys():
         out["agencies"][ag] = {"prospects": 0, "clients": 0, "commandes": 0}
 
@@ -477,16 +572,8 @@ def aggregate_day(prospects: List[dict], agencies: dict, closes: List[dict]) -> 
         out["totals"]["prospects"] += 1
         out["totals"]["commandes"] += cmds
 
-    # close stats (optionnel)
-    for c in closes:
-        try:
-            out["totals"]["close_visits_clients"] += int(str(c.get("visits_clients", "0")).strip() or "0")
-            out["totals"]["close_visits_prospects"] += int(str(c.get("visits_prospects", "0")).strip() or "0")
-            out["totals"]["close_commandes"] += int(str(c.get("commandes", "0")).strip() or "0")
-        except Exception:
-            pass
-
     return out
+
 
 # =========================
 # MAIN
@@ -503,7 +590,8 @@ def main():
         raise RuntimeError("TELEGRAM_TOKEN missing in GitHub Secrets (needed for card photos download)")
 
     run_date_str = (os.environ.get("RUN_DATE") or "").strip()
-    date_str = run_date_str if run_date_str else today_fr_yyyymmdd()
+    d = parse_date_yyyy_mm_dd(run_date_str) if run_date_str else datetime.utcnow().date()
+    date_str = d.strftime("%Y-%m-%d")
 
     agencies_cfg = cfg.get("agencies", {})
 
@@ -511,11 +599,6 @@ def main():
     url = f"{worker}/dump?date={date_str}&kind=prospects"
     prospects = fetch_jsonl(url, export_token)
     print("[OK] prospects rows=", len(prospects))
-
-    # ===== dump closes du jour =====
-    closes_url = f"{worker}/dump?date={date_str}&kind=closes"
-    closes = fetch_jsonl(closes_url, export_token)
-    print("[OK] closes rows=", len(closes))
 
     # ===== OCR + enrich =====
     for r in prospects:
@@ -530,15 +613,16 @@ def main():
             except Exception as e:
                 print("[OCR][WARN]", str(e)[:160])
 
+        # Email gratuit via site (si encore vide)
         try:
             enrich_email_from_website(r)
         except Exception as e:
             print("[WEB][WARN]", str(e)[:160])
 
     # ===== split par agence =====
-    agency_records: Dict[str, List[dict]] = {ag: [] for ag in agencies_cfg.keys()}
+    agency_records = {ag: [] for ag in agencies_cfg.keys()}
     for p in prospects:
-        ag = (p.get("agency") or "").strip()
+        ag = p.get("agency", "")
         if ag in agency_records:
             agency_records[ag].append(p)
 
@@ -547,7 +631,7 @@ def main():
         to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
         excel = build_excel(recs)
 
-        # PJ cartes: toutes les cartes de l'agence
+        # PJ cartes: on prend toutes les cartes de l'agence
         card_attachments = []
         for i, r in enumerate(recs, 1):
             file_id = (r.get("card_photo_file_id") or "").strip()
@@ -569,37 +653,22 @@ def main():
         attachments = [(f"{date_str}_{ag}_IMPORT.xlsx", excel)]
         attachments.extend(card_attachments)
 
-        # close recap (global, informatif)
-        close_txt = ""
-        if closes:
-            # dernier close de l'agence si présent
-            last = None
-            for c in closes:
-                if (c.get("agency") or "").strip() == ag:
-                    last = c
-            if last:
-                close_txt = (
-                    f"\nClôture (dernier): VC={last.get('visits_clients','')}, "
-                    f"VP={last.get('visits_prospects','')}, CMD={last.get('commandes','')}\n"
-                )
-
         send_email_brevo(
             f"[PROSPECTION] {ag} — {date_str}",
-            f"Export agence {ag}\nProspects: {nb_prospects}\nClients: {nb_clients}\nCommandes: {nb_commandes}\n"
-            f"Cartes de visite jointes: {len(card_attachments)}\n"
-            f"{close_txt}",
+            f"Export agence {ag}\nProspects: {nb_prospects}\nClients: {nb_clients}\nCommandes: {nb_commandes}\n\n"
+            f"Cartes de visite jointes: {len(card_attachments)}\n",
             to_list,
             attachments,
         )
 
     # ===== cumul mensuel =====
-    d = parse_date_yyyy_mm_dd(date_str)
     cumul_file = cumul_path_for(d)
     cumul = load_cumul(cumul_file)
-    day_agg = aggregate_day(prospects, agencies_cfg, closes)
+    day_agg = aggregate_day(prospects, agencies_cfg)
     cumul["days"][date_str] = day_agg
     save_cumul(cumul_file, cumul)
     print("[CUMUL] updated:", str(cumul_file))
+
 
 if __name__ == "__main__":
     main()
