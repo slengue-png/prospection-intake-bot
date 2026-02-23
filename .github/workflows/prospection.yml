@@ -1,43 +1,23 @@
-name: Prospection — Export & Mail
+name: Prospection - Cloture Session
 
 on:
   workflow_dispatch:
     inputs:
       run_date:
-        description: "Date YYYY-MM-DD (optionnel). Si vide: date Europe/Paris."
-        required: false
+        description: "Date au format YYYY-MM-DD"
+        required: true
       agency:
-        description: "Agence (optionnel)"
-        required: false
+        description: "Agence (GR, VR, GRS, SLS)"
+        required: true
       initials:
-        description: "Initiales (optionnel)"
-        required: false
-      visits_clients:
-        description: "Visites clients (optionnel)"
-        required: false
-      visits_prospects:
-        description: "Visites prospects (optionnel)"
-        required: false
-      commandes:
-        description: "Commandes (optionnel)"
-        required: false
-
-permissions:
-  contents: write
+        description: "Initiales collaborateur"
+        required: true
 
 jobs:
-  run:
+  run-export:
     runs-on: ubuntu-latest
-    steps:
-      - name: Show inputs
-        run: |
-          echo "run_date=${{ github.event.inputs.run_date }}"
-          echo "agency=${{ github.event.inputs.agency }}"
-          echo "initials=${{ github.event.inputs.initials }}"
-          echo "visits_clients=${{ github.event.inputs.visits_clients }}"
-          echo "visits_prospects=${{ github.event.inputs.visits_prospects }}"
-          echo "commandes=${{ github.event.inputs.commandes }}"
 
+    steps:
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -46,38 +26,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system deps (Tesseract OCR)
+      - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
+          pip install -r requirements.txt
 
-      - name: Install python deps
-        run: pip install -r requirements.txt
-
-      - name: Export & mail
+      - name: Run export session
         env:
-          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          EXPORT_BASE_URL: ${{ secrets.EXPORT_BASE_URL }}
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
-          BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
-
-          RUN_DATE: ${{ github.event.inputs.run_date }}
-          CLOSE_AGENCY: ${{ github.event.inputs.agency }}
-          CLOSE_INITIALS: ${{ github.event.inputs.initials }}
-          CLOSE_VISITS_CLIENTS: ${{ github.event.inputs.visits_clients }}
-          CLOSE_VISITS_PROSPECTS: ${{ github.event.inputs.visits_prospects }}
-          CLOSE_COMMANDES: ${{ github.event.inputs.commandes }}
-        run: python scripts/export_and_mail.py
-
-      - name: Commit monthly cumul (data/)
+          MODE: "session"
+          RUN_DATE: ${{ inputs.run_date }}
+          AGENCY: ${{ inputs.agency }}
+          INITIALS: ${{ inputs.initials }}
         run: |
-          git config user.name "prospection-bot"
-          git config user.email "prospection-bot@users.noreply.github.com"
-          git add data/ || true
-          if git diff --cached --quiet; then
-            echo "No cumul changes to commit."
-            exit 0
-          fi
-          git commit -m "Update monthly cumul"
-          git push
+          python scripts/export_and_mail.py
