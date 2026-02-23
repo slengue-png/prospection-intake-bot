@@ -1,25 +1,340 @@
 import os
-import io
-import json
-import base64
-import urllib.request
-import urllib.error
-from datetime import datetime, date
 import re
+import json
+import time
+import smtplib
+import mimetypes
+from dataclasses import dataclass
+from email.message import EmailMessage
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
-import pytesseract
 from openpyxl import Workbook
-import yaml
+from openpyxl.utils import get_column_letter
+
+from PIL import Image, ImageOps, ImageEnhance
+import pytesseract
 
 
 # =========================
-# EXCEL IMPORT (AGENCES)
+# ENV
 # =========================
-IMPORT_COLUMNS = [
+WORKER_DUMP_URL = os.getenv("WORKER_DUMP_URL", "").strip()
+EXPORT_TOKEN = os.getenv("EXPORT_TOKEN", "").strip()
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+
+SMTP_HOST = os.getenv("SMTP_HOST", "").strip()
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587").strip())
+SMTP_USER = os.getenv("SMTP_USER", "").strip()
+SMTP_PASS = os.getenv("SMTP_PASS", "").strip()
+MAIL_FROM = os.getenv("MAIL_FROM", "").strip()
+
+AGENCY_RECIPIENTS_JSON = os.getenv("AGENCY_RECIPIENTS_JSON", "").strip()
+
+OUT_DIR = Path(os.getenv("OUT_DIR", "out"))
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+RUN_DATE = os.getenv("RUN_DATE", "").strip()
+AGENCY = os.getenv("AGENCY", "").strip().upper()
+INITIALS = os.getenv("INITIALS", "").strip().upper()
+VISITS_CLIENTS = os.getenv("VISITS_CLIENTS", "").strip()
+VISITS_PROSPECTS = os.getenv("VISITS_PROSPECTS", "").strip()
+COMMANDES = os.getenv("COMMANDES", "").strip()
+
+
+# =========================
+# Data model
+# =========================
+@dataclass
+class Prospect:
+    name: str = ""
+    address: str = ""
+    postal_code: str = ""
+    city: str = ""
+    phone: str = ""
+    phone2: str = ""
+    email: str = ""
+    siret: str = ""
+    naf: str = ""
+    website: str = ""
+    contact_civility: str = ""
+    contact_firstname: str = ""
+    contact_lastname: str = ""
+    dirigeant: str = ""
+    resume: str = ""
+    commande: str = ""
+    infos_commerciales: str = ""
+    card_file_id: str = ""
+    agency: str = ""
+    initials: str = ""
+
+
+# =========================
+# Helpers
+# =========================
+def must(val: str, name: str) -> str:
+    if not val:
+        raise RuntimeError(f"Missing required env: {name}")
+    return val
+
+
+def normalize_naf(code: str) -> str:
+    return re.sub(r"[^0-9A-Z]", "", (code or "").upper())
+
+
+def clean(s: Any) -> str:
+    return re.sub(r"\s+", " ", str(s or "").strip())
+
+
+def ensure_http_origin(url: str) -> str:
+    url = (url or "").strip()
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        if not p.scheme:
+            return ""
+        return f"{p.scheme}://{p.netloc}"
+    except Exception:
+        return ""
+
+
+# =========================
+# Fetch prospects from worker dump
+# =========================
+def fetch_dump_jsonl(date_yyyy_mm_dd: str) -> List[Dict[str, Any]]:
+    dump_url = must(WORKER_DUMP_URL, "WORKER_DUMP_URL")
+    token = must(EXPORT_TOKEN, "EXPORT_TOKEN")
+
+    r = requests.get(
+        dump_url,
+        params={"date": date_yyyy_mm_dd, "kind": "prospects"},
+        headers={"X-Export-Token": token},
+        timeout=60,
+    )
+    r.raise_for_status()
+
+    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
+    out = []
+    for ln in lines:
+        try:
+            out.append(json.loads(ln))
+        except Exception:
+            # ignore bad line
+            continue
+    return out
+
+
+def to_prospect(obj: Dict[str, Any]) -> Prospect:
+    return Prospect(
+        name=clean(obj.get("name")),
+        address=clean(obj.get("address")),
+        postal_code=clean(obj.get("postal_code")),
+        city=clean(obj.get("city")),
+        phone=clean(obj.get("phone")),
+        phone2=clean(obj.get("phone2")),
+        email=clean(obj.get("email")),
+        siret=clean(obj.get("siret")),
+        naf=normalize_naf(clean(obj.get("naf"))),
+        website=ensure_http_origin(clean(obj.get("website"))),
+        contact_civility=clean(obj.get("contact_civility")),
+        contact_firstname=clean(obj.get("contact_firstname")),
+        contact_lastname=clean(obj.get("contact_lastname")),
+        dirigeant=clean(obj.get("dirigeant")),
+        resume=clean(obj.get("resume")),
+        commande=clean(obj.get("commande")),
+        infos_commerciales=clean(obj.get("infos_commerciales")),
+        card_file_id=clean(obj.get("card_photo_file_id") or obj.get("card_file_id") or ""),
+        agency=clean(obj.get("agency")).upper(),
+        initials=clean(obj.get("initials")).upper(),
+    )
+
+
+# =========================
+# Telegram file download
+# =========================
+def telegram_get_file_path(file_id: str) -> Optional[str]:
+    if not TELEGRAM_TOKEN or not file_id:
+        return None
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile"
+    r = requests.post(url, json={"file_id": file_id}, timeout=30)
+    if r.status_code != 200:
+        return None
+    j = r.json()
+    if not j.get("ok"):
+        return None
+    return j["result"].get("file_path")
+
+
+def telegram_download_file(file_id: str, out_path: Path) -> bool:
+    fp = telegram_get_file_path(file_id)
+    if not fp:
+        return False
+    file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fp}"
+    r = requests.get(file_url, timeout=60)
+    if r.status_code != 200:
+        return False
+    out_path.write_bytes(r.content)
+    return True
+
+
+# =========================
+# OCR (contact name + email + phone)
+# =========================
+EMAIL_RE = re.compile(r"[a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,}", re.I)
+PHONE_RE = re.compile(r"(\+33\s?|\b0)([1-9](?:[\s\.-]?\d{2}){4})")
+
+
+def preprocess_image(img: Image.Image) -> Image.Image:
+    # simple & robust preprocessing for business cards
+    img = ImageOps.exif_transpose(img)
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img)
+    img = ImageEnhance.Contrast(img).enhance(1.5)
+    img = ImageEnhance.Sharpness(img).enhance(1.8)
+    # upscale for OCR
+    w, h = img.size
+    img = img.resize((int(w * 1.8), int(h * 1.8)))
+    return img
+
+
+def ocr_text(image_path: Path) -> str:
+    img = Image.open(image_path)
+    img = preprocess_image(img)
+    # French + English helps names/emails
+    return pytesseract.image_to_string(img, lang="fra+eng")
+
+
+def normalize_fr_phone(raw: str) -> str:
+    s = re.sub(r"[^\d+]", "", raw)
+    s = s.replace("+33", "0")
+    digits = re.sub(r"\D", "", s)
+    if len(digits) >= 10:
+        digits = digits[:10]
+    if len(digits) == 10 and digits.startswith("0"):
+        return digits
+    return ""
+
+
+def extract_email(text: str) -> str:
+    m = EMAIL_RE.findall(text or "")
+    if not m:
+        return ""
+    # remove obvious placeholders
+    for e in m:
+        if not re.search(r"(example|test|yourmail)", e, re.I):
+            return e.strip()
+    return m[0].strip()
+
+
+def extract_phones(text: str) -> List[str]:
+    out = []
+    for m in PHONE_RE.finditer(text or ""):
+        full = (m.group(0) or "").strip()
+        p = normalize_fr_phone(full)
+        if p and p not in out:
+            out.append(p)
+    return out
+
+
+def looks_like_person(line: str) -> bool:
+    line = clean(line)
+    if not line or len(line) < 5:
+        return False
+    bad_words = [
+        "sas", "sarl", "eurl", "veolia", "lely", "pissard", "ras", "intérim", "interim",
+        "directeur", "directrice", "agence", "service", "www", "http", "@"
+    ]
+    if any(w in line.lower() for w in bad_words):
+        return False
+
+    # heuristic: 2 words, at least one in ALLCAPS or Title
+    words = line.split()
+    if len(words) < 2:
+        return False
+    # reject lines mostly numeric
+    if sum(ch.isdigit() for ch in line) > 2:
+        return False
+    return True
+
+
+def extract_person_name(text: str) -> Tuple[str, str, str]:
+    """
+    Returns (civility, firstname, lastname)
+    Best-effort: detect "Céline MEKHMOUKH" or "MEKHMOUKH Céline"
+    """
+    lines = [clean(x) for x in (text or "").splitlines() if clean(x)]
+    # prioritize top lines
+    candidates = lines[:12] + lines[12:25]
+
+    for ln in candidates:
+        if not looks_like_person(ln):
+            continue
+        # remove job title after name
+        ln = re.sub(r"(Directeur|Directrice|Responsable|Manager|Chef|Chargé|Charge)\b.*", "", ln, flags=re.I).strip()
+        parts = ln.split()
+        if len(parts) < 2:
+            continue
+
+        # if last name is uppercase (common on cards)
+        if parts[-1].isupper() and len(parts[-1]) >= 3:
+            firstname = parts[0]
+            lastname = " ".join(parts[1:])
+            return ("", firstname, lastname)
+
+        # if first token uppercase and next token Title
+        if parts[0].isupper() and len(parts[0]) >= 3:
+            lastname = parts[0]
+            firstname = " ".join(parts[1:])
+            return ("", firstname, lastname)
+
+        # fallback: first=first token, last=rest
+        return ("", parts[0], " ".join(parts[1:]))
+
+    return ("", "", "")
+
+
+def enrich_from_card_ocr(prospect: Prospect, image_path: Path) -> Prospect:
+    try:
+        txt = ocr_text(image_path)
+    except Exception:
+        return prospect
+
+    # contact name
+    civ, fn, ln = extract_person_name(txt)
+    if not prospect.contact_firstname and fn:
+        prospect.contact_firstname = fn
+    if not prospect.contact_lastname and ln:
+        prospect.contact_lastname = ln
+    if not prospect.contact_civility and civ:
+        prospect.contact_civility = civ
+
+    # email
+    if not prospect.email:
+        em = extract_email(txt)
+        if em:
+            prospect.email = em
+
+    # phones (prefer mobile 06/07 in phone2 if empty)
+    phones = extract_phones(txt)
+    if phones:
+        mob = next((p for p in phones if p.startswith("06") or p.startswith("07")), "")
+        fix = next((p for p in phones if p.startswith("04") or p.startswith("01") or p.startswith("02") or p.startswith("03") or p.startswith("05") or p.startswith("09")), "")
+        if not prospect.phone2 and mob:
+            prospect.phone2 = mob
+        if not prospect.phone and fix:
+            prospect.phone = fix
+
+    return prospect
+
+
+# =========================
+# Excel export
+# =========================
+COLUMNS = [
     "NOM",
     "ADRESSE",
     "CODE POSTAL",
@@ -40,634 +355,156 @@ IMPORT_COLUMNS = [
     "CARTE_VISITE_FILE_ID",
 ]
 
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "fr-FR,fr;q=0.9",
-    "Connection": "close",
-}
 
-
-# =========================
-# CONFIG
-# =========================
-def load_config(path="config.yml"):
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-def normalize_emails(x):
-    if x is None:
-        return []
-    if isinstance(x, list):
-        raw = x
-    elif isinstance(x, str):
-        raw = [p.strip() for p in x.split(",")]
-    else:
-        raw = []
-    out = []
-    for e in raw:
-        e = (e or "").strip()
-        if e:
-            out.append(e)
-    return out
-
-
-# =========================
-# FETCH /dump (Worker)
-# =========================
-def fetch_jsonl(url, export_token):
-    print(f"[FETCH] {url}")
-    if not export_token:
-        raise RuntimeError("EXPORT_TOKEN missing in GitHub Secrets")
-
-    req = urllib.request.Request(url)
-    for k, v in BROWSER_HEADERS.items():
-        req.add_header(k, v)
-    req.add_header("X-Export-Token", export_token)
-
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            raw = resp.read().decode("utf-8", errors="replace").strip()
-            print("[HTTP]", resp.status)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTPError {e.code} on {url} -> {body[:300]}")
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"URLError on {url} -> {e.reason}")
-
-    if not raw:
-        return []
-    rows = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rows.append(json.loads(line))
-        except:
-            pass
-    return rows
-
-
-# =========================
-# TEL / EMAIL PARSING
-# =========================
-EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
-
-# FR phone broad, then filter
-PHONE_RE = re.compile(r"(?:(?:\+|00)33|0)\s*[1-9](?:[\s.\-]*\d{2}){4}")
-
-
-def normalize_phone(raw: str) -> str:
-    if not raw:
-        return ""
-    s = str(raw).strip()
-    s = s.replace("(0)", "")
-    s = re.sub(r"[^\d+]", "", s)
-    if s.startswith("+33"):
-        s = "0" + s[3:]
-    digits = re.sub(r"\D", "", s)
-    if len(digits) < 10:
-        return ""
-    return digits[:10]
-
-
-def phone_allowed(num: str) -> bool:
-    return bool(num) and len(num) == 10 and (num.startswith("04") or num.startswith("06") or num.startswith("07"))
-
-
-def pick_best_phones(nums: List[str]) -> Tuple[str, str]:
-    """
-    Retourne (fixed04_or_otherFixed, mobile06_07)
-    """
-    fixed = ""
-    mobile = ""
-    for n in nums:
-        if not phone_allowed(n):
-            continue
-        if n.startswith("04") and not fixed:
-            fixed = n
-        if (n.startswith("06") or n.startswith("07")) and not mobile:
-            mobile = n
-    # si pas de 04, on accepte un fixe non-01 si présent
-    if not fixed:
-        for n in nums:
-            if not n or len(n) != 10:
-                continue
-            if n.startswith(("02", "03", "05", "08", "09")):
-                fixed = n
-                break
-    return fixed, mobile
-
-
-def extract_emails(text: str) -> List[str]:
-    if not text:
-        return []
-    emails = [e.lower() for e in EMAIL_RE.findall(text)]
-    bad = ["noreply", "no-reply", "donotreply", "example", "exemple"]
-    out = []
-    for e in emails:
-        if any(b in e for b in bad):
-            continue
-        out.append(e)
-    seen = set()
-    res = []
-    for e in out:
-        if e not in seen:
-            seen.add(e)
-            res.append(e)
-    return res
-
-
-def extract_phones(text: str) -> List[str]:
-    if not text:
-        return []
-    found = []
-    for m in PHONE_RE.findall(text):
-        n = normalize_phone(m)
-        if n:
-            found.append(n)
-    seen = set()
-    res = []
-    for n in found:
-        if n not in seen:
-            seen.add(n)
-            res.append(n)
-    return res
-
-
-# =========================
-# TELEGRAM DOWNLOAD (card photo)
-# =========================
-def tg_api_get_file(token: str, file_id: str) -> Optional[str]:
-    url = f"https://api.telegram.org/bot{token}/getFile"
-    r = requests.get(url, params={"file_id": file_id}, timeout=20)
-    r.raise_for_status()
-    j = r.json()
-    if not j.get("ok"):
-        return None
-    return j["result"].get("file_path")
-
-
-def tg_download_file(token: str, file_path: str) -> bytes:
-    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return r.content
-
-
-# =========================
-# OCR TESSERACT (✅ correction complète)
-# =========================
-def _preprocess_for_ocr(im: Image.Image) -> Image.Image:
-    """
-    Prétraitement "robuste" pour photos Telegram:
-    - rotation auto via EXIF
-    - upscale
-    - gris + autocontrast
-    - sharpen léger
-    - binarisation douce (seuil)
-    """
-    im = ImageOps.exif_transpose(im)  # corrige rotation iPhone/Android
-    im = im.convert("RGB")
-
-    # upscale pour aider Tesseract
-    w, h = im.size
-    scale = 2.0 if max(w, h) < 2200 else 1.5
-    im = im.resize((int(w * scale), int(h * scale)))
-
-    # grayscale + contraste
-    gray = im.convert("L")
-    gray = ImageOps.autocontrast(gray)
-
-    # réduction bruit / sharp
-    gray = gray.filter(ImageFilter.MedianFilter(size=3))
-    gray = ImageEnhance.Sharpness(gray).enhance(1.6)
-    gray = ImageEnhance.Contrast(gray).enhance(1.4)
-
-    # binarisation douce
-    # seuil adaptatif simple: moyenne * 0.95
-    hist = gray.histogram()
-    total = sum(hist)
-    acc = 0
-    mean = 0
-    for i, v in enumerate(hist):
-        acc += v
-        mean += i * v
-    mean = mean / total if total else 128
-    thr = int(mean * 0.95)
-    bw = gray.point(lambda x: 255 if x > thr else 0)
-
-    return bw
-
-
-def ocr_card_image(img_bytes: bytes) -> str:
-    """
-    OCR gratuit via tesseract (installé via apt).
-    Amélioré pour cartes de visite.
-    """
-    with Image.open(io.BytesIO(img_bytes)) as im:
-        proc = _preprocess_for_ocr(im)
-
-        # config tesseract: psm 6 = bloc de texte
-        config = "--oem 1 --psm 6"
-        text = pytesseract.image_to_string(proc, lang="fra", config=config)
-
-        # fallback: parfois mieux en psm 11 (texte épars)
-        if not text or len(text.strip()) < 10:
-            text2 = pytesseract.image_to_string(proc, lang="fra", config="--oem 1 --psm 11")
-            if len((text2 or "").strip()) > len((text or "").strip()):
-                text = text2
-
-        return text or ""
-
-
-def enrich_from_ocr(record: dict, ocr_text: str):
-    """
-    ✅ Remplit email/phones si manquants.
-    ✅ Remplit aussi record["mobile"] (champ Telegram) si présent.
-    """
-    emails = extract_emails(ocr_text)
-    phones = extract_phones(ocr_text)
-    fixed, mobile = pick_best_phones(phones)
-
-    # email
-    if not str(record.get("email", "")).strip() and emails:
-        record["email"] = emails[0]
-
-    # téléphone fixe prioritaire
-    if not str(record.get("phone", "")).strip() and fixed:
-        record["phone"] = fixed
-
-    # téléphone2 = mobile
-    if not str(record.get("phone2", "")).strip() and mobile:
-        record["phone2"] = mobile
-
-    # ✅ champ mobile (si ton worker le remplit / si tu l’attends)
-    if not str(record.get("mobile", "")).strip() and mobile:
-        record["mobile"] = mobile
-
-
-# =========================
-# FREE EMAIL GRAB (site scrape) - GARDE FOU
-# =========================
-def fetch_text(url: str, timeout=10) -> str:
-    try:
-        r = requests.get(url, headers=BROWSER_HEADERS, timeout=timeout, allow_redirects=True)
-        if r.status_code != 200:
-            return ""
-        return r.text or ""
-    except:
-        return ""
-
-
-def find_contact_pages(home_html: str, base: str) -> List[str]:
-    links = set()
-    for m in re.finditer(r'href=["\']([^"\']+)["\']', home_html or "", flags=re.IGNORECASE):
-        href = m.group(1).strip()
-        if not href or href.startswith("#"):
-            continue
-        if href.startswith("//"):
-            href = "https:" + href
-        if href.startswith("/"):
-            href = base.rstrip("/") + href
-        if not href.startswith(base):
-            continue
-        low = href.lower()
-        if any(k in low for k in ["contact", "mentions", "legal", "rgpd", "privacy"]):
-            links.add(href.split("#")[0])
-        if len(links) >= 6:
-            break
-    return list(links)
-
-
-def enrich_email_from_website(record: dict):
-    """
-    Gratuit, mais limité pour éviter de planter:
-    - 1 domaine / fiche
-    - max 4 pages
-    """
-    if record.get("email"):
-        return
-    website = (record.get("website") or "").strip()
-    if not website.startswith("http"):
-        return
-
-    base = website.rstrip("/")
-    home = fetch_text(base, timeout=10)
-    if not home:
-        return
-
-    candidates = [
-        base,
-        base + "/contact",
-        base + "/contactez-nous",
-        base + "/nous-contacter",
-        base + "/mentions-legales",
-        base + "/mentions",
-    ]
-    candidates.extend(find_contact_pages(home, base))
-
-    checked = 0
-    for u in candidates:
-        if checked >= 4:
-            break
-        checked += 1
-        html = fetch_text(u, timeout=10)
-        if not html:
-            continue
-        emails = extract_emails(html)
-        if emails:
-            record["email"] = emails[0]
-            return
-
-
-# =========================
-# COMMANDES -> comptage intelligent (inchangé)
-# =========================
-PARASITE_WORDS = {
-    "besoin","poste","postes","profil","profils","recherche","recherchons",
-    "urgent","urgente","asap","svp","stp","merci","cdi","cdd","interim",
-    "intérim","mission","missions","pour","de","des","du","la","le","les",
-    "a","à","au","aux","et","ou","sur","en","d","l","un","une",
-}
-
-def _stem_fr(word: str) -> str:
-    w = word.strip().lower()
-    w = re.sub(r"[^a-zàâäéèêëîïôöùûüç0-9\-]", "", w)
-    if not w:
-        return ""
-    for suf in ["es", "s", "x"]:
-        if w.endswith(suf) and len(w) > 3:
-            w = w[: -len(suf)]
-            break
-    return w
-
-def count_commandes(commande_text: str) -> int:
-    if not commande_text:
-        return 0
-    s = str(commande_text).strip()
-    if not s:
-        return 0
-    if re.fullmatch(r"\d+", s):
-        return 1
-
-    s = s.replace("\n", " ")
-    s = re.sub(r"[;,/|]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-
-    groups = re.findall(r"\b\d+\s+([A-Za-zÀ-ÖØ-öø-ÿ\-]+)", s)
-    if groups:
-        uniq = set()
-        for g in groups:
-            w = _stem_fr(g)
-            if w and w not in PARASITE_WORDS:
-                uniq.add(w)
-        return max(1, len(uniq)) if uniq else 1
-
-    words = re.split(r"\s+", s)
-    uniq = set()
-    for w in words:
-        ww = _stem_fr(w)
-        if not ww or ww in PARASITE_WORDS or ww.isdigit():
-            continue
-        uniq.add(ww)
-
-    return len(uniq) if uniq else 1
-
-
-# =========================
-# EXCEL
-# =========================
-def build_excel(records):
+def write_excel(prospects: List[Prospect], out_xlsx: Path) -> None:
     wb = Workbook()
     ws = wb.active
-    ws.title = "IMPORT"
-    ws.append(IMPORT_COLUMNS)
+    ws.title = "PROSPECTION"
 
-    for r in records:
-        infos_com = " | ".join([x for x in [
-            f"Interlocuteur: {r.get('interlocuteur','')}".strip(),
-            f"Entretien: {r.get('resume','')}".strip(),
-            f"Commande: {r.get('commande','')}".strip(),
-        ] if x and x != "Interlocuteur:" and x != "Entretien:" and x != "Commande:"])
+    ws.append(COLUMNS)
 
-        # NAF -> sans point (2312Z)
-        naf = str(r.get("naf","") or "").strip().upper()
-        naf = re.sub(r"[^0-9A-Z]", "", naf)
-
+    for p in prospects:
         ws.append([
-            r.get("name", ""),
-            r.get("address", ""),
-            r.get("postal_code", ""),
-            r.get("city", ""),
-            r.get("phone", ""),
-            r.get("phone2", ""),
-            r.get("email", ""),
-            r.get("siret", ""),
-            naf,
-            r.get("website", ""),
-            r.get("contact_civility", ""),
-            r.get("contact_firstname", ""),
-            r.get("contact_lastname", "") or r.get("interlocuteur", ""),
-            r.get("dirigeant", ""),
-            r.get("resume", ""),
-            r.get("commande", ""),
-            infos_com,
-            r.get("card_photo_file_id", ""),
+            p.name,
+            p.address,
+            p.postal_code,
+            p.city,
+            p.phone,
+            p.phone2,
+            p.email,
+            p.siret,
+            p.naf,
+            p.website,
+            p.contact_civility,
+            p.contact_firstname,
+            p.contact_lastname,
+            p.dirigeant,
+            p.resume,
+            p.commande,
+            p.infos_commerciales,
+            p.card_file_id,
         ])
 
-    bio = io.BytesIO()
-    wb.save(bio)
-    return bio.getvalue()
+    # basic sizing
+    for col in range(1, len(COLUMNS) + 1):
+        ws.column_dimensions[get_column_letter(col)].width = 22
+
+    wb.save(out_xlsx)
 
 
 # =========================
-# EMAIL (Brevo)
+# Email send (agency-specific)
 # =========================
-def send_email_brevo(subject, body, to_list, attachments):
-    api_key = os.environ.get("BREVO_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("BREVO_API_KEY missing in GitHub Secrets")
-
-    to_list = normalize_emails(to_list)
-    if not to_list:
-        print(f"[BREVO][SKIP] no recipients for subject: {subject}")
-        return
-
-    sender_email = os.environ.get("BREVO_SENDER_EMAIL", "").strip()
-    if not sender_email:
-        raise RuntimeError("BREVO_SENDER_EMAIL missing in GitHub Secrets")
-
-    payload = {
-        "sender": {"email": sender_email, "name": "Prospection Bot"},
-        "to": [{"email": x} for x in to_list],
-        "subject": subject,
-        "textContent": body,
-    }
-
-    if attachments:
-        payload["attachment"] = []
-        for filename, content_bytes in attachments:
-            payload["attachment"].append({
-                "name": filename,
-                "content": base64.b64encode(content_bytes).decode("utf-8"),
-            })
-
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request("https://api.brevo.com/v3/smtp/email", data=data, method="POST")
-    req.add_header("Content-Type", "application/json")
-    req.add_header("api-key", api_key)
-
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        print("[BREVO] status:", resp.status, "| to:", ",".join(to_list), "| subject:", subject)
-        _ = resp.read()
-
-
-# =========================
-# CUMUL MENSUEL
-# =========================
-def parse_date_yyyy_mm_dd(s: str) -> date:
-    return datetime.strptime(s, "%Y-%m-%d").date()
-
-def month_key(d: date) -> str:
-    return f"{d.year:04d}-{d.month:02d}"
-
-def cumul_path_for(d: date) -> Path:
-    Path("data").mkdir(parents=True, exist_ok=True)
-    return Path("data") / f"cumul_{month_key(d)}.json"
-
-def load_cumul(path: Path) -> dict:
-    if not path.exists():
-        return {"month": path.stem.replace("cumul_", ""), "days": {}, "updated_at_utc": ""}
+def get_recipients_for_agency(agency: str) -> List[str]:
+    if not AGENCY_RECIPIENTS_JSON:
+        return []
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except:
-        return {"month": path.stem.replace("cumul_", ""), "days": {}, "updated_at_utc": ""}
+        m = json.loads(AGENCY_RECIPIENTS_JSON)
+        val = m.get(agency) or m.get(agency.upper()) or []
+        if isinstance(val, str):
+            return [val]
+        if isinstance(val, list):
+            return [str(x) for x in val if str(x).strip()]
+    except Exception:
+        return []
+    return []
 
-def save_cumul(path: Path, data: dict):
-    data["updated_at_utc"] = datetime.utcnow().isoformat(timespec="seconds") + "Z"
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-def aggregate_day(prospects: List[dict], agencies: dict) -> dict:
-    out = {"agencies": {}, "by_user": {}, "totals": {"prospects": 0, "clients": 0, "commandes": 0}}
-    for ag in agencies.keys():
-        out["agencies"][ag] = {"prospects": 0, "clients": 0, "commandes": 0}
+def attach_file(msg: EmailMessage, path: Path) -> None:
+    ctype, encoding = mimetypes.guess_type(str(path))
+    if ctype is None:
+        ctype = "application/octet-stream"
+    maintype, subtype = ctype.split("/", 1)
+    msg.add_attachment(path.read_bytes(), maintype=maintype, subtype=subtype, filename=path.name)
 
-    for r in prospects:
-        ag = (r.get("agency") or "").strip()
-        ini = (r.get("initials") or "NA").strip().upper()
-        cmds = count_commandes(r.get("commande", ""))
 
-        if ag in out["agencies"]:
-            out["agencies"][ag]["prospects"] += 1
-            out["agencies"][ag]["commandes"] += cmds
+def send_email(subject: str, body: str, recipients: List[str], attachments: List[Path]) -> None:
+    if not recipients:
+        raise RuntimeError(f"No recipients for agency {AGENCY} (check AGENCY_RECIPIENTS_JSON)")
+    must(SMTP_HOST, "SMTP_HOST")
+    must(MAIL_FROM, "MAIL_FROM")
 
-        key = f"{ag}|{ini}"
-        out["by_user"].setdefault(key, {"agency": ag, "initials": ini, "prospects": 0, "clients": 0, "commandes": 0})
-        out["by_user"][key]["prospects"] += 1
-        out["by_user"][key]["commandes"] += cmds
+    msg = EmailMessage()
+    msg["From"] = MAIL_FROM
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.set_content(body)
 
-        out["totals"]["prospects"] += 1
-        out["totals"]["commandes"] += cmds
+    for p in attachments:
+        if p.exists():
+            attach_file(msg, p)
 
-    return out
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as s:
+        s.starttls()
+        if SMTP_USER and SMTP_PASS:
+            s.login(SMTP_USER, SMTP_PASS)
+        s.send_message(msg)
 
 
 # =========================
-# MAIN
+# Main
 # =========================
-def main():
-    cfg = load_config()
-    worker = (cfg.get("worker_base_url") or "").strip().rstrip("/")
-    if not worker.startswith("https://"):
-        raise RuntimeError("config.yml: worker_base_url must start with https://")
+def main() -> None:
+    must(RUN_DATE, "RUN_DATE")
+    must(AGENCY, "AGENCY")
+    must(INITIALS, "INITIALS")
 
-    export_token = os.environ.get("EXPORT_TOKEN", "").strip()
-    telegram_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
-    if not telegram_token:
-        raise RuntimeError("TELEGRAM_TOKEN missing in GitHub Secrets (needed for card photos download)")
+    raw = fetch_dump_jsonl(RUN_DATE)
+    prospects_all = [to_prospect(x) for x in raw]
 
-    run_date_str = (os.environ.get("RUN_DATE") or "").strip()
-    d = parse_date_yyyy_mm_dd(run_date_str) if run_date_str else datetime.utcnow().date()
-    date_str = d.strftime("%Y-%m-%d")
+    # Filter by agency (critical!)
+    prospects = [p for p in prospects_all if p.agency == AGENCY]
 
-    agencies_cfg = cfg.get("agencies", {})
+    # Download cards + OCR enrich
+    card_dir = OUT_DIR / f"cards_{RUN_DATE}_{AGENCY}"
+    card_dir.mkdir(parents=True, exist_ok=True)
 
-    # ===== dump prospects du jour =====
-    url = f"{worker}/dump?date={date_str}&kind=prospects"
-    prospects = fetch_jsonl(url, export_token)
-    print("[OK] prospects rows=", len(prospects))
+    attachments: List[Path] = []
 
-    # ===== OCR + enrich =====
-    for r in prospects:
-        file_id = (r.get("card_photo_file_id") or "").strip()
-        if file_id:
-            try:
-                fp = tg_api_get_file(telegram_token, file_id)
-                if fp:
-                    img_bytes = tg_download_file(telegram_token, fp)
-                    txt = ocr_card_image(img_bytes)
-                    enrich_from_ocr(r, txt)
-            except Exception as e:
-                print("[OCR][WARN]", str(e)[:160])
+    for i, p in enumerate(prospects, start=1):
+        if not p.card_file_id:
+            continue
 
-        # Email gratuit via site (si encore vide)
-        try:
-            enrich_email_from_website(r)
-        except Exception as e:
-            print("[WEB][WARN]", str(e)[:160])
+        img_path = card_dir / f"{i:03d}_{p.name[:30].replace(' ', '_')}.jpg"
+        ok = telegram_download_file(p.card_file_id, img_path)
+        if ok:
+            # enrich fields from OCR
+            p = enrich_from_card_ocr(p, img_path)
+            # keep file for mail
+            attachments.append(img_path)
 
-    # ===== split par agence =====
-    agency_records = {ag: [] for ag in agencies_cfg.keys()}
-    for p in prospects:
-        ag = p.get("agency", "")
-        if ag in agency_records:
-            agency_records[ag].append(p)
+    # Write excel
+    xlsx_path = OUT_DIR / f"prospection_{RUN_DATE}_{AGENCY}.xlsx"
+    write_excel(prospects, xlsx_path)
+    attachments.insert(0, xlsx_path)
 
-    # ===== emails agences (excel + PJ cartes) =====
-    for ag, recs in agency_records.items():
-        to_list = agencies_cfg.get(ag, {}).get("daily_to", [])
-        excel = build_excel(recs)
+    # Compose email
+    recipients = get_recipients_for_agency(AGENCY)
 
-        # PJ cartes: on prend toutes les cartes de l'agence
-        card_attachments = []
-        for i, r in enumerate(recs, 1):
-            file_id = (r.get("card_photo_file_id") or "").strip()
-            if not file_id:
-                continue
-            try:
-                fp = tg_api_get_file(telegram_token, file_id)
-                if not fp:
-                    continue
-                img = tg_download_file(telegram_token, fp)
-                card_attachments.append((f"{date_str}_{ag}_carte_{i}.jpg", img))
-            except Exception as e:
-                print("[CARD][WARN]", str(e)[:160])
+    subject = f"[PROSPECTION] {AGENCY} — {RUN_DATE} — {INITIALS}"
+    body = (
+        f"Export prospection — Agence {AGENCY}\n"
+        f"Date: {RUN_DATE}\n"
+        f"Initiales: {INITIALS}\n"
+        f"Visites clients: {VISITS_CLIENTS or '-'}\n"
+        f"Visites prospects: {VISITS_PROSPECTS or '-'}\n"
+        f"Commandes: {COMMANDES or '-'}\n\n"
+        f"PJ: Excel + cartes de visite (si présentes)\n"
+        f"Nb entrées agence {AGENCY}: {len(prospects)}\n"
+    )
 
-        nb_prospects = len(recs)
-        nb_clients = 0
-        nb_commandes = sum(count_commandes(r.get("commande", "")) for r in recs)
+    send_email(subject, body, recipients, attachments)
 
-        attachments = [(f"{date_str}_{ag}_IMPORT.xlsx", excel)]
-        attachments.extend(card_attachments)
-
-        send_email_brevo(
-            f"[PROSPECTION] {ag} — {date_str}",
-            f"Export agence {ag}\nProspects: {nb_prospects}\nClients: {nb_clients}\nCommandes: {nb_commandes}\n\n"
-            f"Cartes de visite jointes: {len(card_attachments)}\n",
-            to_list,
-            attachments,
-        )
-
-    # ===== cumul mensuel =====
-    cumul_file = cumul_path_for(d)
-    cumul = load_cumul(cumul_file)
-    day_agg = aggregate_day(prospects, agencies_cfg)
-    cumul["days"][date_str] = day_agg
-    save_cumul(cumul_file, cumul)
-    print("[CUMUL] updated:", str(cumul_file))
+    # small debug file for artifacts
+    debug = {
+        "run_date": RUN_DATE,
+        "agency": AGENCY,
+        "initials": INITIALS,
+        "count": len(prospects),
+        "recipients": recipients,
+        "attachments": [p.name for p in attachments],
+    }
+    (OUT_DIR / "debug.json").write_text(json.dumps(debug, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
