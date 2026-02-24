@@ -8,23 +8,25 @@ on:
         description: "individual | agency_manager | admin"
         required: true
         default: "individual"
-        type: string
+        type: choice
+        options: [individual, agency_manager, admin]
       run_date:
-        description: "YYYY-MM-DD Europe/Paris (optionnel)"
+        description: "Date YYYY-MM-DD Europe/Paris (optionnel : auto)"
         required: false
         type: string
       agency:
-        description: "GR/VR/GRS/SLS (requis si individual)"
+        description: "Agence (GR/VR/GRS/SLS) - requis si individual"
         required: false
         type: string
       initials:
-        description: "JL/CZ/JB/LB/PV/ST/AC/SL (requis si individual)"
+        description: "Initiales (JL/CZ/JB/LB/PV/ST/AC/SL) - requis si individual"
         required: false
         type: string
 
+  # GitHub cron = UTC. On calcule RUN_DATE Europe/Paris dans le job.
   schedule:
-    - cron: "45 16 * * *"   # 17:45 Europe/Paris (≈ UTC)
-    - cron: "47 16 * * *"   # 17:47 Europe/Paris (≈ UTC)
+    - cron: "45 16 * * *"   # 17:45 Europe/Paris en hiver (UTC+1) -> OK en pratique si tu acceptes un décalage en été
+    - cron: "47 16 * * *"   # 17:47 Europe/Paris en hiver
 
 jobs:
   export_and_mail:
@@ -49,17 +51,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Determine mode for schedule
-        id: mode
+      # ✅ Détermine SEND_MODE + RUN_DATE Europe/Paris
+      - name: Compute mode + run_date (Europe/Paris)
+        id: vars
         run: |
+          # RUN_DATE: priorité à l'input workflow_dispatch, sinon date Europe/Paris
+          if [ -n "${{ inputs.run_date }}" ]; then
+            RUN_DATE="${{ inputs.run_date }}"
+          else
+            RUN_DATE="$(TZ=Europe/Paris date +%F)"
+          fi
+
+          # SEND_MODE: priorité à l'input dispatch, sinon selon schedule
           MODE="${{ inputs.mode }}"
           if [ "${{ github.event_name }}" = "schedule" ]; then
+            # On distingue 17:45 vs 17:47 via github.event.schedule
             if [ "${{ github.event.schedule }}" = "45 16 * * *" ]; then
               MODE="agency_manager"
             else
               MODE="admin"
             fi
           fi
+
+          echo "run_date=$RUN_DATE" >> $GITHUB_OUTPUT
           echo "mode=$MODE" >> $GITHUB_OUTPUT
 
       - name: Run export & mail
@@ -74,14 +88,11 @@ jobs:
 
           MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
 
-          SEND_MODE: ${{ steps.mode.outputs.mode }}
-
-          # Inputs dispatch (si vide => script fallback)
-          RUN_DATE: ${{ inputs.run_date }}
+          SEND_MODE: ${{ steps.vars.outputs.mode }}
+          RUN_DATE: ${{ steps.vars.outputs.run_date }}
           AGENCY: ${{ inputs.agency }}
           INITIALS: ${{ inputs.initials }}
 
-          # OCR safety
           MAX_OCR_IMAGES: "50"
 
         run: |
