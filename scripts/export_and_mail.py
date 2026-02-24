@@ -1,72 +1,22 @@
-import os
-import re
-import json
-import time
-import io
-from datetime import datetime
+import os, re, json, io, base64
+from datetime import datetime, time as dtime
 from typing import Dict, List, Tuple, Optional
+from zoneinfo import ZoneInfo
 
 import requests
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from PIL import Image
 import pytesseract
 
-
-# =========================
-# CONFIG
-# =========================
-
-# Mapping destinataires (TEST comme tu l'as donné)
-# Clé = (AGENCY, INITIALS) => email destinataire immédiat
-RECIPIENTS_SESSION = {
-    ("GR", "JL"): "sam9999@free.fr",
-    ("GR", "CZ"): "slengue@gmail.com",
-    ("VR", "JB"): "sam9999@free.fr",
-    ("VR", "LB"): "slengue@gmail.com",
-    ("GRS", "PV"): "sam9999@free.fr",
-    ("GRS", "ST"): "slengue@gmail.com",
-    ("SLS", "AC"): "sam9999@free.fr",
-}
-
-# Récap agence fin de journée => responsable
-RECIPIENTS_DAILY_AGENCY = {
-    "GR": "sam9999@free.fr",     # JL
-    "VR": "sam9999@free.fr",     # JB
-    "GRS": "sam9999@free.fr",    # PV
-    "SLS": "sam9999@free.fr",    # AC
-}
-
-# Ton récap global (17:47)
-RECIPIENTS_DAILY_GLOBAL = ["samuel.lengue@ras-interim.fr"]
-
-
-# Colonnes Excel attendues (ordre)
-EXCEL_COLUMNS = [
-    "NOM",
-    "ADRESSE",
-    "CODE POSTAL",
-    "VILLE",
-    "TELEPHONE",
-    "TELEPHONE 2",
-    "MAIL",
-    "SIRET",
-    "NAF",
-    "SITE WEB",
-    "Contact: civilité",
-    "Contact : prénom",
-    "Contact : nom",
-    "DIRIGEANT",
-    "RESUME ENTRETIEN",
-    "COMMANDE",
-    "INFOS_COMMERCIALES",
-    "CARTE_VISITE_FILE_ID",
-]
-
-# OCR — on cherche surtout nom + email + tel
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:(?:\+33|0)\s*[1-9](?:[\s.\-]*\d{2}){4})")
 
+PARIS = ZoneInfo("Europe/Paris")
+
+# -------------------------
+# Helpers
+# -------------------------
 
 def must_env(name: str) -> str:
     v = os.getenv(name, "").strip()
@@ -74,56 +24,43 @@ def must_env(name: str) -> str:
         raise RuntimeError(f"Missing required env var: {name}")
     return v
 
+def opt_env(name: str) -> str:
+    return os.getenv(name, "").strip()
 
 def normalize_naf(naf: str) -> str:
-    # "23.12Z" -> "2312Z"
     if not naf:
         return ""
-    naf = str(naf).strip().upper()
-    naf = naf.replace(".", "").replace(" ", "")
-    return naf
-
-
-def join_address(address: str, postal: str, city: str) -> str:
-    parts = [str(x).strip() for x in [address, postal, city] if str(x).strip()]
-    return " ".join(parts).strip()
-
+    return str(naf).strip().upper().replace(".", "").replace(" ", "")
 
 def safe_filename(s: str) -> str:
     s = re.sub(r"[^\w\-\. ]+", "_", s, flags=re.UNICODE)
     s = re.sub(r"\s+", " ", s).strip()
-    return s[:120] if len(s) > 120 else s
-
+    return s[:160] if len(s) > 160 else s
 
 def build_dump_url(base: str, date: str, kind: str) -> str:
-    base = base.strip()
-    if base.endswith("/"):
-        base = base[:-1]
-    if not base.startswith("http://") and not base.startswith("https://"):
-        raise RuntimeError("WORKER_BASE_URL must start with https:// or http://")
+    base = base.strip().rstrip("/")
     return f"{base}/dump?date={date}&kind={kind}"
-
 
 def fetch_dump_jsonl(date: str, kind: str) -> List[dict]:
     base = must_env("WORKER_BASE_URL")
     token = must_env("EXPORT_TOKEN")
-
     url = build_dump_url(base, date, kind)
-    headers = {"X-Export-Token": token}
-
-    r = requests.get(url, headers=headers, timeout=60)
+    r = requests.get(url, headers={"X-Export-Token": token}, timeout=60)
     r.raise_for_status()
-
-    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
     out = []
-    for ln in lines:
+    for ln in r.text.splitlines():
+        ln = ln.strip()
+        if not ln:
+            continue
         try:
             out.append(json.loads(ln))
         except Exception:
-            # si jamais une ligne est déjà JSON stringifié bizarrement
             continue
     return out
 
+# -------------------------
+# Telegram download (fallback)
+# -------------------------
 
 def telegram_get_file_path(file_id: str) -> Optional[str]:
     token = must_env("TELEGRAM_TOKEN")
@@ -135,7 +72,6 @@ def telegram_get_file_path(file_id: str) -> Optional[str]:
         return None
     return j["result"].get("file_path")
 
-
 def telegram_download_file(file_path: str) -> bytes:
     token = must_env("TELEGRAM_TOKEN")
     url = f"https://api.telegram.org/file/bot{token}/{file_path}"
@@ -143,30 +79,25 @@ def telegram_download_file(file_path: str) -> bytes:
     r.raise_for_status()
     return r.content
 
+# -------------------------
+# OCR
+# -------------------------
 
 def ocr_extract_contact_fields(image_bytes: bytes) -> Dict[str, str]:
-    """
-    Retourne: {contact_full, email, mobile, phone}
-    - on privilégie mobile si trouvé 06/07
-    - on tente de récupérer un "nom" en détectant une ligne nom/prénom probable (heuristique)
-    """
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
         return {"contact_full": "", "email": "", "mobile": "", "phone": ""}
 
-    # OCR
     text = pytesseract.image_to_string(img, lang="fra+eng")
     text = re.sub(r"[ \t]+", " ", text)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    # Email
     email = ""
     m = EMAIL_RE.search(text)
     if m:
         email = m.group(0).strip()
 
-    # Phones
     phones = PHONE_RE.findall(text)
     normalized = []
     for p in phones:
@@ -180,30 +111,22 @@ def ocr_extract_contact_fields(image_bytes: bytes) -> Dict[str, str]:
     mobile = next((x for x in normalized if x.startswith("06") or x.startswith("07")), "")
     phone = next((x for x in normalized if x.startswith("04")), "")
     if not phone:
-        # autre fixe si pas 04
         phone = next((x for x in normalized if x.startswith(("01", "02", "03", "05", "09", "08"))), "")
 
-    # Heuristique contact: chercher une ligne "Prénom NOM" (ex Céline MEKH...),
-    # souvent au-dessus du poste.
     contact_full = ""
-    # 1) lignes courtes candidates
     candidates = []
     for ln in lines[:20]:
         if len(ln) < 4 or len(ln) > 60:
             continue
-        # éviter "VEOLIA", "SAS", etc.
         upper = ln.upper()
-        if any(k in upper for k in ["SAS", "SARL", "EURL", "FRANCE", "GROUPE", "VEOLIA", "WWW", "HTTP", "@"]):
+        if any(k in upper for k in ["SAS", "SARL", "EURL", "FRANCE", "GROUPE", "WWW", "HTTP", "@"]):
             continue
-        # au moins 2 mots
         if len(ln.split()) < 2:
             continue
-        # contient des lettres
         if not re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", ln):
             continue
         candidates.append(ln)
 
-    # 2) préférer la ligne où il y a un mot en MAJ (souvent NOM)
     for ln in candidates:
         if re.search(r"\b[A-ZÀ-ÖØ-Ý]{3,}\b", ln):
             contact_full = ln
@@ -213,23 +136,15 @@ def ocr_extract_contact_fields(image_bytes: bytes) -> Dict[str, str]:
 
     return {"contact_full": contact_full, "email": email, "mobile": mobile, "phone": phone}
 
-
 def split_contact(contact_full: str) -> Tuple[str, str, str]:
-    """
-    Retourne (civilité, prenom, nom)
-    """
     if not contact_full:
         return ("", "", "")
     s = contact_full.strip()
     civ = ""
-    # petites civilités possibles
-    s = re.sub(r"^(M\.?|MME|Mme|Monsieur|Madame)\s+", lambda m: (m.group(0).strip() + " "), s, flags=re.IGNORECASE)
-    # on extrait civ si présent
     m = re.match(r"^(M\.?|MME|Mme|Monsieur|Madame)\s+(.*)$", s, flags=re.IGNORECASE)
     if m:
         civ = m.group(1).replace("Monsieur", "M.").replace("Madame", "Mme").strip()
         s = m.group(2).strip()
-
     parts = s.split()
     if len(parts) == 1:
         return (civ, "", parts[0])
@@ -237,84 +152,99 @@ def split_contact(contact_full: str) -> Tuple[str, str, str]:
     nom = " ".join(parts[1:])
     return (civ, prenom, nom)
 
+# -------------------------
+# Routing
+# -------------------------
 
-def filter_records(records: List[dict], date: str, agency: str, initials: Optional[str], mode: str) -> List[dict]:
-    """
-    mode:
-      - session: filtre date + agency + initials
-      - agency_daily: filtre date + agency (tous collaborateurs)
-      - global_daily: filtre date (toutes agences)
-    """
-    out = []
+DEFAULT_ROUTING = {
+  "GR": {"JL": ["sam9999@free.fr"], "CZ": ["slengue@gmail.com"], "_manager": ["sam9999@free.fr"]},
+  "VR": {"JB": ["sam9999@free.fr"], "LB": ["slengue@gmail.com"], "_manager": ["sam9999@free.fr"]},
+  "GRS":{"PV": ["sam9999@free.fr"], "ST": ["slengue@gmail.com"], "_manager": ["sam9999@free.fr"]},
+  "SLS":{"AC": ["sam9999@free.fr"], "_manager": ["sam9999@free.fr"]},
+  "_admin": ["samuel.lengue@ras-interim.fr"]
+}
+
+def load_routing() -> dict:
+    s = opt_env("MAIL_ROUTING_JSON")
+    if not s:
+        return DEFAULT_ROUTING
+    try:
+        return json.loads(s)
+    except Exception:
+        return DEFAULT_ROUTING
+
+# -------------------------
+# Excel
+# - Initiales en dernière colonne
+# - Agence avant dernière
+# -------------------------
+
+EXCEL_COLUMNS = [
+    "NOM","ADRESSE","CODE POSTAL","VILLE","TELEPHONE","TELEPHONE 2","MAIL",
+    "SIRET","NAF","SITE WEB",
+    "Contact: civilité","Contact : prénom","Contact : nom",
+    "DIRIGEANT","RESUME ENTRETIEN","COMMANDE","INFOS_COMMERCIALES",
+    "CARTE_VISITE_FILE_ID",
+    "AGENCE","INITIALS"
+]
+
+def build_excel(records: List[dict], xlsx_path: str, template_path: Optional[str] = None) -> None:
+    if template_path and os.path.exists(template_path):
+        wb = load_workbook(template_path)
+        ws = wb.active
+        ws.delete_rows(2, ws.max_row)  # garde entête
+    else:
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "PROSPECTION"
+        ws.append(EXCEL_COLUMNS)
+
     for r in records:
-        if str(r.get("date", "")).strip() != date:
-            continue
-        if mode in ("session", "agency_daily") and str(r.get("agency", "")).strip().upper() != agency.upper():
-            continue
-        if mode == "session":
-            if str(r.get("initials", "")).strip().upper() != (initials or "").upper():
-                continue
-        out.append(r)
-    return out
-
-
-def build_excel(records: List[dict], xlsx_path: str) -> None:
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "PROSPECTION"
-
-    ws.append(EXCEL_COLUMNS)
-
-    for r in records:
-        naf = normalize_naf(r.get("naf", ""))
         row = [
-            r.get("name", "") or "",
-            join_address(r.get("address", ""), r.get("postal_code", ""), r.get("city", "")),
-            r.get("postal_code", "") or "",
-            r.get("city", "") or "",
-            r.get("phone", "") or "",
-            r.get("phone2", "") or "",  # tu utilises phone2 comme "téléphone 2"
-            r.get("email", "") or "",
-            r.get("siret", "") or "",
-            naf,
-            r.get("website", "") or "",
-            r.get("contact_civility", "") or "",
-            r.get("contact_firstname", "") or "",
-            r.get("contact_lastname", "") or "",
-            r.get("dirigeant", "") or "",
-            r.get("resume", "") or "",
-            r.get("commande", "") or "",
-            r.get("infos_commerciales", "") or "",
-            r.get("card_photo_file_id", "") or "",
+            r.get("name","") or "",
+            r.get("address","") or "",
+            r.get("postal_code","") or "",
+            r.get("city","") or "",
+            r.get("phone","") or "",
+            r.get("phone2","") or "",
+            r.get("email","") or "",
+            r.get("siret","") or "",
+            normalize_naf(r.get("naf","")),
+            r.get("website","") or "",
+            r.get("contact_civility","") or "",
+            r.get("contact_firstname","") or "",
+            r.get("contact_lastname","") or "",
+            r.get("dirigeant","") or "",
+            r.get("resume","") or "",
+            r.get("commande","") or "",
+            r.get("infos_commerciales","") or "",
+            r.get("card_photo_file_id","") or "",
+            r.get("agency","") or "",
+            r.get("initials","") or "",
         ]
         ws.append(row)
 
-    # autosize simple
-    for col in range(1, len(EXCEL_COLUMNS) + 1):
-        letter = get_column_letter(col)
-        ws.column_dimensions[letter].width = 20
+    for col in range(1, len(EXCEL_COLUMNS)+1):
+        ws.column_dimensions[get_column_letter(col)].width = 20
 
     wb.save(xlsx_path)
 
+# -------------------------
+# Brevo
+# -------------------------
 
 def send_mail_brevo(to_list: List[str], subject: str, html: str, attachments: List[Tuple[str, bytes]]) -> None:
     api_key = must_env("BREVO_API_KEY")
-    mail_from = must_env("MAIL_FROM")
+    sender_email = must_env("BREVO_SENDER_EMAIL")
+    sender_name = must_env("BREVO_SENDER_NAME")
 
     payload = {
-        "sender": {"email": mail_from, "name": "Prospection Bot"},
+        "sender": {"email": sender_email, "name": sender_name},
         "to": [{"email": x} for x in to_list],
         "subject": subject,
         "htmlContent": html,
-        "attachment": [
-            {"name": name, "content": (content_bytes).decode("latin1")}
-            for (name, content_bytes) in []
-        ],
+        "attachment": [{"name": name, "content": base64.b64encode(b).decode("utf-8")} for name, b in attachments],
     }
-
-    # Brevo attend base64 pour attachment.content
-    import base64
-    payload["attachment"] = [{"name": name, "content": base64.b64encode(b).decode("utf-8")} for name, b in attachments]
 
     r = requests.post(
         "https://api.brevo.com/v3/smtp/email",
@@ -324,154 +254,246 @@ def send_mail_brevo(to_list: List[str], subject: str, html: str, attachments: Li
     )
     r.raise_for_status()
 
+# -------------------------
+# Stats admin basées sur CLOSES uniquement
+# -------------------------
+
+def build_admin_stats_from_closes(closes: List[dict]) -> str:
+    stats: Dict[str, Dict[str, Dict[str,int]]] = {}
+    total = {"prospects":0, "clients":0, "commandes":0}
+
+    for c in closes:
+        ag = (c.get("agency") or "").strip().upper()
+        ini = (c.get("initials") or "").strip().upper()
+        if not ag or not ini:
+            continue
+
+        p = int(c.get("visits_prospects") or 0)
+        cl = int(c.get("visits_clients") or 0)
+        co = int(c.get("commandes") or 0)
+
+        stats.setdefault(ag, {})
+        stats[ag].setdefault(ini, {"prospects":0, "clients":0, "commandes":0})
+
+        stats[ag][ini]["prospects"] += p
+        stats[ag][ini]["clients"] += cl
+        stats[ag][ini]["commandes"] += co
+
+        total["prospects"] += p
+        total["clients"] += cl
+        total["commandes"] += co
+
+    html = "<h2>📊 RÉCAP GLOBAL</h2>"
+    for ag in sorted(stats.keys()):
+        html += f"<h3>🏢 {ag}</h3>"
+        html += """
+        <table border="1" cellpadding="6" cellspacing="0">
+        <tr><th>Collaborateur</th><th>Prospects</th><th>Clients</th><th>Commandes</th></tr>
+        """
+        for ini in sorted(stats[ag].keys()):
+            d = stats[ag][ini]
+            html += f"<tr><td>{ini}</td><td>{d['prospects']}</td><td>{d['clients']}</td><td>{d['commandes']}</td></tr>"
+        html += "</table><br>"
+
+    html += f"""
+    <h3>🔢 TOTAL GLOBAL</h3>
+    <ul>
+      <li>Prospects : {total['prospects']}</li>
+      <li>Clients : {total['clients']}</li>
+      <li>Commandes : {total['commandes']}</li>
+    </ul>
+    """
+    return html
+
+# -------------------------
+# late_update : uniquement si quelque chose > 17:45
+# -------------------------
+
+def iso_to_paris(iso: str) -> Optional[datetime]:
+    if not iso:
+        return None
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.astimezone(PARIS)
+    except Exception:
+        return None
+
+def has_new_since_1745(prospects: List[dict], closes: List[dict]) -> bool:
+    threshold = dtime(17, 45)
+    for r in prospects:
+        dt = iso_to_paris(r.get("created_at",""))
+        if dt and dt.time() > threshold:
+            return True
+    for c in closes:
+        dt = iso_to_paris(c.get("closed_at",""))
+        if dt and dt.time() > threshold:
+            return True
+    return False
+
+# -------------------------
+# Main modes
+# -------------------------
+
+def filter_records(records: List[dict], date: str, agency: Optional[str], initials: Optional[str]) -> List[dict]:
+    out = []
+    for r in records:
+        if (r.get("date") or "").strip() != date:
+            continue
+        if agency and (r.get("agency") or "").strip().upper() != agency.upper():
+            continue
+        if initials and (r.get("initials") or "").strip().upper() != initials.upper():
+            continue
+        out.append(r)
+    return out
+
+def maybe_enrich_from_ocr(records: List[dict]) -> List[Tuple[str, bytes]]:
+    attachments: List[Tuple[str, bytes]] = []
+    for r in records:
+        file_id = (r.get("card_photo_file_id") or "").strip()
+        url = (r.get("card_photo_url") or "").strip()
+        if not file_id and not url:
+            continue
+
+        img_bytes = b""
+        try:
+            if url:
+                resp = requests.get(url, timeout=60)
+                resp.raise_for_status()
+                img_bytes = resp.content
+            else:
+                fp = telegram_get_file_path(file_id)
+                if not fp:
+                    continue
+                img_bytes = telegram_download_file(fp)
+        except Exception:
+            continue
+
+        o = ocr_extract_contact_fields(img_bytes)
+
+        # contact/interlocuteur
+        if not r.get("interlocuteur") and o.get("contact_full"):
+            r["interlocuteur"] = o["contact_full"]
+
+        civ, prenom, nom = split_contact(o.get("contact_full",""))
+        if not r.get("contact_civility") and civ:
+            r["contact_civility"] = civ
+        if not r.get("contact_firstname") and prenom:
+            r["contact_firstname"] = prenom
+        if not r.get("contact_lastname") and nom:
+            r["contact_lastname"] = nom
+
+        # email
+        if not r.get("email") and o.get("email"):
+            r["email"] = o["email"]
+
+        # phones
+        if not r.get("phone") and o.get("phone"):
+            r["phone"] = o["phone"]
+        if not r.get("phone2") and o.get("mobile"):
+            r["phone2"] = o["mobile"]
+
+        name = safe_filename(f"carte_{r.get('name','societe')}_{file_id or 'url'}.jpg")
+        attachments.append((name, img_bytes))
+    return attachments
 
 def main():
-    """
-    Paramètres via env (venant du workflow_dispatch):
-      MODE = session | agency_daily | global_daily
-      RUN_DATE = YYYY-MM-DD
-      AGENCY = GR/VR/GRS/SLS (si mode session/agency_daily)
-      INITIALS = JL/CZ/... (si mode session)
-      VISITS_CLIENTS / VISITS_PROSPECTS / COMMANDES (optionnel: stats)
-    """
-    mode = os.getenv("MODE", "session").strip()
-    run_date = os.getenv("RUN_DATE", "").strip()
+    send_mode = opt_env("SEND_MODE") or "individual"
+    routing = load_routing()
+
+    run_date = opt_env("RUN_DATE")
     if not run_date:
-        # fallback = date du jour (UTC -> pas parfait, mais ton worker stocke en Europe/Paris; normalement RUN_DATE est fourni)
-        run_date = datetime.utcnow().strftime("%Y-%m-%d")
+        run_date = datetime.now(PARIS).strftime("%Y-%m-%d")
 
-    agency = os.getenv("AGENCY", "").strip().upper()
-    initials = os.getenv("INITIALS", "").strip().upper()
+    agency = opt_env("AGENCY").upper()
+    initials = opt_env("INITIALS").upper()
 
-    visits_clients = os.getenv("VISITS_CLIENTS", "").strip()
-    visits_prospects = os.getenv("VISITS_PROSPECTS", "").strip()
-    commandes = os.getenv("COMMANDES", "").strip()
-
-    # 1) récup prospects du jour
     prospects_all = fetch_dump_jsonl(run_date, "prospects")
+    closes_all = fetch_dump_jsonl(run_date, "closes")
 
-    # 2) filtre selon mode
-    if mode == "session":
+    template_path = "Table.2.xlsx" if os.path.exists("Table.2.xlsx") else None
+
+    if send_mode == "individual":
         if not agency or not initials:
-            raise RuntimeError("MODE=session requires AGENCY and INITIALS")
-        prospects = filter_records(prospects_all, run_date, agency, initials, mode)
-    elif mode == "agency_daily":
-        if not agency:
-            raise RuntimeError("MODE=agency_daily requires AGENCY")
-        prospects = filter_records(prospects_all, run_date, agency, None, mode)
-    elif mode == "global_daily":
-        prospects = filter_records(prospects_all, run_date, "", None, mode)
-    else:
-        raise RuntimeError("Invalid MODE. Use session|agency_daily|global_daily")
+            raise RuntimeError("individual requires AGENCY and INITIALS")
+        prospects = filter_records(prospects_all, run_date, agency, initials)
+        # OCR cartes pour compléter les champs si manquants + PJ cartes
+        card_attachments = maybe_enrich_from_ocr(prospects)
 
-    # 3) OCR sur cartes (uniquement MODE=session : tu veux PJ + enrichir contact)
-    attachments: List[Tuple[str, bytes]] = []
-    if mode == "session":
-        for r in prospects:
-            file_id = (r.get("card_photo_file_id") or "").strip()
-            if not file_id:
-                continue
-
-            # download
-            fp = telegram_get_file_path(file_id)
-            if not fp:
-                continue
-            img_bytes = telegram_download_file(fp)
-
-            # OCR -> enrichit contact + email/phone si manquant
-            o = ocr_extract_contact_fields(img_bytes)
-
-            # contact
-            if not r.get("interlocuteur") and o.get("contact_full"):
-                r["interlocuteur"] = o["contact_full"]
-
-            civ, prenom, nom = split_contact(o.get("contact_full", ""))
-            if not r.get("contact_civility") and civ:
-                r["contact_civility"] = civ
-            if not r.get("contact_firstname") and prenom:
-                r["contact_firstname"] = prenom
-            if not r.get("contact_lastname") and nom:
-                r["contact_lastname"] = nom
-
-            # email
-            if not r.get("email") and o.get("email"):
-                r["email"] = o["email"]
-
-            # phones
-            if not r.get("phone") and o.get("phone"):
-                r["phone"] = o["phone"]
-            if not r.get("phone2") and o.get("mobile"):
-                r["phone2"] = o["mobile"]
-
-            # PJ
-            attachments.append((safe_filename(f"carte_{r.get('name','societe')}_{file_id}.jpg"), img_bytes))
-
-    # 4) Excel
-    if mode == "session":
         xlsx_name = safe_filename(f"prospection_{agency}_{initials}_{run_date}.xlsx")
-    elif mode == "agency_daily":
-        xlsx_name = safe_filename(f"prospection_{agency}_CONSOLIDE_{run_date}.xlsx")
-    else:
-        xlsx_name = safe_filename(f"prospection_GLOBAL_{run_date}.xlsx")
+        build_excel(prospects, xlsx_name, template_path=template_path)
 
-    xlsx_path = os.path.join(os.getcwd(), xlsx_name)
-    build_excel(prospects, xlsx_path)
+        with open(xlsx_name, "rb") as f:
+            excel_bytes = f.read()
 
-    # Excel en PJ
-    with open(xlsx_path, "rb") as f:
-        excel_bytes = f.read()
-    attachments.insert(0, (xlsx_name, excel_bytes))
+        attachments = [(xlsx_name, excel_bytes)] + card_attachments
 
-    # 5) destinataires + mail
-    if mode == "session":
-        to_email = RECIPIENTS_SESSION.get((agency, initials))
-        if not to_email:
-            raise RuntimeError(f"No recipient mapped for ({agency},{initials}) in RECIPIENTS_SESSION")
-        to_list = [to_email]
+        to_list = routing.get(agency, {}).get(initials, [])
+        if not to_list:
+            raise RuntimeError(f"No routing for {agency}/{initials}")
+
         subject = f"[PROSPECTION] {agency}/{initials} - {run_date}"
-        stats_html = ""
-        if visits_clients or visits_prospects or commandes:
-            stats_html = f"""
-            <p><b>Clôture session</b></p>
-            <ul>
-              <li>Visites clients: {visits_clients or "-"}</li>
-              <li>Visites prospects: {visits_prospects or "-"}</li>
-              <li>Commandes: {commandes or "-"}</li>
-            </ul>
-            """
-        html = f"""
-        <p>Bonjour,</p>
-        <p>Voici l’export de prospection <b>{agency}/{initials}</b> du <b>{run_date}</b>.</p>
-        {stats_html}
-        <p>Pièces jointes : Excel + cartes de visite.</p>
-        """
+        html = f"<p>Bonjour,</p><p>Export prospection <b>{agency}/{initials}</b> du <b>{run_date}</b>.</p><p>Excel + cartes en PJ.</p>"
         send_mail_brevo(to_list, subject, html, attachments)
+        print(f"OK individual {agency}/{initials} records={len(prospects)}")
 
-    elif mode == "agency_daily":
-        to_email = RECIPIENTS_DAILY_AGENCY.get(agency)
-        if not to_email:
-            raise RuntimeError(f"No agency daily recipient mapped for {agency}")
-        to_list = [to_email]
-        subject = f"[PROSPECTION] Récap agence {agency} - {run_date}"
-        html = f"""
-        <p>Bonjour,</p>
-        <p>Voici le récapitulatif consolidé de l’agence <b>{agency}</b> pour le <b>{run_date}</b>.</p>
-        <p>Pièce jointe : Excel consolidé.</p>
-        """
-        send_mail_brevo(to_list, subject, html, attachments)
+    elif send_mode == "agency_manager":
+        # envoie 1 mail par agence au manager
+        for ag in ["GR","VR","GRS","SLS"]:
+            prospects = filter_records(prospects_all, run_date, ag, None)
 
-    else:  # global_daily
-        to_list = RECIPIENTS_DAILY_GLOBAL
+            xlsx_name = safe_filename(f"prospection_{ag}_CONSOLIDE_{run_date}.xlsx")
+            build_excel(prospects, xlsx_name, template_path=template_path)
+            with open(xlsx_name, "rb") as f:
+                excel_bytes = f.read()
+
+            to_list = routing.get(ag, {}).get("_manager", [])
+            if not to_list:
+                continue
+
+            subject = f"[PROSPECTION] Récap agence {ag} - {run_date}"
+            html = f"<p>Bonjour,</p><p>Récap consolidé agence <b>{ag}</b> du <b>{run_date}</b>.</p><p>Excel en PJ.</p>"
+            send_mail_brevo(to_list, subject, html, [(xlsx_name, excel_bytes)])
+            print(f"OK agency_manager {ag} records={len(prospects)}")
+
+    elif send_mode == "admin":
+        # global + stats closes
+        prospects = filter_records(prospects_all, run_date, None, None)
+        closes = filter_records(closes_all, run_date, None, None)
+
+        xlsx_name = safe_filename(f"prospection_GLOBAL_{run_date}.xlsx")
+        build_excel(prospects, xlsx_name, template_path=template_path)
+        with open(xlsx_name, "rb") as f:
+            excel_bytes = f.read()
+
+        stats_html = build_admin_stats_from_closes(closes)
+        to_list = routing.get("_admin", [])
         subject = f"[PROSPECTION] Récap GLOBAL - {run_date}"
-        html = f"""
-        <p>Bonsoir,</p>
-        <p>Voici le récapitulatif global pour le <b>{run_date}</b> (toutes agences / collaborateurs).</p>
-        <p>Pièce jointe : Excel global.</p>
-        """
-        send_mail_brevo(to_list, subject, html, attachments)
+        html = f"<p>Bonsoir,</p>{stats_html}<p>Excel global en PJ.</p>"
+        send_mail_brevo(to_list, subject, html, [(xlsx_name, excel_bytes)])
+        print(f"OK admin records={len(prospects)} closes={len(closes)}")
 
-    print(f"OK: mode={mode} date={run_date} records={len(prospects)} attachments={len(attachments)}")
+    elif send_mode == "late_update":
+        prospects = filter_records(prospects_all, run_date, None, None)
+        closes = filter_records(closes_all, run_date, None, None)
 
+        if not has_new_since_1745(prospects, closes):
+            print("No new records since 17:45 → no mail sent")
+            return
+
+        xlsx_name = safe_filename(f"prospection_GLOBAL_{run_date}_LATE.xlsx")
+        build_excel(prospects, xlsx_name, template_path=template_path)
+        with open(xlsx_name, "rb") as f:
+            excel_bytes = f.read()
+
+        stats_html = build_admin_stats_from_closes(closes)
+        to_list = routing.get("_admin", [])
+        subject = f"[PROSPECTION] MAJ 23:59 - {run_date}"
+        html = f"<p>Bonsoir,</p><p><b>Mise à jour tardive</b> (nouvelles saisies après 17:45).</p>{stats_html}<p>Excel en PJ.</p>"
+        send_mail_brevo(to_list, subject, html, [(xlsx_name, excel_bytes)])
+        print("OK late_update sent")
+
+    else:
+        raise RuntimeError("Invalid SEND_MODE")
 
 if __name__ == "__main__":
     main()
