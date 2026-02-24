@@ -1,37 +1,41 @@
-name: prospection
+# .github/workflows/prospection.yml
+name: Prospection
 
 on:
   workflow_dispatch:
     inputs:
       mode:
         description: "individual | agency_manager | admin"
-        required: false
+        required: true
         default: "individual"
         type: string
       run_date:
-        description: "Date (YYYY-MM-DD) Europe/Paris"
+        description: "YYYY-MM-DD Europe/Paris (optionnel)"
         required: false
         type: string
       agency:
-        description: "Agence (GR/VR/GRS/SLS...)"
+        description: "GR/VR/GRS/SLS (requis si individual)"
         required: false
         type: string
       initials:
-        description: "Initiales (JL/CZ/...)"
+        description: "JL/CZ/JB/LB/PV/ST/AC/SL (requis si individual)"
         required: false
         type: string
 
   schedule:
-    - cron: "45 16 * * *"   # 17:45 Paris -> agency_manager
-    - cron: "47 16 * * *"   # 17:47 Paris -> admin
+    - cron: "45 16 * * *"   # 17:45 Europe/Paris (≈ UTC)
+    - cron: "47 16 * * *"   # 17:47 Europe/Paris (≈ UTC)
 
 jobs:
   export_and_mail:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -45,8 +49,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Compute mode for schedule
-        id: sched
+      - name: Determine mode for schedule
+        id: mode
         run: |
           MODE="${{ inputs.mode }}"
           if [ "${{ github.event_name }}" = "schedule" ]; then
@@ -56,7 +60,7 @@ jobs:
               MODE="admin"
             fi
           fi
-          echo "MODE=$MODE" >> $GITHUB_OUTPUT
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
 
       - name: Run export & mail
         env:
@@ -70,9 +74,15 @@ jobs:
 
           MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
 
-          SEND_MODE: ${{ steps.sched.outputs.MODE }}
+          SEND_MODE: ${{ steps.mode.outputs.mode }}
+
+          # Inputs dispatch (si vide => script fallback)
           RUN_DATE: ${{ inputs.run_date }}
           AGENCY: ${{ inputs.agency }}
           INITIALS: ${{ inputs.initials }}
+
+          # OCR safety
+          MAX_OCR_IMAGES: "50"
+
         run: |
           python scripts/export_and_mail.py
