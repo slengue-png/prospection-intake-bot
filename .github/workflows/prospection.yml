@@ -4,6 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
+        description: "individual | agency_manager | admin | late_update"
         required: true
         default: "individual"
         type: choice
@@ -13,12 +14,15 @@ on:
           - admin
           - late_update
       run_date:
+        description: "Date (YYYY-MM-DD) Europe/Paris"
         required: false
         type: string
       agency:
+        description: "Agence (GR/VR/GRS/SLS)"
         required: false
         type: string
       initials:
+        description: "Initiales"
         required: false
         type: string
       visits_clients:
@@ -44,12 +48,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
-      - run: pip install -r requirements.txt
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Determine mode
         id: mode
@@ -66,7 +78,7 @@ jobs:
           fi
           echo "mode=$MODE" >> $GITHUB_OUTPUT
 
-      - name: Run export
+      - name: Run export & mail
         env:
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
@@ -76,14 +88,16 @@ jobs:
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
           BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
 
+          MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
+
           RUN_DATE: ${{ inputs.run_date }}
           AGENCY: ${{ inputs.agency }}
           INITIALS: ${{ inputs.initials }}
-
           VISITS_CLIENTS: ${{ inputs.visits_clients }}
           VISITS_PROSPECTS: ${{ inputs.visits_prospects }}
           COMMANDES: ${{ inputs.commandes }}
 
           SEND_MODE: ${{ steps.mode.outputs.mode }}
 
-        run: python scripts/export_and_mail.py
+        run: |
+          python scripts/export_and_mail.py
