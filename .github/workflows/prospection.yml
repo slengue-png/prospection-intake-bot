@@ -4,7 +4,6 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "individual | agency_manager | admin | late_update"
         required: true
         default: "individual"
         type: choice
@@ -12,40 +11,24 @@ on:
           - individual
           - agency_manager
           - admin
-          - late_update
       run_date:
-        description: "Date (YYYY-MM-DD) Europe/Paris"
         required: false
         type: string
       agency:
-        description: "Agence (GR/VR/GRS/SLS)"
         required: false
         type: string
       initials:
-        description: "Initiales"
         required: false
-        type: string
-      visits_clients:
-        required: false
-        default: ""
-        type: string
-      visits_prospects:
-        required: false
-        default: ""
-        type: string
-      commandes:
-        required: false
-        default: ""
         type: string
 
   schedule:
-    - cron: "45 16 * * *"
-    - cron: "47 16 * * *"
-    - cron: "59 22 * * *"
+    - cron: "45 16 * * *"   # 17:45 France
+    - cron: "47 16 * * *"   # 17:47 France
 
 jobs:
-  export_and_mail:
+  export:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
@@ -53,32 +36,23 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install system deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
+      - run: sudo apt-get update && sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
+      - run: pip install -r requirements.txt
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Determine mode
+      - name: Determine Mode
         id: mode
         run: |
           MODE="${{ inputs.mode }}"
           if [ "${{ github.event_name }}" = "schedule" ]; then
             if [ "${{ github.event.schedule }}" = "45 16 * * *" ]; then
               MODE="agency_manager"
-            elif [ "${{ github.event.schedule }}" = "47 16 * * *" ]; then
-              MODE="admin"
             else
-              MODE="late_update"
+              MODE="admin"
             fi
           fi
           echo "mode=$MODE" >> $GITHUB_OUTPUT
 
-      - name: Run export & mail
+      - name: Run Export
         env:
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
@@ -93,11 +67,6 @@ jobs:
           RUN_DATE: ${{ inputs.run_date }}
           AGENCY: ${{ inputs.agency }}
           INITIALS: ${{ inputs.initials }}
-          VISITS_CLIENTS: ${{ inputs.visits_clients }}
-          VISITS_PROSPECTS: ${{ inputs.visits_prospects }}
-          COMMANDES: ${{ inputs.commandes }}
-
           SEND_MODE: ${{ steps.mode.outputs.mode }}
 
-        run: |
-          python scripts/export_and_mail.py
+        run: python scripts/export_and_mail.py
