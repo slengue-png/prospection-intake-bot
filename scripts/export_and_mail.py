@@ -1,92 +1,114 @@
+#!/usr/bin/env python3
+"""
+export_and_mail.py — VERSION PRO (V1 FIGÉE)
+
+✅ OCR cartes de visite (email/portable + nom contact heuristique)
+✅ Reconstruit contact si besoin (interlocuteur > OCR > dirigeant)
+✅ Export Excel basé sur template Table.2.xlsx (colonnes exactes) + AGENCE + INITIALS (INITIALS en dernière colonne)
+✅ Consolidation "closes" (clients/prospects/commandes) via /dump?kind=closes
+✅ Emails Brevo:
+   - SEND_MODE=individual       -> mail immédiat du collaborateur
+   - SEND_MODE=agency_manager   -> mail manager par agence (consolidé)
+   - SEND_MODE=admin            -> mail SL (global) avec:
+        - tableau par agence
+        - tableau par commercial
+        - totaux clients/prospects/commandes
+        - classement par nombre d’actions
+
+ENV attendues (GitHub Secrets / env):
+- WORKER_BASE_URL
+- EXPORT_TOKEN
+- TELEGRAM_TOKEN
+- BREVO_API_KEY
+- BREVO_SENDER_EMAIL
+- BREVO_SENDER_NAME
+- MAIL_ROUTING_JSON
+
+ENV inputs (workflow):
+- SEND_MODE: individual | agency_manager | admin
+- RUN_DATE: YYYY-MM-DD (optionnel -> UTC fallback)
+- AGENCY: GR|VR|GRS|SLS (requis si individual; optionnel si agency_manager)
+- INITIALS: JL|CZ|... (requis si individual)
+- MAX_OCR_IMAGES: (optionnel, défaut 50)
+"""
+
 import os
 import re
 import io
 import json
 import base64
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Dict, List, Optional, Tuple
 
 import requests
-from openpyxl import Workbook
+from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
 from PIL import Image
 import pytesseract
 
-# =========================
-# CONFIG / CONSTANTS
-# =========================
 
+# =========================
+# REGEX
+# =========================
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:(?:\+33|0)\s*[1-9](?:[\s.\-]*\d{2}){4})")
 
-# Colonnes Excel (stable)
-# NOTE: tu as demandé "INITIALS en dernière colonne" + "AGENCY" aussi (utile manager/admin)
-EXCEL_COLUMNS = [
-    "NOM",
-    "ADRESSE",
-    "CODE POSTAL",
-    "VILLE",
-    "TELEPHONE",
-    "TELEPHONE 2",
-    "MAIL",
-    "SIRET",
-    "NAF",
-    "SITE WEB",
-    "Contact: civilité",
-    "Contact : prénom",
-    "Contact : nom",
-    "DIRIGEANT",
-    "RESUME ENTRETIEN",
-    "COMMANDE",
-    "INFOS_COMMERCIALES",
-    "CARTE_VISITE_FILE_ID",
-    "CARTE_VISITE_URL",
-    "AGENCY",
-    "INITIALS",
-]
 
 # =========================
-# ENV HELPERS
+# ENV
 # =========================
-
 def must_env(name: str) -> str:
     v = os.getenv(name, "").strip()
     if not v:
         raise RuntimeError(f"Missing required env var: {name}")
     return v
 
+
 def opt_env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
-def safe_filename(s: str) -> str:
-    s = re.sub(r"[^\w\-\. ]+", "_", s, flags=re.UNICODE)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s[:120] if len(s) > 120 else s
 
-def normalize_naf(naf: str) -> str:
-    if not naf:
-        return ""
-    naf = str(naf).strip().upper()
-    return naf.replace(".", "").replace(" ", "")
+# =========================
+# GLOBAL CONFIG
+# =========================
+TEMPLATE_PATH = "Table.2.xlsx"  # doit être committé à la racine du repo
 
-def join_address(address: str, postal: str, city: str) -> str:
-    parts = [str(x).strip() for x in [address, postal, city] if str(x).strip()]
-    return " ".join(parts).strip()
+# Colonnes attendues dans ton template (1ère ligne)
+TEMPLATE_HEADERS = [
+    "NOM",
+    "RUE",
+    "CODE POSTAL",
+    "VILLE",
+    "Téléphone",
+    "Téléphone (Portable)",
+    "Mail générique",
+    "SIRET",
+    "NAF",
+    "SITE WEB",
+    "INTERLOCUTEUR",
+    "DIRIGEANT",
+    "RESUME ENTRETIEN",
+    "COMMANDE",
+    "CARTE DE VISITE",
+]
+
+# Colonnes ajoutées en fin
+EXTRA_HEADERS = ["AGENCE", "INITIALS"]  # INITIALS en dernière colonne
+
 
 # =========================
 # WORKER DUMP
 # =========================
+def build_dump_url(base: str, run_date: str, kind: str) -> str:
+    base = base.rstrip("/")
+    return f"{base}/dump?date={run_date}&kind={kind}"
 
-def build_dump_url(base: str, date: str, kind: str) -> str:
-    base = base.strip()
-    if base.endswith("/"):
-        base = base[:-1]
-    return f"{base}/dump?date={date}&kind={kind}"
 
-def fetch_dump_jsonl(date: str, kind: str) -> List[dict]:
+def fetch_dump_jsonl(run_date: str, kind: str) -> List[dict]:
     base = must_env("WORKER_BASE_URL")
     token = must_env("EXPORT_TOKEN")
-    url = build_dump_url(base, date, kind)
+
+    url = build_dump_url(base, run_date, kind)
     r = requests.get(url, headers={"X-Export-Token": token}, timeout=60)
     r.raise_for_status()
 
@@ -98,14 +120,13 @@ def fetch_dump_jsonl(date: str, kind: str) -> List[dict]:
         try:
             out.append(json.loads(ln))
         except Exception:
-            # ignore bad line
             continue
     return out
 
-# =========================
-# TELEGRAM DOWNLOAD (fallback if only file_id)
-# =========================
 
+# =========================
+# TELEGRAM DOWNLOAD (for OCR)
+# =========================
 def telegram_get_file_path(file_id: str) -> Optional[str]:
     token = must_env("TELEGRAM_TOKEN")
     url = f"https://api.telegram.org/bot{token}/getFile"
@@ -116,50 +137,76 @@ def telegram_get_file_path(file_id: str) -> Optional[str]:
         return None
     return j["result"].get("file_path")
 
-def telegram_download_file_by_path(file_path: str) -> bytes:
-    token = must_env("TELEGRAM_TOKEN")
-    url = f"https://api.telegram.org/file/bot{token}/{file_path}"
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    return r.content
 
-def download_card_image(record: dict) -> Optional[bytes]:
+def download_card_image_bytes(record: dict) -> Optional[bytes]:
     """
-    Prefer card_photo_url (direct) else card_photo_file_id (via getFile).
+    Worker V4.2 stocke:
+      - card_photo_url (direct)
+      - card_photo_file_id
     """
     url = (record.get("card_photo_url") or "").strip()
     if url:
-        try:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
+        r = requests.get(url, timeout=60)
+        if r.ok and r.content:
             return r.content
-        except Exception:
-            pass
 
     file_id = (record.get("card_photo_file_id") or "").strip()
     if not file_id:
         return None
-    try:
-        fp = telegram_get_file_path(file_id)
-        if not fp:
-            return None
-        return telegram_download_file_by_path(fp)
-    except Exception:
+
+    fp = telegram_get_file_path(file_id)
+    if not fp:
         return None
 
-# =========================
-# OCR
-# =========================
+    token = must_env("TELEGRAM_TOKEN")
+    url2 = f"https://api.telegram.org/file/bot{token}/{fp}"
+    r2 = requests.get(url2, timeout=60)
+    if r2.ok and r2.content:
+        return r2.content
 
-def ocr_extract_contact_fields(image_bytes: bytes) -> Dict[str, str]:
+    return None
+
+
+# =========================
+# OCR + NORMALISATION
+# =========================
+def normalize_phone_fr(raw: str) -> str:
+    p = re.sub(r"[^\d+]", "", raw or "")
+    if p.startswith("+33"):
+        p = "0" + p[3:]
+    p = re.sub(r"\D", "", p)
+    if len(p) == 10 and p.startswith("0"):
+        return p
+    return ""
+
+
+def split_name_simple(full: str) -> Tuple[str, str]:
     """
-    Retourne: {contact_full, email, mobile, phone}
-    Heuristiques FR.
+    "Jean Dupont" -> ("Jean","Dupont")
+    "Dupont" -> ("","Dupont")
+    """
+    s = (full or "").strip()
+    s = re.sub(r"\s+", " ", s)
+    if not s:
+        return ("", "")
+    parts = s.split(" ")
+    if len(parts) == 1:
+        return ("", parts[0])
+    return (parts[0], " ".join(parts[1:]))
+
+
+def ocr_extract(image_bytes: bytes) -> Dict[str, str]:
+    """
+    Extrait:
+      - email
+      - mobile (06/07)
+      - phone (fixe prioritaire 04 sinon autre)
+      - contact_full (heuristique)
     """
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
-        return {"contact_full": "", "email": "", "mobile": "", "phone": ""}
+        return {"email": "", "mobile": "", "phone": "", "contact_full": ""}
 
     text = pytesseract.image_to_string(img, lang="fra+eng")
     text = re.sub(r"[ \t]+", " ", text)
@@ -171,28 +218,25 @@ def ocr_extract_contact_fields(image_bytes: bytes) -> Dict[str, str]:
         email = m.group(0).strip()
 
     phones = PHONE_RE.findall(text)
-    normalized: List[str] = []
+    normalized = []
     for p in phones:
-        p2 = re.sub(r"[^\d+]", "", p)
-        if p2.startswith("+33"):
-            p2 = "0" + p2[3:]
-        p2 = re.sub(r"\D", "", p2)
-        if len(p2) == 10 and p2.startswith("0"):
-            normalized.append(p2)
+        np = normalize_phone_fr(p)
+        if np:
+            normalized.append(np)
 
-    mobile = next((x for x in normalized if x.startswith("06") or x.startswith("07")), "")
+    mobile = next((x for x in normalized if x.startswith(("06", "07"))), "")
     phone = next((x for x in normalized if x.startswith("04")), "")
     if not phone:
-        phone = next((x for x in normalized if x.startswith(("01", "02", "03", "05", "09", "08"))), "")
+        phone = next((x for x in normalized if x.startswith(("01", "02", "03", "05", "08", "09"))), "")
 
-    # Candidate name line
+    # contact heuristic
     contact_full = ""
     candidates = []
     for ln in lines[:25]:
         if len(ln) < 4 or len(ln) > 60:
             continue
-        up = ln.upper()
-        if any(k in up for k in ["SAS", "SARL", "EURL", "FRANCE", "GROUPE", "WWW", "HTTP", "@", "TEL", "MOBILE"]):
+        upper = ln.upper()
+        if any(k in upper for k in ["SAS", "SARL", "EURL", "FRANCE", "GROUPE", "WWW", "HTTP", "@"]):
             continue
         if len(ln.split()) < 2:
             continue
@@ -200,6 +244,7 @@ def ocr_extract_contact_fields(image_bytes: bytes) -> Dict[str, str]:
             continue
         candidates.append(ln)
 
+    # prefer line with uppercase token (often lastname)
     for ln in candidates:
         if re.search(r"\b[A-ZÀ-ÖØ-Ý]{3,}\b", ln):
             contact_full = ln
@@ -207,145 +252,133 @@ def ocr_extract_contact_fields(image_bytes: bytes) -> Dict[str, str]:
     if not contact_full and candidates:
         contact_full = candidates[0]
 
-    return {"contact_full": contact_full, "email": email, "mobile": mobile, "phone": phone}
+    return {"email": email, "mobile": mobile, "phone": phone, "contact_full": contact_full}
 
-def split_name_simple(full: str) -> Tuple[str, str]:
-    """
-    "Jean Dupont" -> ("Jean", "Dupont")
-    "Dupont" -> ("", "Dupont")
-    """
-    s = (full or "").strip()
-    s = re.sub(r"\s+", " ", s)
-    if not s:
-        return ("", "")
-    parts = s.split(" ")
-    if len(parts) == 1:
-        return ("", parts[0])
-    return (parts[0], " ".join(parts[1:]))
-
-def normalize_civility(s: str) -> Tuple[str, str]:
-    """
-    Extract civility if present at start.
-    Returns (civility, rest)
-    """
-    if not s:
-        return ("", "")
-    s = s.strip()
-    m = re.match(r"^(M\.?|MME|Mme|Monsieur|Madame)\s+(.*)$", s, flags=re.IGNORECASE)
-    if not m:
-        return ("", s)
-    civ_raw = m.group(1)
-    rest = m.group(2).strip()
-    civ = civ_raw
-    civ = civ.replace("Monsieur", "M.").replace("Madame", "Mme")
-    civ = civ.replace("MME", "Mme").replace("Mme.", "Mme").strip()
-    return (civ, rest)
 
 def ensure_contact_fields(record: dict) -> None:
     """
-    Ta règle:
-    1) Saisie manuelle interlocuteur => CONTACT prénom/nom (split)
-    2) Sinon OCR (si présent via contact_full / contact_first/last)
-    3) Sinon dirigeant => Dirigeant + Contact nom (et prénom si split)
-    """
-    interloc = (record.get("interlocuteur") or "").strip()
-    dirg = (record.get("dirigeant") or "").strip()
+    Priorité:
+      1) saisie manuelle (interlocuteur) -> split -> contact_firstname/contact_lastname
+      2) OCR (si contact fields vides) -> split -> contact fields
+      3) dirigeant -> split -> contact fields
 
-    # 1) manuel
+    Et si contact fields existent mais interlocuteur vide -> on reconstruit interlocuteur (pour Excel)
+    """
+    # 1) manual interlocuteur
+    interloc = (record.get("interlocuteur") or "").strip()
     if interloc:
-        civ, rest = normalize_civility(interloc)
-        if civ and not (record.get("contact_civility") or "").strip():
-            record["contact_civility"] = civ
-        fn, ln = split_name_simple(rest)
+        fn, ln = split_name_simple(interloc)
         record["contact_firstname"] = fn
-        record["contact_lastname"] = ln or rest
+        record["contact_lastname"] = ln or interloc
         return
 
-    # 2) si déjà rempli par OCR ou worker (contact_first/last) -> ok
-    has_contact = (record.get("contact_firstname") or "").strip() or (record.get("contact_lastname") or "").strip()
-    if has_contact:
+    # 2) if already filled (by worker) do nothing
+    if (record.get("contact_firstname") or "").strip() or (record.get("contact_lastname") or "").strip():
         return
 
     # 3) fallback dirigeant
+    dirg = (record.get("dirigeant") or "").strip()
     if dirg:
         fn, ln = split_name_simple(dirg)
         record["contact_firstname"] = fn
         record["contact_lastname"] = ln or dirg
 
-# =========================
-# OPTIONAL: light email scraping if missing
-# =========================
-
-def scrape_email_from_website(website: str) -> str:
-    if not website:
-        return ""
-    try:
-        r = requests.get(website, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
-        r.raise_for_status()
-        matches = EMAIL_RE.findall(r.text)
-        if not matches:
-            return ""
-        # remove noreply
-        matches = [m for m in matches if not re.search(r"no-?reply", m, re.I)]
-        return matches[0] if matches else ""
-    except Exception:
-        return ""
 
 # =========================
-# EXCEL
+# EXCEL (Template)
 # =========================
+def build_header_map(ws) -> Dict[str, int]:
+    max_col = ws.max_column
+    return {str(ws.cell(row=1, column=c).value or "").strip(): c for c in range(1, max_col + 1)}
 
-def build_excel(records: List[dict], xlsx_path: str) -> None:
-    wb = Workbook()
+
+def ensure_extra_headers(ws) -> Dict[str, int]:
+    header_map = build_header_map(ws)
+    col = ws.max_column
+
+    if "AGENCE" not in header_map:
+        col += 1
+        ws.cell(row=1, column=col).value = "AGENCE"
+    if "INITIALS" not in header_map:
+        col += 1
+        ws.cell(row=1, column=col).value = "INITIALS"
+
+    return build_header_map(ws)
+
+
+def autosize(ws, width: int = 22) -> None:
+    for c in range(1, ws.max_column + 1):
+        ws.column_dimensions[get_column_letter(c)].width = width
+
+
+def build_excel_from_template(records: List[dict], out_path: str) -> None:
+    if not os.path.exists(TEMPLATE_PATH):
+        raise RuntimeError(f"Missing Excel template at repo root: {TEMPLATE_PATH}")
+
+    wb = load_workbook(TEMPLATE_PATH)
     ws = wb.active
-    ws.title = "PROSPECTION"
 
-    ws.append(EXCEL_COLUMNS)
+    # Soft check headers
+    current_headers = [ws.cell(row=1, column=i).value for i in range(1, len(TEMPLATE_HEADERS) + 1)]
+    if [str(x or "").strip() for x in current_headers] != TEMPLATE_HEADERS:
+        # On ne bloque pas, mais ton template doit rester stable
+        pass
 
-    for r in records:
-        naf = normalize_naf(r.get("naf", ""))
-        row = [
-            r.get("name", "") or "",
-            join_address(r.get("address", ""), r.get("postal_code", ""), r.get("city", "")),
-            r.get("postal_code", "") or "",
-            r.get("city", "") or "",
-            r.get("phone", "") or "",
-            r.get("phone2", "") or "",
-            r.get("email", "") or "",
-            r.get("siret", "") or "",
-            naf,
-            r.get("website", "") or "",
-            r.get("contact_civility", "") or "",
-            r.get("contact_firstname", "") or "",
-            r.get("contact_lastname", "") or "",
-            r.get("dirigeant", "") or "",
-            r.get("resume", "") or "",
-            r.get("commande", "") or "",
-            r.get("infos_commerciales", "") or "",
-            r.get("card_photo_file_id", "") or "",
-            r.get("card_photo_url", "") or "",
-            r.get("agency", "") or "",
-            r.get("initials", "") or "",
-        ]
-        ws.append(row)
+    header_map = ensure_extra_headers(ws)
 
-    # autosize simple
-    for col in range(1, len(EXCEL_COLUMNS) + 1):
-        letter = get_column_letter(col)
-        ws.column_dimensions[letter].width = 20
+    start_row = ws.max_row + 1
 
-    wb.save(xlsx_path)
+    for idx, r in enumerate(records):
+        row = start_row + idx
+
+        # ensure contact fallback
+        ensure_contact_fields(r)
+
+        # Interlocuteur displayed:
+        interloc_excel = (r.get("interlocuteur") or "").strip()
+        if not interloc_excel:
+            fn = (r.get("contact_firstname") or "").strip()
+            ln = (r.get("contact_lastname") or "").strip()
+            interloc_excel = f"{fn} {ln}".strip() or (r.get("dirigeant") or "")
+
+        values = {
+            "NOM": r.get("name", "") or "",
+            "RUE": r.get("address", "") or "",
+            "CODE POSTAL": r.get("postal_code", "") or "",
+            "VILLE": r.get("city", "") or "",
+            "Téléphone": r.get("phone", "") or "",
+            "Téléphone (Portable)": r.get("phone2", "") or "",
+            "Mail générique": r.get("email", "") or "",
+            "SIRET": r.get("siret", "") or "",
+            "NAF": (r.get("naf", "") or "").replace(".", "").replace(" ", ""),
+            "SITE WEB": r.get("website", "") or "",
+            "INTERLOCUTEUR": interloc_excel,
+            "DIRIGEANT": r.get("dirigeant", "") or "",
+            "RESUME ENTRETIEN": r.get("resume", "") or "",
+            "COMMANDE": r.get("commande", "") or "",
+            "CARTE DE VISITE": r.get("card_photo_url", "") or r.get("card_photo_file_id", "") or "",
+            "AGENCE": r.get("agency", "") or "",
+            "INITIALS": r.get("initials", "") or "",
+        }
+
+        for h, v in values.items():
+            col = header_map.get(h)
+            if col:
+                ws.cell(row=row, column=col).value = v
+
+    autosize(ws, 22)
+    wb.save(out_path)
+
 
 # =========================
-# BREVO EMAIL
+# BREVO
 # =========================
-
 def send_mail_brevo(to_list: List[str], subject: str, html: str, attachments: List[Tuple[str, bytes]]) -> None:
     api_key = must_env("BREVO_API_KEY")
     sender_email = must_env("BREVO_SENDER_EMAIL")
     sender_name = must_env("BREVO_SENDER_NAME")
 
-    payload: Dict[str, Any] = {
+    payload = {
         "sender": {"email": sender_email, "name": sender_name},
         "to": [{"email": x} for x in to_list],
         "subject": subject,
@@ -361,389 +394,347 @@ def send_mail_brevo(to_list: List[str], subject: str, html: str, attachments: Li
     )
     r.raise_for_status()
 
+
 # =========================
-# STATS / REPORTING
+# STATS (closes)
 # =========================
+def to_int(x) -> int:
+    try:
+        s = str(x).strip()
+        return int(s) if s else 0
+    except Exception:
+        return 0
+
+
+def compute_stats(prospects: List[dict], closes: List[dict]) -> dict:
+    """
+    actions = nb prospects enregistrés
+    clients/prospects/commandes = venant des closes (mini menu Clore session)
+    """
+    by_agency: Dict[str, dict] = {}
+    by_initials: Dict[str, dict] = {}
+
+    # actions by prospect records
+    for p in prospects:
+        ag = (p.get("agency") or "").upper()
+        ini = (p.get("initials") or "").upper()
+        if not ag:
+            continue
+
+        by_agency.setdefault(ag, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0, "by_initials": {}})
+        by_agency[ag]["actions"] += 1
+        by_agency[ag]["by_initials"].setdefault(ini, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
+        by_agency[ag]["by_initials"][ini]["actions"] += 1
+
+        by_initials.setdefault(ini, {"agencies": set(), "actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
+        by_initials[ini]["actions"] += 1
+        by_initials[ini]["agencies"].add(ag)
+
+    # closes numbers
+    for c in closes:
+        ag = (c.get("agency") or "").upper()
+        ini = (c.get("initials") or "").upper()
+
+        clients = to_int(c.get("visits_clients"))
+        prosps = to_int(c.get("visits_prospects"))
+        comm = to_int(c.get("commandes"))
+
+        if ag:
+            by_agency.setdefault(ag, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0, "by_initials": {}})
+            by_agency[ag]["clients"] += clients
+            by_agency[ag]["prospects"] += prosps
+            by_agency[ag]["commandes"] += comm
+
+            by_agency[ag]["by_initials"].setdefault(ini, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
+            by_agency[ag]["by_initials"][ini]["clients"] += clients
+            by_agency[ag]["by_initials"][ini]["prospects"] += prosps
+            by_agency[ag]["by_initials"][ini]["commandes"] += comm
+
+        by_initials.setdefault(ini, {"agencies": set(), "actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
+        by_initials[ini]["clients"] += clients
+        by_initials[ini]["prospects"] += prosps
+        by_initials[ini]["commandes"] += comm
+        if ag:
+            by_initials[ini]["agencies"].add(ag)
+
+    totals = {
+        "actions": sum(v["actions"] for v in by_agency.values()),
+        "clients": sum(v["clients"] for v in by_agency.values()),
+        "prospects": sum(v["prospects"] for v in by_agency.values()),
+        "commandes": sum(v["commandes"] for v in by_agency.values()),
+    }
+
+    ranking = sorted(
+        [(ini, v["actions"]) for ini, v in by_initials.items() if ini],
+        key=lambda x: x[1],
+        reverse=True,
+    )
+
+    # cast agencies sets -> list
+    for ini in list(by_initials.keys()):
+        by_initials[ini]["agencies"] = sorted(list(by_initials[ini]["agencies"]))
+
+    return {"by_agency": by_agency, "by_initials": by_initials, "totals": totals, "ranking": ranking}
+
 
 def html_table(headers: List[str], rows: List[List[str]]) -> str:
     th = "".join([f"<th style='border:1px solid #ddd;padding:6px;text-align:left'>{h}</th>" for h in headers])
     trs = []
-    for row in rows:
-        tds = "".join([f"<td style='border:1px solid #ddd;padding:6px'>{(c if c is not None else '')}</td>" for c in row])
+    for r in rows:
+        tds = "".join([f"<td style='border:1px solid #ddd;padding:6px'>{str(x)}</td>" for x in r])
         trs.append(f"<tr>{tds}</tr>")
-    return f"""
-    <table style="border-collapse:collapse;border:1px solid #ddd;width:100%;margin:10px 0">
-      <thead><tr style="background:#f6f6f6">{th}</tr></thead>
-      <tbody>
-        {''.join(trs)}
-      </tbody>
-    </table>
-    """
+    return f"<table style='border-collapse:collapse;border:1px solid #ddd;margin:10px 0'><tr>{th}</tr>{''.join(trs)}</table>"
 
-def compute_action_counts(prospects: List[dict]) -> Dict[Tuple[str, str], int]:
-    # (agency, initials) -> number of prospect records
-    counts: Dict[Tuple[str, str], int] = {}
-    for r in prospects:
-        ag = (r.get("agency") or "").upper()
-        ini = (r.get("initials") or "").upper()
-        if not ag or not ini:
-            continue
-        counts[(ag, ini)] = counts.get((ag, ini), 0) + 1
-    return counts
-
-def compute_close_stats(closes: List[dict]) -> Dict[Tuple[str, str], Dict[str, int]]:
-    # (agency, initials) -> totals of clients/prospects/commandes
-    out: Dict[Tuple[str, str], Dict[str, int]] = {}
-    for c in closes:
-        ag = (c.get("agency") or "").upper()
-        ini = (c.get("initials") or "").upper()
-        if not ag or not ini:
-            continue
-        def to_int(x) -> int:
-            try:
-                x = str(x).strip()
-                return int(x) if x else 0
-            except Exception:
-                return 0
-        vc = to_int(c.get("visits_clients", "0"))
-        vp = to_int(c.get("visits_prospects", "0"))
-        co = to_int(c.get("commandes", "0"))
-        key = (ag, ini)
-        if key not in out:
-            out[key] = {"clients": 0, "prospects": 0, "commandes": 0}
-        out[key]["clients"] += vc
-        out[key]["prospects"] += vp
-        out[key]["commandes"] += co
-    return out
-
-def sum_close_stats_by_agency(close_stats: Dict[Tuple[str, str], Dict[str, int]]) -> Dict[str, Dict[str, int]]:
-    out: Dict[str, Dict[str, int]] = {}
-    for (ag, _ini), v in close_stats.items():
-        if ag not in out:
-            out[ag] = {"clients": 0, "prospects": 0, "commandes": 0}
-        out[ag]["clients"] += v["clients"]
-        out[ag]["prospects"] += v["prospects"]
-        out[ag]["commandes"] += v["commandes"]
-    return out
 
 # =========================
-# ROUTING / MODES
+# FILTERING
 # =========================
+def filter_by_date(items: List[dict], run_date: str) -> List[dict]:
+    return [x for x in items if str(x.get("date", "")).strip() == run_date]
 
-def load_routing() -> dict:
-    routing_raw = must_env("MAIL_ROUTING_JSON")
-    return json.loads(routing_raw)
 
-def get_agencies_from_routing(routing: dict) -> List[str]:
-    return [k for k in routing.keys() if k not in ("_admin",)]
+def filter_prospects(items: List[dict], run_date: str, mode: str, agency: str, initials: str) -> List[dict]:
+    items = filter_by_date(items, run_date)
+    if mode == "individual":
+        return [x for x in items if (x.get("agency") or "").upper() == agency and (x.get("initials") or "").upper() == initials]
+    if mode == "agency_manager":
+        return [x for x in items if (x.get("agency") or "").upper() == agency] if agency else items
+    return items  # admin
 
-def recipients_individual(routing: dict, agency: str, initials: str) -> List[str]:
-    return routing.get(agency, {}).get(initials, [])
 
-def recipients_manager(routing: dict, agency: str) -> List[str]:
-    return routing.get(agency, {}).get("_manager", [])
+def filter_closes(items: List[dict], run_date: str, mode: str, agency: str, initials: str) -> List[dict]:
+    items = filter_by_date(items, run_date)
+    if mode == "individual":
+        return [x for x in items if (x.get("agency") or "").upper() == agency and (x.get("initials") or "").upper() == initials]
+    if mode == "agency_manager":
+        return [x for x in items if (x.get("agency") or "").upper() == agency] if agency else items
+    return items  # admin
 
-def recipients_admin(routing: dict) -> List[str]:
-    return routing.get("_admin", [])
 
 # =========================
-# MAIN LOGIC
+# MAIN
 # =========================
+def main() -> None:
+    routing = json.loads(must_env("MAIL_ROUTING_JSON"))
 
-def enrich_records_with_ocr_and_fallback(records: List[dict]) -> List[Tuple[str, bytes]]:
-    """
-    OCR:
-    - Only if card exists.
-    - Fill missing email/phone2/contact fields.
-    Returns list of attachment images (name, bytes).
-    """
-    attachments: List[Tuple[str, bytes]] = []
-
-    for r in records:
-        img_bytes = download_card_image(r)
-        if not img_bytes:
-            # fallback contact via dirigeant if needed
-            ensure_contact_fields(r)
-            continue
-
-        # OCR extract
-        o = ocr_extract_contact_fields(img_bytes)
-
-        # If no manual interlocuteur, OCR may provide contact
-        if not (r.get("interlocuteur") or "").strip() and o.get("contact_full"):
-            # store as interlocuteur for traceability (but contact fields filled below)
-            r["interlocuteur"] = o["contact_full"]
-
-        # civility + split
-        if o.get("contact_full"):
-            civ, rest = normalize_civility(o["contact_full"])
-            if civ and not (r.get("contact_civility") or "").strip():
-                r["contact_civility"] = civ
-            # Only fill name parts if empty (manual should win; worker sets manual already)
-            if not (r.get("contact_firstname") or "").strip() and not (r.get("contact_lastname") or "").strip():
-                fn, ln = split_name_simple(rest)
-                if fn or ln:
-                    r["contact_firstname"] = fn
-                    r["contact_lastname"] = ln or rest
-
-        # email
-        if not (r.get("email") or "").strip() and o.get("email"):
-            r["email"] = o["email"]
-
-        # phones
-        if not (r.get("phone2") or "").strip() and o.get("mobile"):
-            r["phone2"] = o["mobile"]
-        if not (r.get("phone") or "").strip() and o.get("phone"):
-            r["phone"] = o["phone"]
-
-        # Website email scraping if still missing
-        if not (r.get("email") or "").strip():
-            site = (r.get("website") or "").strip()
-            if site:
-                scraped = scrape_email_from_website(site)
-                if scraped:
-                    r["email"] = scraped
-
-        # Apply final fallback rule (manuel > OCR > dirigeant)
-        ensure_contact_fields(r)
-
-        # Add image attachment
-        file_id = (r.get("card_photo_file_id") or "card").strip()
-        company = safe_filename(r.get("name", "societe") or "societe")
-        attachments.append((safe_filename(f"carte_{company}_{file_id}.jpg"), img_bytes))
-
-    # ensure fallback for all records
-    for r in records:
-        ensure_contact_fields(r)
-
-    return attachments
-
-def filter_prospects(prospects: List[dict], date: str, agency: Optional[str], initials: Optional[str], mode: str) -> List[dict]:
-    out = []
-    for r in prospects:
-        if str(r.get("date", "")).strip() != date:
-            continue
-        if mode in ("individual", "agency_manager") and agency:
-            if str(r.get("agency", "")).strip().upper() != agency.upper():
-                continue
-        if mode == "individual" and initials:
-            if str(r.get("initials", "")).strip().upper() != initials.upper():
-                continue
-        out.append(r)
-    return out
-
-def build_admin_html(run_date: str, prospects_all: List[dict], closes_all: List[dict]) -> str:
-    action_counts = compute_action_counts(prospects_all)
-    close_stats = compute_close_stats(closes_all)
-    agency_totals = sum_close_stats_by_agency(close_stats)
-
-    # Table by agency
-    agency_rows = []
-    for ag in sorted(agency_totals.keys()):
-        v = agency_totals[ag]
-        agency_rows.append([ag, str(v["clients"]), str(v["prospects"]), str(v["commandes"]), str(sum(action_counts.get((ag, ini), 0) for (_, ini) in action_counts.keys() if _ == ag))])
-    agency_tbl = html_table(
-        ["Agence", "Clients", "Prospects", "Commandes", "Nb actions (fiches)"],
-        agency_rows or [["—", "0", "0", "0", "0"]],
-    )
-
-    # Table by commercial (agency+initials)
-    commercial_rows = []
-    all_keys = set(action_counts.keys()) | set(close_stats.keys())
-    for (ag, ini) in sorted(all_keys):
-        actions = action_counts.get((ag, ini), 0)
-        st = close_stats.get((ag, ini), {"clients": 0, "prospects": 0, "commandes": 0})
-        commercial_rows.append([ag, ini, str(actions), str(st["clients"]), str(st["prospects"]), str(st["commandes"])])
-    commercial_tbl = html_table(
-        ["Agence", "Initiales", "Nb actions (fiches)", "Clients", "Prospects", "Commandes"],
-        commercial_rows or [["—", "—", "0", "0", "0", "0"]],
-    )
-
-    # Ranking by actions
-    ranking = sorted([(ag, ini, cnt) for (ag, ini), cnt in action_counts.items()], key=lambda x: x[2], reverse=True)
-    rank_rows = [[str(i+1), ag, ini, str(cnt)] for i, (ag, ini, cnt) in enumerate(ranking)]
-    rank_tbl = html_table(
-        ["Rang", "Agence", "Initiales", "Nb actions (fiches)"],
-        rank_rows or [["—", "—", "—", "0"]],
-    )
-
-    # Totals
-    tot_clients = sum(v["clients"] for v in close_stats.values()) if close_stats else 0
-    tot_prospects = sum(v["prospects"] for v in close_stats.values()) if close_stats else 0
-    tot_commandes = sum(v["commandes"] for v in close_stats.values()) if close_stats else 0
-    tot_actions = sum(action_counts.values()) if action_counts else 0
-
-    return f"""
-    <p>Bonsoir,</p>
-    <p><b>Récap global</b> — <b>{run_date}</b></p>
-
-    <p>
-      <b>Totaux jour</b><br/>
-      Actions (fiches): <b>{tot_actions}</b><br/>
-      Clients: <b>{tot_clients}</b> — Prospects: <b>{tot_prospects}</b> — Commandes: <b>{tot_commandes}</b>
-    </p>
-
-    <h3>📊 Synthèse par agence</h3>
-    {agency_tbl}
-
-    <h3>👥 Synthèse par commercial</h3>
-    {commercial_tbl}
-
-    <h3>🏆 Classement commerciaux (nb d’actions)</h3>
-    {rank_tbl}
-
-    <p>Pièces jointes : Excel global.</p>
-    """
-
-def build_manager_html(run_date: str, agency: str, prospects_agency: List[dict], closes_all: List[dict]) -> str:
-    action_counts = compute_action_counts(prospects_agency)
-    close_stats = compute_close_stats(closes_all)
-
-    keys = sorted(set([(agency.upper(), (r.get("initials") or "").upper()) for r in prospects_agency if (r.get("initials") or "").strip()] +
-                      [(ag, ini) for (ag, ini) in close_stats.keys() if ag.upper() == agency.upper()]))
-
-    rows = []
-    for (ag, ini) in keys:
-        actions = action_counts.get((ag, ini), 0)
-        st = close_stats.get((ag, ini), {"clients": 0, "prospects": 0, "commandes": 0})
-        rows.append([ini, str(actions), str(st["clients"]), str(st["prospects"]), str(st["commandes"])])
-
-    tot_actions = sum(action_counts.values()) if action_counts else 0
-    tot_clients = sum(v["clients"] for (ag, _), v in close_stats.items() if ag.upper() == agency.upper())
-    tot_prospects = sum(v["prospects"] for (ag, _), v in close_stats.items() if ag.upper() == agency.upper())
-    tot_commandes = sum(v["commandes"] for (ag, _), v in close_stats.items() if ag.upper() == agency.upper())
-
-    tbl = html_table(
-        ["Initiales", "Nb actions (fiches)", "Clients", "Prospects", "Commandes"],
-        rows or [["—", "0", "0", "0", "0"]],
-    )
-
-    return f"""
-    <p>Bonjour,</p>
-    <p><b>Récap agence {agency}</b> — <b>{run_date}</b></p>
-    <p>
-      Totaux agence — Actions: <b>{tot_actions}</b>,
-      Clients: <b>{tot_clients}</b>,
-      Prospects: <b>{tot_prospects}</b>,
-      Commandes: <b>{tot_commandes}</b>
-    </p>
-    {tbl}
-    <p>Pièce jointe : Excel consolidé agence.</p>
-    """
-
-def build_individual_html(run_date: str, agency: str, initials: str, closes_all: List[dict]) -> str:
-    close_stats = compute_close_stats(closes_all).get((agency.upper(), initials.upper()), {"clients": 0, "prospects": 0, "commandes": 0})
-    return f"""
-    <p>Bonjour,</p>
-    <p>Voici ton export de prospection <b>{agency}/{initials}</b> du <b>{run_date}</b>.</p>
-    <p>
-      <b>Clôture</b> — Clients: <b>{close_stats["clients"]}</b>,
-      Prospects: <b>{close_stats["prospects"]}</b>,
-      Commandes: <b>{close_stats["commandes"]}</b>
-    </p>
-    <p>Pièces jointes : Excel + cartes de visite (si disponibles).</p>
-    """
-
-def main():
     send_mode = opt_env("SEND_MODE", "individual").strip()
-    run_date = opt_env("RUN_DATE", "")
+    run_date = opt_env("RUN_DATE")
     if not run_date:
+        # fallback (workflow schedule te passera RUN_DATE si tu veux; sinon UTC)
         run_date = datetime.utcnow().strftime("%Y-%m-%d")
-
-    routing = load_routing()
-    agencies = get_agencies_from_routing(routing)
 
     agency = opt_env("AGENCY", "").upper()
     initials = opt_env("INITIALS", "").upper()
+    max_ocr = int(opt_env("MAX_OCR_IMAGES", "50") or "50")
 
-    # 1) dumps
     prospects_all = fetch_dump_jsonl(run_date, "prospects")
     closes_all = fetch_dump_jsonl(run_date, "closes")
 
-    # 2) Mode individual => 1 mail pour AGENCY/INITIALS
+    # -------------------------
+    # INDIVIDUAL (mail immédiat)
+    # -------------------------
     if send_mode == "individual":
         if not agency or not initials:
             raise RuntimeError("SEND_MODE=individual requires AGENCY and INITIALS")
 
-        prospects = filter_prospects(prospects_all, run_date, agency, initials, "individual")
+        prospects = filter_prospects(prospects_all, run_date, "individual", agency, initials)
+        closes = filter_closes(closes_all, run_date, "individual", agency, initials)
 
-        # OCR + fallback + attachments
-        attachments = enrich_records_with_ocr_and_fallback(prospects)
+        # OCR only if missing and card exists
+        card_attachments: List[Tuple[str, bytes]] = []
+        ocr_done = 0
 
-        # excel
-        xlsx_name = safe_filename(f"prospection_{agency}_{initials}_{run_date}.xlsx")
-        build_excel(prospects, xlsx_name)
+        for rec in prospects:
+            ensure_contact_fields(rec)
 
+            need_email = not (rec.get("email") or "").strip()
+            need_mobile = not (rec.get("phone2") or "").strip()
+            need_contact = not ((rec.get("contact_firstname") or "").strip() or (rec.get("contact_lastname") or "").strip())
+
+            has_card = (rec.get("card_photo_url") or rec.get("card_photo_file_id") or "").strip() != ""
+            if has_card and (need_email or need_mobile or need_contact) and ocr_done < max_ocr:
+                img = download_card_image_bytes(rec)
+                if img:
+                    o = ocr_extract(img)
+
+                    if need_email and o.get("email"):
+                        rec["email"] = o["email"]
+                    if need_mobile and o.get("mobile"):
+                        rec["phone2"] = o["mobile"]
+                    if not (rec.get("phone") or "").strip() and o.get("phone"):
+                        rec["phone"] = o["phone"]
+
+                    if need_contact and o.get("contact_full"):
+                        fn, ln = split_name_simple(o["contact_full"])
+                        if fn and not (rec.get("contact_firstname") or "").strip():
+                            rec["contact_firstname"] = fn
+                        if ln and not (rec.get("contact_lastname") or "").strip():
+                            rec["contact_lastname"] = ln
+
+                    ocr_done += 1
+                    card_attachments.append((f"carte_{agency}_{initials}_{ocr_done}.jpg", img))
+
+            # final fallback
+            ensure_contact_fields(rec)
+
+        # Excel
+        xlsx_name = f"prospection_{agency}_{initials}_{run_date}.xlsx"
+        build_excel_from_template(prospects, xlsx_name)
         with open(xlsx_name, "rb") as f:
             excel_bytes = f.read()
 
-        attach_all = [(xlsx_name, excel_bytes)] + attachments
+        attachments = [(xlsx_name, excel_bytes)] + card_attachments
 
-        to_list = recipients_individual(routing, agency, initials)
+        # recipients
+        to_list = routing.get(agency, {}).get(initials)
         if not to_list:
-            raise RuntimeError(f"No recipient mapping for {agency}/{initials}")
+            raise RuntimeError(f"No routing found for {agency}/{initials}")
 
+        # stats from closes (as requested)
+        clients = sum(to_int(x.get("visits_clients")) for x in closes)
+        prosps = sum(to_int(x.get("visits_prospects")) for x in closes)
+        comm = sum(to_int(x.get("commandes")) for x in closes)
+
+        html = f"""
+        <p>Bonjour,</p>
+        <p>Voici ton export de prospection <b>{agency}/{initials}</b> du <b>{run_date}</b>.</p>
+        <ul>
+          <li><b>Actions (prospects saisis)</b> : {len(prospects)}</li>
+          <li><b>Clients</b> : {clients}</li>
+          <li><b>Prospects</b> : {prosps}</li>
+          <li><b>Commandes</b> : {comm}</li>
+        </ul>
+        <p>Pièces jointes : Excel{ " + cartes de visite" if card_attachments else "" }.</p>
+        """
         subject = f"[PROSPECTION] {agency}/{initials} - {run_date}"
-        html = build_individual_html(run_date, agency, initials, closes_all)
-        send_mail_brevo(to_list, subject, html, attach_all)
+        send_mail_brevo(to_list, subject, html, attachments)
 
-        print(f"OK individual: {agency}/{initials} records={len(prospects)} attachments={len(attach_all)}")
+        print(f"OK individual: {agency}/{initials} prospects={len(prospects)} cards={len(card_attachments)} closes={len(closes)}")
         return
 
-    # 3) Mode agency_manager => 1 mail par agence (manager) + excel agence
+    # ---------------------------------------
+    # AGENCY MANAGER (17:45) — 1 mail/agence
+    # ---------------------------------------
     if send_mode == "agency_manager":
-        # si AGENCY vide => loop toutes agences
-        target_agencies = [agency] if agency else agencies
+        # si AGENCY fourni -> une agence, sinon toutes les agences du routing (sauf _admin)
+        agencies = [agency] if agency else [k for k in routing.keys() if k != "_admin"]
 
-        for ag in target_agencies:
-            prospects_agency = filter_prospects(prospects_all, run_date, ag, None, "agency_manager")
+        for ag in agencies:
+            if not ag:
+                continue
 
-            # Pas d'OCR sur recap agence (plus rapide). Mais on applique fallback contact.
-            for r in prospects_agency:
-                ensure_contact_fields(r)
+            prospects = filter_prospects(prospects_all, run_date, "agency_manager", ag, "")
+            closes = filter_closes(closes_all, run_date, "agency_manager", ag, "")
 
-            xlsx_name = safe_filename(f"prospection_{ag}_CONSOLIDE_{run_date}.xlsx")
-            build_excel(prospects_agency, xlsx_name)
+            for rec in prospects:
+                ensure_contact_fields(rec)
+
+            xlsx_name = f"prospection_{ag}_CONSOLIDE_{run_date}.xlsx"
+            build_excel_from_template(prospects, xlsx_name)
             with open(xlsx_name, "rb") as f:
                 excel_bytes = f.read()
 
-            to_list = recipients_manager(routing, ag)
+            to_list = routing.get(ag, {}).get("_manager")
             if not to_list:
-                # on skip si pas de manager
-                print(f"Skip agency {ag}: no _manager recipient")
+                print(f"SKIP agency {ag}: missing _manager")
                 continue
 
-            subject = f"[PROSPECTION] Récap agence {ag} - {run_date}"
-            html = build_manager_html(run_date, ag, prospects_agency, closes_all)
-            send_mail_brevo(to_list, subject, html, [(xlsx_name, excel_bytes)])
+            clients = sum(to_int(x.get("visits_clients")) for x in closes)
+            prosps = sum(to_int(x.get("visits_prospects")) for x in closes)
+            comm = sum(to_int(x.get("commandes")) for x in closes)
 
-            print(f"OK agency_manager: {ag} records={len(prospects_agency)}")
+            html = f"""
+            <p>Bonjour,</p>
+            <p>Voici le récapitulatif <b>agence {ag}</b> du <b>{run_date}</b>.</p>
+            <ul>
+              <li><b>Actions (prospects saisis)</b> : {len(prospects)}</li>
+              <li><b>Clients</b> : {clients}</li>
+              <li><b>Prospects</b> : {prosps}</li>
+              <li><b>Commandes</b> : {comm}</li>
+            </ul>
+            <p>Pièce jointe : Excel consolidé agence.</p>
+            """
+            subject = f"[PROSPECTION] Récap agence {ag} - {run_date}"
+            send_mail_brevo(to_list, subject, html, [(xlsx_name, excel_bytes)])
+            print(f"OK agency_manager: {ag} prospects={len(prospects)} closes={len(closes)}")
 
         return
 
-    # 4) Mode admin => 1 mail global SL + excel global + tableaux stats
+    # ------------------------------------------------
+    # ADMIN (17:47) — 1 mail global SL + tableaux HTML
+    # ------------------------------------------------
     if send_mode == "admin":
-        # fallback contact fields
-        for r in prospects_all:
-            ensure_contact_fields(r)
+        prospects = filter_by_date(prospects_all, run_date)
+        closes = filter_by_date(closes_all, run_date)
 
-        xlsx_name = safe_filename(f"prospection_GLOBAL_{run_date}.xlsx")
-        build_excel(prospects_all, xlsx_name)
+        for rec in prospects:
+            ensure_contact_fields(rec)
+
+        xlsx_name = f"prospection_GLOBAL_{run_date}.xlsx"
+        build_excel_from_template(prospects, xlsx_name)
         with open(xlsx_name, "rb") as f:
             excel_bytes = f.read()
 
-        to_list = recipients_admin(routing)
+        stats = compute_stats(prospects, closes)
+        totals = stats["totals"]
+
+        # table by agency
+        agency_rows = []
+        for ag, v in sorted(stats["by_agency"].items(), key=lambda x: x[0]):
+            agency_rows.append([ag, v["actions"], v["clients"], v["prospects"], v["commandes"]])
+
+        # table by commercial
+        initials_rows = []
+        for ini, v in sorted(stats["by_initials"].items(), key=lambda x: x[0]):
+            if not ini:
+                continue
+            initials_rows.append([
+                ini,
+                ", ".join(v["agencies"]) if v["agencies"] else "",
+                v["actions"],
+                v["clients"],
+                v["prospects"],
+                v["commandes"],
+            ])
+
+        # ranking by actions
+        ranking_rows = [[ini, actions] for (ini, actions) in stats["ranking"]]
+
+        html = f"""
+        <p>Bonsoir SL,</p>
+        <p>Voici le <b>récapitulatif GLOBAL</b> du <b>{run_date}</b>.</p>
+
+        <h3 style="margin:16px 0 6px 0">Totaux jour</h3>
+        <ul>
+          <li><b>Actions (prospects saisis)</b> : {totals["actions"]}</li>
+          <li><b>Clients</b> : {totals["clients"]}</li>
+          <li><b>Prospects</b> : {totals["prospects"]}</li>
+          <li><b>Commandes</b> : {totals["commandes"]}</li>
+        </ul>
+
+        <h3 style="margin:16px 0 6px 0">Tableau par agence</h3>
+        {html_table(["Agence","Actions","Clients","Prospects","Commandes"], agency_rows)}
+
+        <h3 style="margin:16px 0 6px 0">Tableau par commercial</h3>
+        {html_table(["Initiales","Agences","Actions","Clients","Prospects","Commandes"], initials_rows)}
+
+        <h3 style="margin:16px 0 6px 0">Classement (par nombre d’actions)</h3>
+        {html_table(["Initiales","Actions"], ranking_rows)}
+
+        <p>Pièce jointe : Excel GLOBAL.</p>
+        """
+
+        to_list = routing.get("_admin")
         if not to_list:
-            raise RuntimeError("No _admin recipients configured in MAIL_ROUTING_JSON")
+            raise RuntimeError("MAIL_ROUTING_JSON missing _admin recipients")
 
         subject = f"[PROSPECTION] Récap GLOBAL - {run_date}"
-        html = build_admin_html(run_date, prospects_all, closes_all)
         send_mail_brevo(to_list, subject, html, [(xlsx_name, excel_bytes)])
-
-        print(f"OK admin: records={len(prospects_all)}")
+        print(f"OK admin: prospects={len(prospects)} closes={len(closes)}")
         return
 
     raise RuntimeError("Invalid SEND_MODE. Use individual|agency_manager|admin")
+
 
 if __name__ == "__main__":
     main()
