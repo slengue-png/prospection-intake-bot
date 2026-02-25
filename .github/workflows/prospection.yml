@@ -1,3 +1,4 @@
+# .github/workflows/prospection.yml
 name: Prospection
 
 on:
@@ -20,31 +21,29 @@ on:
         description: "JL/CZ/JB/LB/PV/ST/AC/SL (requis si individual)"
         required: false
         type: string
-
       visits_clients:
-        description: "Nb clients (clôture session)"
+        description: "(optionnel) Nb clients"
         required: false
         default: ""
         type: string
       visits_prospects:
-        description: "Nb prospects (clôture session)"
+        description: "(optionnel) Nb prospects"
         required: false
         default: ""
         type: string
       commandes:
-        description: "Nb commandes (clôture session)"
+        description: "(optionnel) Nb commandes"
         required: false
         default: ""
         type: string
 
   schedule:
-    - cron: "45 16 * * *"   # 17:45 (approx UTC) => agency_manager
-    - cron: "47 16 * * *"   # 17:47 (approx UTC) => admin
+    - cron: "45 16 * * *"   # 17:45 FR approx (à ajuster selon été/hiver)
+    - cron: "47 16 * * *"   # 17:47 FR approx (admin)
 
 jobs:
   export_and_mail:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -95,6 +94,7 @@ jobs:
           AGENCY: ${{ inputs.agency }}
           INITIALS: ${{ inputs.initials }}
 
+          # (optionnels — pas utilisés pour calcul, mais acceptés pour compat Worker)
           VISITS_CLIENTS: ${{ inputs.visits_clients }}
           VISITS_PROSPECTS: ${{ inputs.visits_prospects }}
           COMMANDES: ${{ inputs.commandes }}
