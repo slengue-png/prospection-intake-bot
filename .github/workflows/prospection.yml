@@ -8,74 +8,65 @@ on:
         required: true
         default: "individual"
         type: string
-
       run_date:
-        description: "YYYY-MM-DD (optionnel)"
+        description: "YYYY-MM-DD Europe/Paris (optionnel)"
         required: false
         type: string
-
       agency:
         description: "GR/VR/GRS/SLS (requis si individual)"
         required: false
         type: string
-
       initials:
         description: "JL/CZ/JB/LB/PV/ST/AC/SL (requis si individual)"
         required: false
         type: string
-
       visits_clients:
-        description: "(optionnel)"
+        description: "(optionnel) Nb clients"
         required: false
         default: ""
         type: string
-
       visits_prospects:
-        description: "(optionnel)"
+        description: "(optionnel) Nb prospects"
         required: false
         default: ""
         type: string
-
       commandes:
-        description: "(optionnel)"
+        description: "(optionnel) Nb commandes"
         required: false
         default: ""
         type: string
 
   schedule:
-    # 17:45 France (UTC+1 hiver / approx UTC+2 été)
-    - cron: "45 16 * * *"
-    # 17:47 France (admin SL)
-    - cron: "47 16 * * *"
+    - cron: "45 16 * * *"   # 17:45 FR approx (manager)
+    - cron: "47 16 * * *"   # 17:47 FR approx (admin)
 
 jobs:
   export_and_mail:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install system dependencies (Tesseract)
+      - name: Install system deps (tesseract)
         run: |
           sudo apt-get update
           sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
 
-      - name: Install Python dependencies
+      - name: Install python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Determine execution mode
+      - name: Determine mode for schedule
         id: mode
         run: |
           MODE="${{ inputs.mode }}"
-
           if [ "${{ github.event_name }}" = "schedule" ]; then
             if [ "${{ github.event.schedule }}" = "45 16 * * *" ]; then
               MODE="agency_manager"
@@ -83,39 +74,36 @@ jobs:
               MODE="admin"
             fi
           fi
-
           echo "mode=$MODE" >> $GITHUB_OUTPUT
 
-      - name: Run export and mail script
+      - name: Run export & mail
         env:
-          # Worker
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
 
-          # Brevo
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
           BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
 
-          # Routing
           MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
 
-          # Gemini (OPTIONNEL)
+          # OPTIONAL (AI + Places for photo mode)
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
 
-          # Mode dynamique
           SEND_MODE: ${{ steps.mode.outputs.mode }}
+
           RUN_DATE: ${{ inputs.run_date }}
           AGENCY: ${{ inputs.agency }}
           INITIALS: ${{ inputs.initials }}
 
-          # Compatibilité Worker
           VISITS_CLIENTS: ${{ inputs.visits_clients }}
           VISITS_PROSPECTS: ${{ inputs.visits_prospects }}
           COMMANDES: ${{ inputs.commandes }}
 
           MAX_OCR_IMAGES: "50"
+          MAX_PHOTO_IMAGES: "15"
 
         run: |
           python scripts/export_and_mail.py
