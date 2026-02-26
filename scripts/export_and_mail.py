@@ -1,42 +1,40 @@
 #!/usr/bin/env python3
 """
-export_and_mail.py — VERSION PRO V2 (V1 stable + Gemini 1.5 Flash “safe add-on”)
+export_and_mail.py — VERSION PRO V2 PHOTO + GEMINI VISION (safe add-on)
 
-✅ V1 conservée :
-- /dump prospects + closes (Cloudflare Worker inchangé)
-- OCR Tesseract (cartes de visite)
-- Export Excel depuis template Table.2.xlsx (openpyxl)
-- Envoi emails Brevo (multi-agences / multi-modes)
+V1 conservée :
+- /dump prospects + closes
+- OCR Tesseract cartes de visite (mode entreprise)
+- Export Excel depuis Table.2.xlsx (openpyxl)
+- Emails Brevo (individual / agency_manager / admin)
 
-✅ V2 ajout (SANS casser l’existant) :
-- Gemini 1.5 Flash (Google AI Studio) OPTIONNEL
-- GEMINI_API_KEY absent => fallback silencieux (aucun plantage)
-- JSON STRICT, retries, timeout, température <= 0.2, maxOutputTokens <= 512
-- Complète Excel uniquement si vide (n’écrase jamais)
-- Ajoute colonnes AI si nécessaires (en fin de feuille)
+V2 ajout :
+- /dump photos
+- Téléchargement images Telegram côté GitHub
+- Gemini Vision (gemini-1.5-flash) optionnel (GEMINI_API_KEY)
+- Enrichissement déterministe API gouv + (optionnel) Google Places
+- Excel : ajoute SOURCE / CONFIDENCE / STATUS / SUGGESTIONS
+- Ne jamais écraser données manuelles si présentes
 
-MODES :
-- SEND_MODE=individual       -> mail immédiat collaborateur (filtré AGENCY+INITIALS)
-- SEND_MODE=agency_manager   -> mail manager par agence (consolidé)
-- SEND_MODE=admin            -> mail SL global + tableaux HTML + classement
-
-ENV (Secrets / env) :
+ENV requis :
 - WORKER_BASE_URL
 - EXPORT_TOKEN
 - TELEGRAM_TOKEN
 - BREVO_API_KEY
 - BREVO_SENDER_EMAIL
 - BREVO_SENDER_NAME
-- MAIL_ROUTING_JSON   (json recipients)
-OPTIONNEL :
-- GEMINI_API_KEY
+- MAIL_ROUTING_JSON
 
-ENV inputs (workflow/dispatch) :
+ENV optionnels :
+- GEMINI_API_KEY
+- GOOGLE_PLACES_API_KEY   (si tu veux enrichir tel/site côté GitHub pour mode photo)
+
+Inputs workflow :
 - SEND_MODE: individual | agency_manager | admin
 - RUN_DATE: YYYY-MM-DD (optionnel)
-- AGENCY: GR|VR|GRS|SLS (requis si individual; optionnel si agency_manager)
-- INITIALS: JL|CZ|JB|LB|PV|ST|AC|SL (requis si individual)
-- MAX_OCR_IMAGES: (optionnel, défaut 50)
+- AGENCY, INITIALS (requis si individual)
+- MAX_OCR_IMAGES (défaut 50)
+- MAX_PHOTO_IMAGES (défaut 15)
 """
 
 import os
@@ -89,9 +87,8 @@ def opt_int(name: str, default: int) -> int:
 # =========================
 # GLOBAL CONFIG
 # =========================
-TEMPLATE_PATH = "Table.2.xlsx"  # doit être committé à la racine du repo
+TEMPLATE_PATH = "Table.2.xlsx"
 
-# Colonnes attendues (template utilisateur)
 TEMPLATE_HEADERS = [
     "NOM",
     "RUE",
@@ -110,41 +107,15 @@ TEMPLATE_HEADERS = [
     "CARTE DE VISITE",
 ]
 
-# Colonnes ajoutées fin (V1)
-EXTRA_HEADERS = ["AGENCE", "INITIALS"]  # INITIALS en dernière colonne
+EXTRA_HEADERS = ["AGENCE", "INITIALS"]
 
-# Colonnes AI ajoutées fin (V2)
-AI_HEADERS_BUSINESS_CARD = [
-    "AI_CIVILITY",
-    "AI_FIRST_NAME",
-    "AI_LAST_NAME",
-    "AI_JOB_TITLE",
-    "AI_EMAIL",
-    "AI_MOBILE",
-    "AI_PHONE",
-]
-
-AI_HEADERS_MEETING = [
-    "AI_NEED",
-    "AI_POSITIONS",
-    "AI_VOLUME",
-    "AI_CONSTRAINTS",
-    "AI_DECISION_MAKER",
-    "AI_NEXT_STEP",
-    "AI_URGENCY",
-    "AI_NOTES",
-]
-
-AI_HEADERS_SCORE = [
-    "AI_SCORE",
-    "AI_SCORE_JUSTIFICATION",
-]
+PHOTO_HEADERS = ["SOURCE", "CONFIDENCE", "STATUS", "SUGGESTIONS"]
 
 # Gemini config
 GEMINI_MODEL = "gemini-1.5-flash"
 GEMINI_TEMPERATURE = 0.2
 GEMINI_MAX_TOKENS = 512
-GEMINI_TIMEOUT_S = 20
+GEMINI_TIMEOUT_S = 25
 GEMINI_MAX_RETRIES = 3
 
 
@@ -177,7 +148,7 @@ def fetch_dump_jsonl(run_date: str, kind: str) -> List[dict]:
 
 
 # =========================
-# TELEGRAM DOWNLOAD (for OCR)
+# TELEGRAM DOWNLOAD
 # =========================
 def telegram_get_file_path(file_id: str) -> Optional[str]:
     token = must_env("TELEGRAM_TOKEN")
@@ -190,12 +161,19 @@ def telegram_get_file_path(file_id: str) -> Optional[str]:
     return j["result"].get("file_path")
 
 
+def telegram_download_file_bytes(file_id: str) -> Optional[bytes]:
+    fp = telegram_get_file_path(file_id)
+    if not fp:
+        return None
+    token = must_env("TELEGRAM_TOKEN")
+    url = f"https://api.telegram.org/file/bot{token}/{fp}"
+    r = requests.get(url, timeout=60)
+    if r.ok and r.content:
+        return r.content
+    return None
+
+
 def download_card_image_bytes(record: dict) -> Optional[bytes]:
-    """
-    Worker stocke:
-      - card_photo_url (direct)
-      - card_photo_file_id
-    """
     url = (record.get("card_photo_url") or "").strip()
     if url:
         r = requests.get(url, timeout=60)
@@ -206,21 +184,11 @@ def download_card_image_bytes(record: dict) -> Optional[bytes]:
     if not file_id:
         return None
 
-    fp = telegram_get_file_path(file_id)
-    if not fp:
-        return None
-
-    token = must_env("TELEGRAM_TOKEN")
-    url2 = f"https://api.telegram.org/file/bot{token}/{fp}"
-    r2 = requests.get(url2, timeout=60)
-    if r2.ok and r2.content:
-        return r2.content
-
-    return None
+    return telegram_download_file_bytes(file_id)
 
 
 # =========================
-# OCR + NORMALISATION
+# OCR (V1 cards)
 # =========================
 def normalize_phone_fr(raw: str) -> str:
     p = re.sub(r"[^\d+]", "", raw or "")
@@ -233,10 +201,6 @@ def normalize_phone_fr(raw: str) -> str:
 
 
 def split_name_simple(full: str) -> Tuple[str, str]:
-    """
-    "Jean Dupont" -> ("Jean","Dupont")
-    "Dupont" -> ("","Dupont")
-    """
     s = (full or "").strip()
     s = re.sub(r"\s+", " ", s)
     if not s:
@@ -248,14 +212,6 @@ def split_name_simple(full: str) -> Tuple[str, str]:
 
 
 def ocr_extract(image_bytes: bytes) -> Dict[str, str]:
-    """
-    Extrait:
-      - ocr_text (brut)
-      - email
-      - mobile (06/07)
-      - phone (fixe prioritaire 04 sinon autre)
-      - contact_full (heuristique)
-    """
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     except Exception:
@@ -282,7 +238,6 @@ def ocr_extract(image_bytes: bytes) -> Dict[str, str]:
     if not phone:
         phone = next((x for x in normalized if x.startswith(("01", "02", "03", "05", "08", "09"))), "")
 
-    # contact heuristic
     contact_full = ""
     candidates = []
     for ln in lines[:25]:
@@ -297,7 +252,6 @@ def ocr_extract(image_bytes: bytes) -> Dict[str, str]:
             continue
         candidates.append(ln)
 
-    # prefer line with uppercase token (often lastname)
     for ln in candidates:
         if re.search(r"\b[A-ZÀ-ÖØ-Ý]{3,}\b", ln):
             contact_full = ln
@@ -309,14 +263,6 @@ def ocr_extract(image_bytes: bytes) -> Dict[str, str]:
 
 
 def ensure_contact_fields(record: dict) -> None:
-    """
-    Priorité (V1 conservée) :
-      1) saisie manuelle (interlocuteur) -> split -> contact_firstname/contact_lastname
-      2) si contact fields déjà remplis -> rien
-      3) dirigeant -> split -> contact fields
-
-    Important: ne jamais écraser une valeur existante.
-    """
     interloc = (record.get("interlocuteur") or "").strip()
     if interloc:
         if not (record.get("contact_firstname") or "").strip() and not (record.get("contact_lastname") or "").strip():
@@ -336,22 +282,19 @@ def ensure_contact_fields(record: dict) -> None:
 
 
 # =========================
-# GEMINI 1.5 FLASH (OPTIONNEL)
+# Gemini helpers (strict JSON)
 # =========================
+def _gemini_enabled() -> bool:
+    return bool(opt_env("GEMINI_API_KEY"))
+
+
 def _extract_json_object(text: str) -> Optional[str]:
-    """
-    Essaye d’extraire un objet JSON {...} depuis une réponse qui peut contenir
-    du markdown, ```json, ou du texte autour.
-    """
     if not text:
         return None
     s = text.strip()
-
-    # Enlever fences markdown si présents
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE).strip()
     s = re.sub(r"\s*```$", "", s).strip()
 
-    # Chercher premier '{' et parse "balanced braces" simple
     start = s.find("{")
     if start < 0:
         return None
@@ -382,52 +325,39 @@ def _extract_json_object(text: str) -> Optional[str]:
     return None
 
 
-def _gemini_enabled() -> bool:
-    return bool(opt_env("GEMINI_API_KEY"))
-
-
-def gemini_generate_json(system_instruction: str, user_text: str, schema_hint: str) -> Optional[dict]:
-    """
-    Appel Gemini (Google AI Studio API) et retourne un dict.
-    - Si GEMINI_API_KEY absent => return None (fallback silencieux)
-    - Retry simple (max 3)
-    - Timeout défini
-    - JSON strict (on extrait/clean si nécessaire)
-    """
+def gemini_generate_json_multimodal(system_instruction: str, user_text: str, image_bytes: bytes, mime_type: str, schema_hint: str) -> Optional[dict]:
     api_key = opt_env("GEMINI_API_KEY")
     if not api_key:
         return None
 
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    headers = {"Content-Type": "application/json"}
     params = {"key": api_key}
+    headers = {"Content-Type": "application/json"}
 
-    # Prompt strict JSON
-    # On force un objet JSON unique, sans texte, sans markdown.
-    sys = (system_instruction or "").strip()
-    usr = (user_text or "").strip()
-    sch = (schema_hint or "").strip()
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
 
     payload = {
         "contents": [
             {
                 "role": "user",
                 "parts": [
+                    {"text": "SYSTEM INSTRUCTION:\n" + (system_instruction or "").strip()},
                     {
                         "text": (
-                            "SYSTEM INSTRUCTION:\n"
-                            f"{sys}\n\n"
-                            "OUTPUT RULES (STRICT):\n"
+                            "\nOUTPUT RULES (STRICT):\n"
                             "- Return ONLY one JSON object.\n"
                             "- No markdown.\n"
                             "- No explanations.\n"
-                            "- Use null for unknown.\n\n"
+                            "- Use null for unknown.\n"
+                            "- Never invent email or phone.\n"
+                            "- confidence must be integer 0-100.\n\n"
                             "SCHEMA (HINT):\n"
-                            f"{sch}\n\n"
-                            "INPUT:\n"
-                            f"{usr}\n"
+                            f"{(schema_hint or '').strip()}\n\n"
+                            "USER CONTEXT:\n"
+                            f"{(user_text or '').strip()}\n"
                         )
-                    }
+                    },
+                    {"inline_data": {"mime_type": mime_type, "data": b64}},
                 ],
             }
         ],
@@ -441,75 +371,53 @@ def gemini_generate_json(system_instruction: str, user_text: str, schema_hint: s
     for attempt in range(1, GEMINI_MAX_RETRIES + 1):
         try:
             r = requests.post(url, headers=headers, params=params, json=payload, timeout=GEMINI_TIMEOUT_S)
-            # Rate-limit / transient
             if r.status_code in (429, 500, 502, 503, 504):
                 last_err = f"HTTP {r.status_code}"
-                time.sleep(0.7 * attempt)
+                time.sleep(0.8 * attempt)
                 continue
             r.raise_for_status()
-
             j = r.json()
-            # Extraction texte
-            text = ""
-            try:
-                candidates = j.get("candidates") or []
-                if candidates:
-                    parts = candidates[0].get("content", {}).get("parts") or []
-                    if parts:
-                        text = parts[0].get("text", "") or ""
-            except Exception:
-                text = ""
 
+            text = ""
+            candidates = j.get("candidates") or []
+            if candidates:
+                parts = candidates[0].get("content", {}).get("parts") or []
+                if parts:
+                    text = parts[0].get("text", "") or ""
             raw = text.strip()
             if not raw:
                 return None
 
             obj_str = _extract_json_object(raw) or raw
-            try:
-                parsed = json.loads(obj_str)
-            except Exception:
-                # tentative : extraire à nouveau si le raw contient du bruit
-                obj_str2 = _extract_json_object(raw)
-                if not obj_str2:
-                    return None
-                parsed = json.loads(obj_str2)
-
+            parsed = json.loads(obj_str)
             if isinstance(parsed, dict):
                 return parsed
             return None
-
         except Exception as e:
             last_err = str(e)
-            time.sleep(0.7 * attempt)
+            time.sleep(0.8 * attempt)
             continue
 
-    # Fallback silencieux : on ne plante pas le job
     _ = last_err
     return None
 
 
-# =========================
-# AI FUNCTIONS (SPEC)
-# =========================
-def ai_parse_business_card(ocr_text: str) -> Optional[dict]:
+def ai_photo_extract(image_bytes: bytes, city: str) -> Optional[dict]:
     """
-    Retour EXACT :
+    Retour EXACTEMENT :
     {
-      "civility": null,
-      "first_name": null,
-      "last_name": null,
-      "job_title": null,
-      "email": null,
-      "mobile": null,
-      "phone": null
+      "kind": "business_card" | "logo" | "signage" | "unknown",
+      "company_name_guess": null,
+      "text_extracted": null,
+      "contact": { ... },
+      "confidence": 0
     }
     """
-    system_instruction = (
-        "You extract business card fields from noisy OCR text. "
-        "Be conservative and only fill fields you are confident about."
-    )
-    schema_hint = json.dumps(
-        {
+    schema = {
+        "kind": "unknown",
+        "company_name_guess": None,
+        "text_extracted": None,
+        "contact": {
             "civility": None,
             "first_name": None,
             "last_name": None,
@@ -518,115 +426,220 @@ def ai_parse_business_card(ocr_text: str) -> Optional[dict]:
             "mobile": None,
             "phone": None,
         },
-        ensure_ascii=False,
-    )
-    res = gemini_generate_json(system_instruction, ocr_text, schema_hint)
-    if not res:
-        return None
-
-    # Normalize exact keys + nulls
-    out = {
-        "civility": res.get("civility", None),
-        "first_name": res.get("first_name", None),
-        "last_name": res.get("last_name", None),
-        "job_title": res.get("job_title", None),
-        "email": res.get("email", None),
-        "mobile": res.get("mobile", None),
-        "phone": res.get("phone", None),
+        "confidence": 0,
     }
-
-    # clean strings
-    for k, v in list(out.items()):
-        if isinstance(v, str):
-            vv = v.strip()
-            out[k] = vv if vv else None
-    return out
-
-
-def ai_structure_meeting(meeting_text: str) -> Optional[dict]:
-    """
-    Retour EXACT :
-    {
-      "need": null,
-      "positions": null,
-      "volume": null,
-      "constraints": null,
-      "decision_maker": null,
-      "next_step": null,
-      "urgency": null,
-      "notes": null
-    }
-    """
     system_instruction = (
-        "You structure a free-form commercial meeting note into a strict JSON object. "
-        "Do not invent facts; use null if missing."
+        "You analyze an image that may show a business card, a company logo, or a storefront sign.\n"
+        "Your job: classify kind, extract a company name guess if visible, and extract contact fields if it is a business card.\n"
+        "Rules: never invent email or phone. Use null if missing."
     )
-    schema_hint = json.dumps(
-        {
-            "need": None,
-            "positions": None,
-            "volume": None,
-            "constraints": None,
-            "decision_maker": None,
-            "next_step": None,
-            "urgency": None,
-            "notes": None,
-        },
-        ensure_ascii=False,
-    )
-    res = gemini_generate_json(system_instruction, meeting_text, schema_hint)
+    user_text = f"Confirmed city: {city} (France)."
+    schema_hint = json.dumps(schema, ensure_ascii=False)
+
+    # mime guess (simple)
+    mime = "image/jpeg"
+    res = gemini_generate_json_multimodal(system_instruction, user_text, image_bytes, mime, schema_hint)
     if not res:
         return None
 
+    # sanitize/normalize
     out = {
-        "need": res.get("need", None),
-        "positions": res.get("positions", None),
-        "volume": res.get("volume", None),
-        "constraints": res.get("constraints", None),
-        "decision_maker": res.get("decision_maker", None),
-        "next_step": res.get("next_step", None),
-        "urgency": res.get("urgency", None),
-        "notes": res.get("notes", None),
+        "kind": res.get("kind") if res.get("kind") in ("business_card", "logo", "signage", "unknown") else "unknown",
+        "company_name_guess": res.get("company_name_guess", None),
+        "text_extracted": res.get("text_extracted", None),
+        "contact": res.get("contact") if isinstance(res.get("contact"), dict) else {},
+        "confidence": res.get("confidence", 0),
     }
-    for k, v in list(out.items()):
-        if isinstance(v, str):
-            vv = v.strip()
-            out[k] = vv if vv else None
-    return out
 
-
-def ai_score_prospect(data: dict) -> Optional[dict]:
-    """
-    BONUS (optionnel) :
-    {
-      "score": 0-100,
-      "justification": ""
-    }
-    """
-    system_instruction = (
-        "You estimate prospect potential for a staffing/recruitment agency based on provided structured data. "
-        "Return a score 0-100 and a short justification. Do not invent missing facts."
-    )
-    schema_hint = json.dumps({"score": 0, "justification": ""}, ensure_ascii=False)
-    user_text = json.dumps(data, ensure_ascii=False)
-    res = gemini_generate_json(system_instruction, user_text, schema_hint)
-    if not res:
-        return None
-    score = res.get("score", None)
-    justif = res.get("justification", "")
     try:
-        score_int = int(score)
+        out["confidence"] = int(out["confidence"])
     except Exception:
-        score_int = None
-    if score_int is None or score_int < 0 or score_int > 100:
-        return None
-    if isinstance(justif, str):
-        justif = justif.strip()
-    return {"score": score_int, "justification": justif or ""}
+        out["confidence"] = 0
+    if out["confidence"] < 0:
+        out["confidence"] = 0
+    if out["confidence"] > 100:
+        out["confidence"] = 100
+
+    # contact sub-keys
+    c = out["contact"] if isinstance(out["contact"], dict) else {}
+    out["contact"] = {
+        "civility": (c.get("civility") or None),
+        "first_name": (c.get("first_name") or None),
+        "last_name": (c.get("last_name") or None),
+        "job_title": (c.get("job_title") or None),
+        "email": (c.get("email") or None),
+        "mobile": (c.get("mobile") or None),
+        "phone": (c.get("phone") or None),
+    }
+
+    # strip strings
+    for k in ("company_name_guess", "text_extracted"):
+        if isinstance(out.get(k), str):
+            out[k] = out[k].strip() or None
+    for k, v in list(out["contact"].items()):
+        if isinstance(v, str):
+            vv = v.strip()
+            out["contact"][k] = vv if vv else None
+
+    return out
 
 
 # =========================
-# EXCEL (Template)
+# API GOUV SEARCH (deterministic enrich for photo)
+# =========================
+def gov_search_company(q: str, per_page: int = 3) -> List[dict]:
+    url = "https://recherche-entreprises.api.gouv.fr/search"
+    r = requests.get(url, params={"q": q, "page": 1, "per_page": per_page}, timeout=30)
+    r.raise_for_status()
+    j = r.json()
+    return j.get("results") or []
+
+
+def _safe_get_siege(result: dict) -> dict:
+    s = result.get("siege") or {}
+    return s if isinstance(s, dict) else {}
+
+
+def _extract_name(result: dict) -> str:
+    return (result.get("nom_raison_sociale") or result.get("denomination") or "").strip()
+
+
+def _extract_naf(result: dict) -> str:
+    naf = (result.get("activite_principale") or result.get("naf") or "").strip()
+    return naf.replace(".", "").replace(" ", "")
+
+
+def _extract_dirigeant(result: dict) -> str:
+    arr = result.get("dirigeants") or result.get("representants") or []
+    if not isinstance(arr, list) or not arr:
+        return ""
+    first = arr[0]
+    if isinstance(first, str):
+        return first.strip()
+    p = first.get("personne") if isinstance(first, dict) else {}
+    if not isinstance(p, dict):
+        p = first if isinstance(first, dict) else {}
+    prenom = (p.get("prenom") or p.get("prenoms") or "").strip()
+    nom = (p.get("nom") or p.get("nom_usage") or p.get("nomNaissance") or "").strip()
+    full = f"{prenom} {nom}".strip()
+    return full
+
+
+def _score_match(result: dict, name_guess: str, city: str) -> int:
+    # scoring simple: name token overlap + city match
+    name_guess_l = (name_guess or "").lower()
+    city_l = (city or "").lower()
+    r_name = _extract_name(result).lower()
+    siege = _safe_get_siege(result)
+    r_city = (siege.get("libelle_commune") or "").lower()
+
+    score = 0
+    if city_l and r_city == city_l:
+        score += 30
+    if city_l and city_l in r_city:
+        score += 15
+
+    # token overlap
+    toks = [t for t in re.split(r"[^a-z0-9]+", name_guess_l) if t and len(t) >= 3]
+    for t in toks[:6]:
+        if t in r_name:
+            score += 10
+
+    # prefer longer siret present
+    if (siege.get("siret") or ""):
+        score += 5
+
+    return score
+
+
+def enrich_from_gov(name_guess: str, city: str) -> Tuple[Optional[dict], List[str]]:
+    q = f"{name_guess} {city}".strip()
+    results = gov_search_company(q, per_page=3)
+    if not results:
+        return None, []
+
+    scored = [(r, _score_match(r, name_guess, city)) for r in results]
+    scored.sort(key=lambda x: x[1], reverse=True)
+
+    top = scored[0][0]
+    suggestions = [_extract_name(x[0]) for x in scored[:3] if _extract_name(x[0])]
+
+    siege = _safe_get_siege(top)
+
+    payload = {
+        "name": _extract_name(top),
+        "siret": (siege.get("siret") or "").strip(),
+        "naf": _extract_naf(top),
+        "address": (siege.get("adresse") or siege.get("libelle_voie") or "").strip(),
+        "postal_code": (siege.get("code_postal") or "").strip(),
+        "city": (siege.get("libelle_commune") or city).strip(),
+        "dirigeant": _extract_dirigeant(top),
+        "siren": (top.get("siren") or (siege.get("siret") or "")[:9]).strip(),
+    }
+    return payload, suggestions
+
+
+# =========================
+# Google Places (optional, GitHub side)
+# =========================
+def google_places_enrich(name: str, city: str) -> Dict[str, str]:
+    api_key = opt_env("GOOGLE_PLACES_API_KEY")
+    if not api_key:
+        return {"phone": "", "website": ""}
+
+    # Text Search
+    ts_url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": api_key,
+        "X-Goog-FieldMask": "places.id,places.websiteUri",
+    }
+    body = {"textQuery": f"{name} {city}".strip(), "maxResultCount": 1, "languageCode": "fr", "regionCode": "FR"}
+    r = requests.post(ts_url, headers=headers, json=body, timeout=25)
+    if not r.ok:
+        return {"phone": "", "website": ""}
+
+    j = r.json()
+    p = (j.get("places") or [None])[0]
+    if not p:
+        return {"phone": "", "website": ""}
+
+    place_id = p.get("id") or ""
+    website = p.get("websiteUri") or ""
+
+    phone = ""
+    if place_id:
+        det_url = f"https://places.googleapis.com/v1/places/{place_id}"
+        det_headers = {
+            "X-Goog-Api-Key": api_key,
+            "X-Goog-FieldMask": "nationalPhoneNumber,internationalPhoneNumber,websiteUri",
+        }
+        r2 = requests.get(det_url, headers=det_headers, timeout=25)
+        if r2.ok:
+            j2 = r2.json()
+            phone = j2.get("nationalPhoneNumber") or j2.get("internationalPhoneNumber") or ""
+            website = j2.get("websiteUri") or website
+
+    return {"phone": phone or "", "website": website or ""}
+
+
+# =========================
+# Utility: never overwrite manual
+# =========================
+def fill_if_empty(record: dict, key: str, value: Any) -> None:
+    if value is None:
+        return
+    cur = record.get(key, None)
+    if cur is None:
+        record[key] = value
+        return
+    if isinstance(cur, str) and not cur.strip():
+        record[key] = value
+        return
+
+
+# =========================
+# Excel
 # =========================
 def build_header_map(ws) -> Dict[str, int]:
     max_col = ws.max_column
@@ -656,30 +669,22 @@ def build_excel_from_template(records: List[dict], out_path: str) -> None:
     wb = load_workbook(TEMPLATE_PATH)
     ws = wb.active
 
-    # Ensure base extra headers
     header_map = ensure_headers(ws, EXTRA_HEADERS)
-
-    # Ensure AI headers (safe append)
-    header_map = ensure_headers(ws, AI_HEADERS_BUSINESS_CARD)
-    header_map = ensure_headers(ws, AI_HEADERS_MEETING)
-    header_map = ensure_headers(ws, AI_HEADERS_SCORE)
+    header_map = ensure_headers(ws, PHOTO_HEADERS)
 
     start_row = ws.max_row + 1
 
     for idx, r in enumerate(records):
         row = start_row + idx
 
-        # ensure contact fallback (V1)
         ensure_contact_fields(r)
 
-        # Interlocuteur displayed:
         interloc_excel = (r.get("interlocuteur") or "").strip()
         if not interloc_excel:
             fn = (r.get("contact_firstname") or "").strip()
             ln = (r.get("contact_lastname") or "").strip()
             interloc_excel = f"{fn} {ln}".strip() or (r.get("dirigeant") or "")
 
-        # Base template values
         values = {
             "NOM": r.get("name", "") or "",
             "RUE": r.get("address", "") or "",
@@ -698,34 +703,11 @@ def build_excel_from_template(records: List[dict], out_path: str) -> None:
             "CARTE DE VISITE": r.get("card_photo_url", "") or r.get("card_photo_file_id", "") or "",
             "AGENCE": r.get("agency", "") or "",
             "INITIALS": r.get("initials", "") or "",
+            "SOURCE": r.get("source", "") or "",
+            "CONFIDENCE": r.get("confidence", "") or "",
+            "STATUS": r.get("status", "") or "",
+            "SUGGESTIONS": r.get("suggestions", "") or "",
         }
-
-        # AI values (only if present, never overwrite existing excel cells because row is new)
-        ai_bc = r.get("_ai_business_card") or {}
-        ai_meet = r.get("_ai_meeting") or {}
-        ai_score = r.get("_ai_score") or {}
-
-        values.update(
-            {
-                "AI_CIVILITY": ai_bc.get("civility") or "",
-                "AI_FIRST_NAME": ai_bc.get("first_name") or "",
-                "AI_LAST_NAME": ai_bc.get("last_name") or "",
-                "AI_JOB_TITLE": ai_bc.get("job_title") or "",
-                "AI_EMAIL": ai_bc.get("email") or "",
-                "AI_MOBILE": ai_bc.get("mobile") or "",
-                "AI_PHONE": ai_bc.get("phone") or "",
-                "AI_NEED": ai_meet.get("need") or "",
-                "AI_POSITIONS": ai_meet.get("positions") or "",
-                "AI_VOLUME": ai_meet.get("volume") or "",
-                "AI_CONSTRAINTS": ai_meet.get("constraints") or "",
-                "AI_DECISION_MAKER": ai_meet.get("decision_maker") or "",
-                "AI_NEXT_STEP": ai_meet.get("next_step") or "",
-                "AI_URGENCY": ai_meet.get("urgency") or "",
-                "AI_NOTES": ai_meet.get("notes") or "",
-                "AI_SCORE": ai_score.get("score") if isinstance(ai_score.get("score"), int) else "",
-                "AI_SCORE_JUSTIFICATION": ai_score.get("justification") or "",
-            }
-        )
 
         for h, v in values.items():
             col = header_map.get(h)
@@ -737,7 +719,7 @@ def build_excel_from_template(records: List[dict], out_path: str) -> None:
 
 
 # =========================
-# BREVO
+# Brevo
 # =========================
 def send_mail_brevo(to_list: List[str], subject: str, html: str, attachments: List[Tuple[str, bytes]]) -> None:
     api_key = must_env("BREVO_API_KEY")
@@ -762,7 +744,7 @@ def send_mail_brevo(to_list: List[str], subject: str, html: str, attachments: Li
 
 
 # =========================
-# STATS (closes)
+# Stats (closes)
 # =========================
 def to_int(x) -> int:
     try:
@@ -773,30 +755,22 @@ def to_int(x) -> int:
 
 
 def compute_stats(prospects: List[dict], closes: List[dict]) -> dict:
-    """
-    actions = nb prospects enregistrés (records)
-    clients/prospects/commandes = venant des closes (/dump?kind=closes)
-    """
     by_agency: Dict[str, dict] = {}
     by_initials: Dict[str, dict] = {}
 
-    # actions by prospect records
     for p in prospects:
         ag = (p.get("agency") or "").upper()
         ini = (p.get("initials") or "").upper()
         if not ag:
             continue
 
-        by_agency.setdefault(ag, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0, "by_initials": {}})
+        by_agency.setdefault(ag, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
         by_agency[ag]["actions"] += 1
-        by_agency[ag]["by_initials"].setdefault(ini, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
-        by_agency[ag]["by_initials"][ini]["actions"] += 1
 
         by_initials.setdefault(ini, {"agencies": set(), "actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
         by_initials[ini]["actions"] += 1
         by_initials[ini]["agencies"].add(ag)
 
-    # closes numbers
     for c in closes:
         ag = (c.get("agency") or "").upper()
         ini = (c.get("initials") or "").upper()
@@ -806,15 +780,10 @@ def compute_stats(prospects: List[dict], closes: List[dict]) -> dict:
         comm = to_int(c.get("commandes"))
 
         if ag:
-            by_agency.setdefault(ag, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0, "by_initials": {}})
+            by_agency.setdefault(ag, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
             by_agency[ag]["clients"] += clients
             by_agency[ag]["prospects"] += prosps
             by_agency[ag]["commandes"] += comm
-
-            by_agency[ag]["by_initials"].setdefault(ini, {"actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
-            by_agency[ag]["by_initials"][ini]["clients"] += clients
-            by_agency[ag]["by_initials"][ini]["prospects"] += prosps
-            by_agency[ag]["by_initials"][ini]["commandes"] += comm
 
         by_initials.setdefault(ini, {"agencies": set(), "actions": 0, "clients": 0, "prospects": 0, "commandes": 0})
         by_initials[ini]["clients"] += clients
@@ -830,15 +799,9 @@ def compute_stats(prospects: List[dict], closes: List[dict]) -> dict:
         "commandes": sum(v["commandes"] for v in by_agency.values()),
     }
 
-    ranking = sorted(
-        [(ini, v["actions"]) for ini, v in by_initials.items() if ini],
-        key=lambda x: x[1],
-        reverse=True,
-    )
-
+    ranking = sorted([(ini, v["actions"]) for ini, v in by_initials.items() if ini], key=lambda x: x[1], reverse=True)
     for ini in list(by_initials.keys()):
         by_initials[ini]["agencies"] = sorted(list(by_initials[ini]["agencies"]))
-
     return {"by_agency": by_agency, "by_initials": by_initials, "totals": totals, "ranking": ranking}
 
 
@@ -852,7 +815,7 @@ def html_table(headers: List[str], rows: List[List[Any]]) -> str:
 
 
 # =========================
-# FILTERING
+# Filters
 # =========================
 def filter_by_date(items: List[dict], run_date: str) -> List[dict]:
     return [x for x in items if str(x.get("date", "")).strip() == run_date]
@@ -864,7 +827,7 @@ def filter_prospects(items: List[dict], run_date: str, mode: str, agency: str, i
         return [x for x in items if (x.get("agency") or "").upper() == agency and (x.get("initials") or "").upper() == initials]
     if mode == "agency_manager":
         return [x for x in items if (x.get("agency") or "").upper() == agency] if agency else items
-    return items  # admin
+    return items
 
 
 def filter_closes(items: List[dict], run_date: str, mode: str, agency: str, initials: str) -> List[dict]:
@@ -873,101 +836,140 @@ def filter_closes(items: List[dict], run_date: str, mode: str, agency: str, init
         return [x for x in items if (x.get("agency") or "").upper() == agency and (x.get("initials") or "").upper() == initials]
     if mode == "agency_manager":
         return [x for x in items if (x.get("agency") or "").upper() == agency] if agency else items
-    return items  # admin
+    return items
+
+
+def filter_photos(items: List[dict], run_date: str, mode: str, agency: str, initials: str) -> List[dict]:
+    items = filter_by_date(items, run_date)
+    if mode == "individual":
+        return [x for x in items if (x.get("agency") or "").upper() == agency and (x.get("user") or "").upper() == initials]
+    if mode == "agency_manager":
+        return [x for x in items if (x.get("agency") or "").upper() == agency] if agency else items
+    return items
 
 
 # =========================
-# V2 INTEGRATION HELPERS
+# Photo -> Prospect line
 # =========================
-def fill_if_empty(record: dict, key: str, value: Any) -> None:
-    """Ne jamais écraser une donnée existante."""
-    if value is None:
-        return
-    cur = record.get(key, None)
-    if cur is None:
-        record[key] = value
-        return
-    if isinstance(cur, str) and not cur.strip():
-        record[key] = value
-        return
+def build_photo_prospect(photo_item: dict, ai: Optional[dict], gov: Optional[dict], suggestions: List[str]) -> dict:
+    # Manual priority
+    city = (photo_item.get("city") or "").strip()
+    meeting = photo_item.get("meeting")
+    interloc = photo_item.get("interlocutor")
+    phone_manual = photo_item.get("phone_manual")
+    mail_manual = photo_item.get("mail_manual")
 
+    out = {
+        "date": photo_item.get("date", ""),
+        "agency": (photo_item.get("agency") or "").upper(),
+        "initials": (photo_item.get("user") or "").upper(),
 
-def maybe_ai_enrich_business_card(record: dict, ocr_text: str) -> None:
-    """
-    Après OCR -> ai_parse_business_card
-    Complète UNIQUEMENT si vides :
-      - email -> record["email"]
-      - mobile -> record["phone2"]
-      - phone -> record["phone"]
-      - interlocuteur/contact -> record["contact_firstname/contact_lastname"] (si vides)
-    Stocke aussi le bloc AI dans record["_ai_business_card"] pour Excel (colonnes AI_*)
-    """
-    if not ocr_text or not _gemini_enabled():
-        return
+        "name": "",
+        "address": "",
+        "postal_code": "",
+        "city": city,
 
-    ai = ai_parse_business_card(ocr_text)
-    if not ai:
-        return
+        "phone": "",
+        "phone2": "",
+        "email": "",
 
-    record["_ai_business_card"] = ai
+        "siret": "",
+        "naf": "",
+        "website": "",
 
-    # Fill missing
-    fill_if_empty(record, "email", ai.get("email"))
-    fill_if_empty(record, "phone2", ai.get("mobile"))
-    fill_if_empty(record, "phone", ai.get("phone"))
+        "dirigeant": "",
+        "interlocuteur": "",
+        "contact_civility": "",
+        "contact_firstname": "",
+        "contact_lastname": "",
 
-    # Contact fields: only if missing
-    if not (record.get("contact_firstname") or "").strip() and not (record.get("contact_lastname") or "").strip():
-        fn = ai.get("first_name")
-        ln = ai.get("last_name")
-        if fn or ln:
-            fill_if_empty(record, "contact_firstname", fn or "")
-            fill_if_empty(record, "contact_lastname", ln or "")
-            # If interlocuteur empty, reconstruct (but do not overwrite manual)
-            if not (record.get("interlocuteur") or "").strip():
-                combo = f"{fn or ''} {ln or ''}".strip()
-                if combo:
-                    fill_if_empty(record, "interlocuteur", combo)
+        "resume": meeting or "",
+        "commande": "",
 
+        "card_photo_file_id": photo_item.get("file_id", ""),
+        "card_photo_url": "",
 
-def maybe_ai_structure_meeting(record: dict) -> None:
-    """
-    Après récupération résumé entretien -> ai_structure_meeting
-    - Ne modifie pas record["resume"] (V1 inchangé)
-    - Stocke le JSON structuré dans record["_ai_meeting"] pour Excel (colonnes AI_*)
-    """
-    txt = (record.get("resume") or "").strip()
-    if not txt or not _gemini_enabled():
-        return
-    ai = ai_structure_meeting(txt)
-    if not ai:
-        return
-    record["_ai_meeting"] = ai
-
-
-def maybe_ai_score(record: dict) -> None:
-    """
-    BONUS : score potentiel prospect (optionnel)
-    - Fait uniquement si Gemini OK
-    - Ne bloque jamais le flux
-    """
-    if not _gemini_enabled():
-        return
-
-    # Données minimales (sans complexifier)
-    payload = {
-        "company": record.get("name") or "",
-        "city": record.get("city") or "",
-        "naf": record.get("naf") or "",
-        "website": record.get("website") or "",
-        "meeting": (record.get("_ai_meeting") or {}) if isinstance(record.get("_ai_meeting"), dict) else {},
-        "order": (record.get("commande") or ""),
-        "notes": (record.get("resume") or ""),
+        "source": "photo",
+        "confidence": "",
+        "status": "A_VERIFIER",
+        "suggestions": "",
     }
-    ai = ai_score_prospect(payload)
-    if not ai:
-        return
-    record["_ai_score"] = ai
+
+    if ai:
+        out["confidence"] = ai.get("confidence", "")
+        cg = (ai.get("company_name_guess") or "").strip() if isinstance(ai.get("company_name_guess"), str) else ""
+        # if gov enrich ok, prefer that as name
+        if cg:
+            out["name"] = cg
+
+        c = ai.get("contact") if isinstance(ai.get("contact"), dict) else {}
+        if isinstance(c.get("civility"), str):
+            out["contact_civility"] = c.get("civility") or ""
+        if isinstance(c.get("first_name"), str):
+            out["contact_firstname"] = c.get("first_name") or ""
+        if isinstance(c.get("last_name"), str):
+            out["contact_lastname"] = c.get("last_name") or ""
+
+        # AI email/phones only if not manual
+        if isinstance(c.get("email"), str):
+            fill_if_empty(out, "email", c.get("email"))
+        if isinstance(c.get("mobile"), str):
+            fill_if_empty(out, "phone2", c.get("mobile"))
+        if isinstance(c.get("phone"), str):
+            fill_if_empty(out, "phone", c.get("phone"))
+
+    # Manual overrides always win
+    if mail_manual:
+        out["email"] = mail_manual
+    if phone_manual:
+        # put manual in phone (fixe) if no better, else in phone2? => we keep phone if empty, else phone2
+        if not out["phone"]:
+            out["phone"] = phone_manual
+        elif not out["phone2"]:
+            out["phone2"] = phone_manual
+
+    # Interlocutor manual has priority
+    if interloc:
+        out["interlocuteur"] = interloc
+        fn, ln = split_name_simple(interloc)
+        fill_if_empty(out, "contact_firstname", fn)
+        fill_if_empty(out, "contact_lastname", ln or interloc)
+
+    # Deterministic gov enrich
+    if gov:
+        out["name"] = gov.get("name") or out["name"]
+        out["address"] = gov.get("address") or ""
+        out["postal_code"] = gov.get("postal_code") or ""
+        out["city"] = gov.get("city") or out["city"]
+        out["siret"] = gov.get("siret") or ""
+        out["naf"] = gov.get("naf") or ""
+        out["dirigeant"] = gov.get("dirigeant") or ""
+
+    # Places enrich optional (if key present and we have name+city)
+    if out["name"] and out["city"]:
+        pl = google_places_enrich(out["name"], out["city"])
+        # only fill if empty
+        fill_if_empty(out, "phone", pl.get("phone"))
+        fill_if_empty(out, "website", pl.get("website"))
+
+    # status + suggestions
+    if gov and out.get("siret"):
+        out["status"] = "OK"
+    else:
+        out["status"] = "A_VERIFIER"
+    if suggestions:
+        out["suggestions"] = " | ".join([s for s in suggestions if s])
+
+    # ensure contact fallback from dirigeant if still empty
+    ensure_contact_fields(out)
+    if not out["interlocuteur"]:
+        # fallback for display/excel
+        fn = (out.get("contact_firstname") or "").strip()
+        ln = (out.get("contact_lastname") or "").strip()
+        combo = f"{fn} {ln}".strip()
+        out["interlocuteur"] = combo or out.get("dirigeant", "")
+
+    return out
 
 
 # =========================
@@ -977,32 +979,36 @@ def main() -> None:
     routing = json.loads(must_env("MAIL_ROUTING_JSON"))
 
     send_mode = opt_env("SEND_MODE", "individual").strip()
-    run_date = opt_env("RUN_DATE")
-    if not run_date:
-        run_date = datetime.utcnow().strftime("%Y-%m-%d")
+    run_date = opt_env("RUN_DATE") or datetime.utcnow().strftime("%Y-%m-%d")
 
     agency = opt_env("AGENCY", "").upper()
     initials = opt_env("INITIALS", "").upper()
+
     max_ocr = opt_int("MAX_OCR_IMAGES", 50)
+    max_photos = opt_int("MAX_PHOTO_IMAGES", 15)
 
     prospects_all = fetch_dump_jsonl(run_date, "prospects")
     closes_all = fetch_dump_jsonl(run_date, "closes")
 
-    # -------------------------
-    # INDIVIDUAL (mail immédiat)
-    # -------------------------
+    # NEW: photos
+    photos_all = fetch_dump_jsonl(run_date, "photos")
+
+    # --------------------------------
+    # INDIVIDUAL
+    # --------------------------------
     if send_mode == "individual":
         if not agency or not initials:
             raise RuntimeError("SEND_MODE=individual requires AGENCY and INITIALS")
 
         prospects = filter_prospects(prospects_all, run_date, "individual", agency, initials)
         closes = filter_closes(closes_all, run_date, "individual", agency, initials)
+        photos = filter_photos(photos_all, run_date, "individual", agency, initials)
 
+        # --- V1: OCR card attachments for prospects (unchanged behavior) ---
         card_attachments: List[Tuple[str, bytes]] = []
         ocr_done = 0
 
         for rec in prospects:
-            # V1 fallback contact (manual > dirigeant)
             ensure_contact_fields(rec)
 
             need_email = not (rec.get("email") or "").strip()
@@ -1015,78 +1021,97 @@ def main() -> None:
                 img = download_card_image_bytes(rec)
                 if img:
                     o = ocr_extract(img)
-                    ocr_text = o.get("ocr_text", "")
-
-                    # V1: regex fill if missing
                     if need_email and o.get("email"):
                         fill_if_empty(rec, "email", o["email"])
                     if need_mobile and o.get("mobile"):
                         fill_if_empty(rec, "phone2", o["mobile"])
                     if need_phone and o.get("phone"):
                         fill_if_empty(rec, "phone", o["phone"])
-
                     if need_contact and o.get("contact_full"):
                         fn, ln = split_name_simple(o["contact_full"])
-                        if fn and not (rec.get("contact_firstname") or "").strip():
+                        if fn:
                             fill_if_empty(rec, "contact_firstname", fn)
-                        if ln and not (rec.get("contact_lastname") or "").strip():
+                        if ln:
                             fill_if_empty(rec, "contact_lastname", ln)
-
-                    # V2: Gemini parse business card (only fills empty)
-                    maybe_ai_enrich_business_card(rec, ocr_text)
-
                     ocr_done += 1
                     card_attachments.append((f"carte_{agency}_{initials}_{ocr_done}.jpg", img))
 
-            # V2: structure meeting (non destructif) + optional score
-            maybe_ai_structure_meeting(rec)
-            maybe_ai_score(rec)
-
-            # final V1 fallback
             ensure_contact_fields(rec)
 
-        # Excel
+        # --- V2 Photo: process photos into prospect-like lines ---
+        photo_attachments: List[Tuple[str, bytes]] = []
+        photo_lines: List[dict] = []
+
+        processed = 0
+        for p in photos:
+            if processed >= max_photos:
+                break
+            file_id = (p.get("file_id") or "").strip()
+            city = (p.get("city") or "").strip()
+            if not file_id or not city:
+                continue
+
+            img_bytes = telegram_download_file_bytes(file_id)
+            if not img_bytes:
+                continue
+
+            ai = None
+            if _gemini_enabled():
+                ai = ai_photo_extract(img_bytes, city)
+
+            suggestions: List[str] = []
+            gov = None
+            if ai and isinstance(ai.get("company_name_guess"), str) and ai.get("company_name_guess").strip():
+                gov, suggestions = enrich_from_gov(ai["company_name_guess"].strip(), city)
+            else:
+                # fallback: if no company guess, no gov enrich (still exported as A_VERIFIER)
+                gov, suggestions = (None, [])
+
+            line = build_photo_prospect(p, ai, gov, suggestions)
+            photo_lines.append(line)
+
+            # attach original image (for user immediate mail)
+            processed += 1
+            photo_attachments.append((f"photo_{agency}_{initials}_{processed}.jpg", img_bytes))
+
+        # Merge all for Excel
+        merged = prospects + photo_lines
+
         xlsx_name = f"prospection_{agency}_{initials}_{run_date}.xlsx"
-        build_excel_from_template(prospects, xlsx_name)
+        build_excel_from_template(merged, xlsx_name)
         with open(xlsx_name, "rb") as f:
             excel_bytes = f.read()
 
-        attachments = [(xlsx_name, excel_bytes)] + card_attachments
+        attachments = [(xlsx_name, excel_bytes)] + card_attachments + photo_attachments
 
-        # recipients
         to_list = routing.get(agency, {}).get(initials)
         if not to_list:
             raise RuntimeError(f"No routing found for {agency}/{initials}")
 
-        # stats from closes (requested)
         clients = sum(to_int(x.get("visits_clients")) for x in closes)
         prosps = sum(to_int(x.get("visits_prospects")) for x in closes)
         comm = sum(to_int(x.get("commandes")) for x in closes)
 
-        ai_note = ""
-        if _gemini_enabled():
-            ai_note = "<p><i>AI activée (Gemini 1.5 Flash) : structuration entretien + parsing carte (si utile).</i></p>"
-
         html = f"""
         <p>Bonjour,</p>
-        <p>Voici ton export de prospection <b>{agency}/{initials}</b> du <b>{run_date}</b>.</p>
+        <p>Voici ton export <b>{agency}/{initials}</b> du <b>{run_date}</b>.</p>
         <ul>
-          <li><b>Actions (prospects saisis)</b> : {len(prospects)}</li>
+          <li><b>Prospects (mode entreprise)</b> : {len(prospects)}</li>
+          <li><b>Prospects (mode photo)</b> : {len(photo_lines)}</li>
           <li><b>Clients</b> : {clients}</li>
-          <li><b>Prospects</b> : {prosps}</li>
+          <li><b>Prospects visités</b> : {prosps}</li>
           <li><b>Commandes</b> : {comm}</li>
         </ul>
-        {ai_note}
-        <p>Pièces jointes : Excel{" + cartes de visite" if card_attachments else ""}.</p>
+        <p>Pièces jointes : Excel + images (cartes/photos).</p>
         """
         subject = f"[PROSPECTION] {agency}/{initials} - {run_date}"
         send_mail_brevo(to_list, subject, html, attachments)
 
-        print(f"OK individual: {agency}/{initials} prospects={len(prospects)} cards={len(card_attachments)} closes={len(closes)} ai={'on' if _gemini_enabled() else 'off'}")
+        print(f"OK individual: {agency}/{initials} prospects={len(prospects)} photo={len(photo_lines)} closes={len(closes)}")
         return
 
     # ---------------------------------------
-    # AGENCY MANAGER (17:45) — 1 mail/agence
+    # AGENCY MANAGER
     # ---------------------------------------
     if send_mode == "agency_manager":
         agencies = [agency] if agency else [k for k in routing.keys() if k != "_admin"]
@@ -1097,14 +1122,39 @@ def main() -> None:
 
             prospects = filter_prospects(prospects_all, run_date, "agency_manager", ag, "")
             closes = filter_closes(closes_all, run_date, "agency_manager", ag, "")
+            photos = filter_photos(photos_all, run_date, "agency_manager", ag, "")
 
-            for rec in prospects:
+            photo_lines: List[dict] = []
+            processed = 0
+            for p in photos:
+                if processed >= 30:  # consolidation agency: cap
+                    break
+                file_id = (p.get("file_id") or "").strip()
+                city = (p.get("city") or "").strip()
+                if not file_id or not city:
+                    continue
+
+                img_bytes = telegram_download_file_bytes(file_id)
+                if not img_bytes:
+                    continue
+
+                ai = ai_photo_extract(img_bytes, city) if _gemini_enabled() else None
+
+                suggestions: List[str] = []
+                gov = None
+                if ai and isinstance(ai.get("company_name_guess"), str) and ai.get("company_name_guess").strip():
+                    gov, suggestions = enrich_from_gov(ai["company_name_guess"].strip(), city)
+
+                line = build_photo_prospect(p, ai, gov, suggestions)
+                photo_lines.append(line)
+                processed += 1
+
+            merged = prospects + photo_lines
+            for rec in merged:
                 ensure_contact_fields(rec)
-                maybe_ai_structure_meeting(rec)
-                maybe_ai_score(rec)
 
             xlsx_name = f"prospection_{ag}_CONSOLIDE_{run_date}.xlsx"
-            build_excel_from_template(prospects, xlsx_name)
+            build_excel_from_template(merged, xlsx_name)
             with open(xlsx_name, "rb") as f:
                 excel_bytes = f.read()
 
@@ -1117,46 +1167,66 @@ def main() -> None:
             prosps = sum(to_int(x.get("visits_prospects")) for x in closes)
             comm = sum(to_int(x.get("commandes")) for x in closes)
 
-            ai_note = ""
-            if _gemini_enabled():
-                ai_note = "<p><i>AI activée (Gemini 1.5 Flash) : structuration entretien + score (si possible).</i></p>"
-
             html = f"""
             <p>Bonjour,</p>
-            <p>Voici le récapitulatif <b>agence {ag}</b> du <b>{run_date}</b>.</p>
+            <p>Récap <b>agence {ag}</b> du <b>{run_date}</b>.</p>
             <ul>
-              <li><b>Actions (prospects saisis)</b> : {len(prospects)}</li>
+              <li><b>Prospects (mode entreprise)</b> : {len(prospects)}</li>
+              <li><b>Prospects (mode photo)</b> : {len(photo_lines)}</li>
               <li><b>Clients</b> : {clients}</li>
-              <li><b>Prospects</b> : {prosps}</li>
+              <li><b>Prospects visités</b> : {prosps}</li>
               <li><b>Commandes</b> : {comm}</li>
             </ul>
-            {ai_note}
             <p>Pièce jointe : Excel consolidé agence.</p>
             """
             subject = f"[PROSPECTION] Récap agence {ag} - {run_date}"
             send_mail_brevo(to_list, subject, html, [(xlsx_name, excel_bytes)])
-            print(f"OK agency_manager: {ag} prospects={len(prospects)} closes={len(closes)} ai={'on' if _gemini_enabled() else 'off'}")
+            print(f"OK agency_manager: {ag} prospects={len(prospects)} photo={len(photo_lines)} closes={len(closes)}")
 
         return
 
-    # ------------------------------------------------
-    # ADMIN (17:47) — 1 mail global SL + tableaux HTML
-    # ------------------------------------------------
+    # ---------------------------------------
+    # ADMIN
+    # ---------------------------------------
     if send_mode == "admin":
         prospects = filter_by_date(prospects_all, run_date)
         closes = filter_by_date(closes_all, run_date)
+        photos = filter_by_date(photos_all, run_date)
 
-        for rec in prospects:
+        photo_lines: List[dict] = []
+        processed = 0
+        for p in photos:
+            if processed >= 80:  # global cap
+                break
+            file_id = (p.get("file_id") or "").strip()
+            city = (p.get("city") or "").strip()
+            if not file_id or not city:
+                continue
+            img_bytes = telegram_download_file_bytes(file_id)
+            if not img_bytes:
+                continue
+
+            ai = ai_photo_extract(img_bytes, city) if _gemini_enabled() else None
+
+            suggestions: List[str] = []
+            gov = None
+            if ai and isinstance(ai.get("company_name_guess"), str) and ai.get("company_name_guess").strip():
+                gov, suggestions = enrich_from_gov(ai["company_name_guess"].strip(), city)
+
+            line = build_photo_prospect(p, ai, gov, suggestions)
+            photo_lines.append(line)
+            processed += 1
+
+        merged = prospects + photo_lines
+        for rec in merged:
             ensure_contact_fields(rec)
-            maybe_ai_structure_meeting(rec)
-            maybe_ai_score(rec)
 
         xlsx_name = f"prospection_GLOBAL_{run_date}.xlsx"
-        build_excel_from_template(prospects, xlsx_name)
+        build_excel_from_template(merged, xlsx_name)
         with open(xlsx_name, "rb") as f:
             excel_bytes = f.read()
 
-        stats = compute_stats(prospects, closes)
+        stats = compute_stats(merged, closes)
         totals = stats["totals"]
 
         agency_rows = []
@@ -1167,45 +1237,30 @@ def main() -> None:
         for ini, v in sorted(stats["by_initials"].items(), key=lambda x: x[0]):
             if not ini:
                 continue
-            initials_rows.append(
-                [
-                    ini,
-                    ", ".join(v["agencies"]) if v["agencies"] else "",
-                    v["actions"],
-                    v["clients"],
-                    v["prospects"],
-                    v["commandes"],
-                ]
-            )
+            initials_rows.append([ini, ", ".join(v["agencies"]) if v["agencies"] else "", v["actions"], v["clients"], v["prospects"], v["commandes"]])
 
         ranking_rows = [[ini, actions] for (ini, actions) in stats["ranking"]]
 
-        ai_note = ""
-        if _gemini_enabled():
-            ai_note = "<p><i>AI activée (Gemini 1.5 Flash) : structuration entretien + score (si possible).</i></p>"
-
         html = f"""
         <p>Bonsoir SL,</p>
-        <p>Voici le <b>récapitulatif GLOBAL</b> du <b>{run_date}</b>.</p>
-
-        <h3 style="margin:16px 0 6px 0">Totaux jour</h3>
+        <p>Récap GLOBAL du <b>{run_date}</b>.</p>
         <ul>
           <li><b>Actions (prospects saisis)</b> : {totals["actions"]}</li>
           <li><b>Clients</b> : {totals["clients"]}</li>
-          <li><b>Prospects</b> : {totals["prospects"]}</li>
+          <li><b>Prospects visités</b> : {totals["prospects"]}</li>
           <li><b>Commandes</b> : {totals["commandes"]}</li>
+          <li><b>Mode photo</b> : {len(photo_lines)} lignes</li>
         </ul>
 
-        <h3 style="margin:16px 0 6px 0">Tableau par agence</h3>
+        <h3>Tableau par agence</h3>
         {html_table(["Agence","Actions","Clients","Prospects","Commandes"], agency_rows)}
 
-        <h3 style="margin:16px 0 6px 0">Tableau par commercial</h3>
+        <h3>Tableau par commercial</h3>
         {html_table(["Initiales","Agences","Actions","Clients","Prospects","Commandes"], initials_rows)}
 
-        <h3 style="margin:16px 0 6px 0">Classement (par nombre d’actions)</h3>
+        <h3>Classement (par nombre d’actions)</h3>
         {html_table(["Initiales","Actions"], ranking_rows)}
 
-        {ai_note}
         <p>Pièce jointe : Excel GLOBAL.</p>
         """
 
@@ -1215,7 +1270,7 @@ def main() -> None:
 
         subject = f"[PROSPECTION] Récap GLOBAL - {run_date}"
         send_mail_brevo(to_list, subject, html, [(xlsx_name, excel_bytes)])
-        print(f"OK admin: prospects={len(prospects)} closes={len(closes)} ai={'on' if _gemini_enabled() else 'off'}")
+        print(f"OK admin: merged={len(merged)} closes={len(closes)} photo={len(photo_lines)}")
         return
 
     raise RuntimeError("Invalid SEND_MODE. Use individual|agency_manager|admin")
