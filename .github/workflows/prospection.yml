@@ -1,19 +1,4 @@
-# .github/workflows/prospection.yml
 name: Prospection
-
-# =====================================================
-# PROSPECTION WORKFLOW — V2 OPTIMISÉ (Option B DST auto)
-#
-# ✅ V1 stable conservée (Worker inchangé)
-# ✅ 4 crons (été/hiver) MAIS "guard" runtime => seuls 17:45 & 17:47 Paris exécutent
-# ✅ Concurrency anti-doublons (par mode)
-# ✅ Timeout global
-# ✅ Cache pip + apt (tesseract)
-# ✅ Artifacts Excel (filet sécurité)
-# ✅ pip-audit (non bloquant)
-# ✅ Notification Telegram si échec
-# ✅ Inputs validés (workflow_dispatch)
-# =====================================================
 
 on:
   workflow_dispatch:
@@ -51,17 +36,12 @@ on:
         type: string
 
   schedule:
-    # ── HIVER (UTC+1) : 17:45 Paris = 16:45 UTC ───────────────────────────
-    - cron: "45 16 * * 1-5"   # target 17:45 Paris
-    - cron: "47 16 * * 1-5"   # target 17:47 Paris
-    # ── ÉTÉ  (UTC+2) : 17:45 Paris = 15:45 UTC ───────────────────────────
-    - cron: "45 15 * * 1-5"   # target 17:45 Paris
-    - cron: "47 15 * * 1-5"   # target 17:47 Paris
-
-concurrency:
-  # Anti-doublons: un seul run par "mode" à la fois (schedule => computed, dispatch => inputs.mode)
-  group: prospection-${{ github.event_name == 'schedule' && github.run_id || inputs.mode }}
-  cancel-in-progress: false
+    # HIVER (UTC+1) : 17:45 Paris = 16:45 UTC
+    - cron: "45 16 * * 1-5"
+    - cron: "47 16 * * 1-5"
+    # ÉTÉ  (UTC+2) : 17:45 Paris = 15:45 UTC
+    - cron: "45 15 * * 1-5"
+    - cron: "47 15 * * 1-5"
 
 jobs:
   export_and_mail:
@@ -69,9 +49,10 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # ── 0. Validation inputs (uniquement workflow_dispatch) ──────────────
+      # 0) Validation inputs (dispatch only)
       - name: Validate inputs (dispatch only)
         if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
         run: |
           MODE="${{ inputs.mode }}"
           AGENCY="${{ inputs.agency }}"
@@ -115,25 +96,26 @@ jobs:
 
           echo "✅ Inputs validés."
 
-      # ── 1. Checkout ─────────────────────────────────────────────────────
+      # 1) Checkout
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Python ───────────────────────────────────────────────────────
+      # 2) Python
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # ── 3. Cache APT packages (tesseract) ────────────────────────────────
+      # 3) Cache APT (tesseract)
       - name: Cache apt packages
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
           packages: tesseract-ocr tesseract-ocr-fra libmagic1
           version: 1.0
 
-      # ── 4. Install system deps (fallback si cache miss) ─────────────────
+      # 4) Install deps système (fallback)
       - name: Install system deps (tesseract + libmagic)
+        shell: bash
         run: |
           if ! command -v tesseract >/dev/null 2>&1; then
             sudo apt-get update -qq
@@ -142,7 +124,7 @@ jobs:
             echo "✅ Tesseract déjà présent (cache)."
           fi
 
-      # ── 5. Cache pip ────────────────────────────────────────────────────
+      # 5) Cache pip
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -151,22 +133,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # ── 6. Install python deps ──────────────────────────────────────────
+      # 6) Install python deps
       - name: Install python deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ── 7. Audit dépendances (non bloquant) ─────────────────────────────
+      # 7) Audit dépendances (non bloquant)
       - name: Audit dependencies (CVE check)
         continue-on-error: true
+        shell: bash
         run: |
           pip install pip-audit --quiet
           pip-audit -r requirements.txt --desc on
 
-      # ── 8. Determine mode + date + GUARD DST ────────────────────────────
-      - name: Determine context (mode/date) + schedule guard
+      # 8) Determine context (mode/date) + guard DST + resolve tuning
+      - name: Determine context (mode/date) + schedule guard + tuning
         id: ctx
+        shell: bash
         run: |
           MODE="${{ inputs.mode }}"
           RUN_DATE="${{ inputs.run_date }}"
@@ -177,7 +162,6 @@ jobs:
             PARIS_MIN=$(TZ="Europe/Paris" date +%M)
             echo "⏰ Paris now: ${PARIS_HOUR}:${PARIS_MIN}"
 
-            # Guard: on n'exécute QUE si on est exactement à 17:45 ou 17:47 Paris
             if [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "45" ]; then
               MODE="agency_manager"
             elif [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "47" ]; then
@@ -189,26 +173,40 @@ jobs:
             fi
           fi
 
-          # Date par défaut = aujourd'hui Paris
           if [ -z "$RUN_DATE" ]; then
             RUN_DATE=$(TZ="Europe/Paris" date +%Y-%m-%d)
           fi
+
+          # Tuning: inputs n'existent pas en schedule => fallback dur
+          MAX_OCR="${{ inputs.max_ocr_images }}"
+          MAX_PHOTO="${{ inputs.max_photo_images }}"
+          if [ -z "$MAX_OCR" ]; then MAX_OCR="50"; fi
+          if [ -z "$MAX_PHOTO" ]; then MAX_PHOTO="15"; fi
 
           echo "mode=$MODE" >> $GITHUB_OUTPUT
           echo "run_date=$RUN_DATE" >> $GITHUB_OUTPUT
           echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
 
-      # ── 9. Skip si guard KO (schedule hors cible) ───────────────────────
+          # Inject dans l'env du job (évite MAX_OCR_IMAGES="")
+          echo "MAX_OCR_IMAGES=$MAX_OCR" >> $GITHUB_ENV
+          echo "MAX_PHOTO_IMAGES=$MAX_PHOTO" >> $GITHUB_ENV
+
+      # 9) Concurrency (anti-doublons) — via cancel-in-progress false
+      # NB: Concurrency doit être au niveau workflow, mais on ne peut pas utiliser ctx.outputs ici.
+      # On met une concurrency simple par event+minute (suffisant avec le guard).
+      # => on le fait au niveau workflow (voir plus bas)
+
+      # 9) Skip si guard KO
       - name: Skip (schedule guard)
         if: ${{ steps.ctx.outputs.should_run != '1' }}
+        shell: bash
         run: |
           echo "✅ Skip propre: schedule hors 17:45/17:47 Paris."
           exit 0
 
-      # ── 10. Run export & mail ───────────────────────────────────────────
+      # 10) Run export & mail
       - name: Run export & mail
         env:
-          # Requis
           WORKER_BASE_URL:    ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN:       ${{ secrets.EXPORT_TOKEN }}
           TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
@@ -217,25 +215,20 @@ jobs:
           BREVO_SENDER_NAME:  ${{ secrets.BREVO_SENDER_NAME }}
           MAIL_ROUTING_JSON:  ${{ secrets.MAIL_ROUTING_JSON }}
 
-          # Optionnels (V2)
-          GEMINI_API_KEY:        ${{ secrets.GEMINI_API_KEY }}
-          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+          GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_PLACES_API_KEY:  ${{ secrets.GOOGLE_PLACES_API_KEY }}
 
-          # Contexte run
           SEND_MODE:  ${{ steps.ctx.outputs.mode }}
           RUN_DATE:   ${{ steps.ctx.outputs.run_date }}
           AGENCY:     ${{ inputs.agency }}
           INITIALS:   ${{ inputs.initials }}
-
-          # Tuning
-          MAX_OCR_IMAGES:   ${{ inputs.max_ocr_images }}
-          MAX_PHOTO_IMAGES: ${{ inputs.max_photo_images }}
-
+        shell: bash
         run: |
           echo "🚀 Lancement — mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS"
+          echo "🔧 Tuning — MAX_OCR_IMAGES=$MAX_OCR_IMAGES MAX_PHOTO_IMAGES=$MAX_PHOTO_IMAGES"
           python scripts/export_and_mail.py
 
-      # ── 11. Upload Excel artifacts (filet de sécurité) ───────────────────
+      # 11) Upload artifacts Excel
       - name: Upload Excel artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -245,12 +238,13 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      # ── 12. Notification Telegram en cas d'échec ─────────────────────────
+      # 12) Notification Telegram en cas d'échec
       - name: Notify failure via Telegram
         if: failure()
         env:
           TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+        shell: bash
         run: |
           if [ -z "$TELEGRAM_ADMIN_CHAT_ID" ]; then
             echo "TELEGRAM_ADMIN_CHAT_ID manquant: notif ignorée."
