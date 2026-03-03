@@ -13,7 +13,7 @@ on:
           - agency_manager
           - admin
       run_date:
-        description: "YYYY-MM-DD Europe/Paris (laisser vide = aujourd'hui Paris)"
+        description: "YYYY-MM-DD Europe/Paris (vide = aujourd'hui Paris)"
         required: false
         type: string
       agency:
@@ -39,9 +39,13 @@ on:
     # HIVER (UTC+1) : 17:45 Paris = 16:45 UTC
     - cron: "45 16 * * 1-5"
     - cron: "47 16 * * 1-5"
-    # ÉTÉ  (UTC+2) : 17:45 Paris = 15:45 UTC
+    # ÉTÉ (UTC+2) : 17:45 Paris = 15:45 UTC
     - cron: "45 15 * * 1-5"
     - cron: "47 15 * * 1-5"
+
+concurrency:
+  group: prospection-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   export_and_mail:
@@ -49,10 +53,8 @@ jobs:
     timeout-minutes: 30
 
     steps:
-      # 0) Validation inputs (dispatch only)
       - name: Validate inputs (dispatch only)
         if: ${{ github.event_name == 'workflow_dispatch' }}
-        shell: bash
         run: |
           MODE="${{ inputs.mode }}"
           AGENCY="${{ inputs.agency }}"
@@ -65,14 +67,8 @@ jobs:
           fi
 
           if [ "$MODE" = "individual" ]; then
-            if [ -z "$AGENCY" ]; then
-              echo "::error::AGENCY requis pour mode=individual"
-              exit 1
-            fi
-            if [ -z "$INITIALS" ]; then
-              echo "::error::INITIALS requis pour mode=individual"
-              exit 1
-            fi
+            if [ -z "$AGENCY" ]; then echo "::error::AGENCY requis pour mode=individual"; exit 1; fi
+            if [ -z "$INITIALS" ]; then echo "::error::INITIALS requis pour mode=individual"; exit 1; fi
           fi
 
           if [ "$MODE" = "agency_manager" ] && [ -z "$AGENCY" ]; then
@@ -96,26 +92,21 @@ jobs:
 
           echo "✅ Inputs validés."
 
-      # 1) Checkout
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Python
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3) Cache APT (tesseract)
       - name: Cache apt packages
         uses: awalsh128/cache-apt-pkgs-action@latest
         with:
           packages: tesseract-ocr tesseract-ocr-fra libmagic1
           version: 1.0
 
-      # 4) Install deps système (fallback)
-      - name: Install system deps (tesseract + libmagic)
-        shell: bash
+      - name: Install system deps (fallback si cache miss)
         run: |
           if ! command -v tesseract >/dev/null 2>&1; then
             sudo apt-get update -qq
@@ -124,7 +115,6 @@ jobs:
             echo "✅ Tesseract déjà présent (cache)."
           fi
 
-      # 5) Cache pip
       - name: Cache pip
         uses: actions/cache@v4
         with:
@@ -133,25 +123,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pip-
 
-      # 6) Install python deps
       - name: Install python deps
-        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 7) Audit dépendances (non bloquant)
-      - name: Audit dependencies (CVE check)
-        continue-on-error: true
-        shell: bash
-        run: |
-          pip install pip-audit --quiet
-          pip-audit -r requirements.txt --desc on
-
-      # 8) Determine context (mode/date) + guard DST + resolve tuning
-      - name: Determine context (mode/date) + schedule guard + tuning
+      - name: Determine context (mode/date) + schedule guard
         id: ctx
-        shell: bash
         run: |
           MODE="${{ inputs.mode }}"
           RUN_DATE="${{ inputs.run_date }}"
@@ -177,74 +155,59 @@ jobs:
             RUN_DATE=$(TZ="Europe/Paris" date +%Y-%m-%d)
           fi
 
-          # Tuning: inputs n'existent pas en schedule => fallback dur
-          MAX_OCR="${{ inputs.max_ocr_images }}"
-          MAX_PHOTO="${{ inputs.max_photo_images }}"
-          if [ -z "$MAX_OCR" ]; then MAX_OCR="50"; fi
-          if [ -z "$MAX_PHOTO" ]; then MAX_PHOTO="15"; fi
-
           echo "mode=$MODE" >> $GITHUB_OUTPUT
           echo "run_date=$RUN_DATE" >> $GITHUB_OUTPUT
           echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
 
-          # Inject dans l'env du job (évite MAX_OCR_IMAGES="")
-          echo "MAX_OCR_IMAGES=$MAX_OCR" >> $GITHUB_ENV
-          echo "MAX_PHOTO_IMAGES=$MAX_PHOTO" >> $GITHUB_ENV
-
-      # 9) Concurrency (anti-doublons) — via cancel-in-progress false
-      # NB: Concurrency doit être au niveau workflow, mais on ne peut pas utiliser ctx.outputs ici.
-      # On met une concurrency simple par event+minute (suffisant avec le guard).
-      # => on le fait au niveau workflow (voir plus bas)
-
-      # 9) Skip si guard KO
       - name: Skip (schedule guard)
         if: ${{ steps.ctx.outputs.should_run != '1' }}
-        shell: bash
         run: |
           echo "✅ Skip propre: schedule hors 17:45/17:47 Paris."
           exit 0
 
-      # 10) Run export & mail
       - name: Run export & mail
         env:
-          WORKER_BASE_URL:    ${{ secrets.WORKER_BASE_URL }}
-          EXPORT_TOKEN:       ${{ secrets.EXPORT_TOKEN }}
-          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
-          BREVO_API_KEY:      ${{ secrets.BREVO_API_KEY }}
-          BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
-          BREVO_SENDER_NAME:  ${{ secrets.BREVO_SENDER_NAME }}
-          MAIL_ROUTING_JSON:  ${{ secrets.MAIL_ROUTING_JSON }}
+          WORKER_BASE_URL:        ${{ secrets.WORKER_BASE_URL }}
+          EXPORT_TOKEN:           ${{ secrets.EXPORT_TOKEN }}
+          TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
+
+          BREVO_API_KEY:          ${{ secrets.BREVO_API_KEY }}
+          BREVO_SENDER_EMAIL:     ${{ secrets.BREVO_SENDER_EMAIL }}
+          BREVO_SENDER_NAME:      ${{ secrets.BREVO_SENDER_NAME }}
+          MAIL_ROUTING_JSON:      ${{ secrets.MAIL_ROUTING_JSON }}
 
           GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_PLACES_API_KEY:  ${{ secrets.GOOGLE_PLACES_API_KEY }}
 
-          SEND_MODE:  ${{ steps.ctx.outputs.mode }}
-          RUN_DATE:   ${{ steps.ctx.outputs.run_date }}
-          AGENCY:     ${{ inputs.agency }}
-          INITIALS:   ${{ inputs.initials }}
-        shell: bash
+          SEND_MODE:              ${{ steps.ctx.outputs.mode }}
+          RUN_DATE:               ${{ steps.ctx.outputs.run_date }}
+          AGENCY:                 ${{ inputs.agency }}
+          INITIALS:               ${{ inputs.initials }}
+
+          # ✅ IMPORTANT: fallback pour schedule (inputs absents)
+          MAX_OCR_IMAGES:         ${{ inputs.max_ocr_images || '50' }}
+          MAX_PHOTO_IMAGES:       ${{ inputs.max_photo_images || '15' }}
+
         run: |
           echo "🚀 Lancement — mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS"
-          echo "🔧 Tuning — MAX_OCR_IMAGES=$MAX_OCR_IMAGES MAX_PHOTO_IMAGES=$MAX_PHOTO_IMAGES"
           python scripts/export_and_mail.py
 
-      # 11) Upload artifacts Excel
       - name: Upload Excel artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: prospection-${{ steps.ctx.outputs.mode }}-${{ steps.ctx.outputs.run_date }}-${{ github.run_id }}
-          path: "*.xlsx"
+          path: |
+            out/**/*.xlsx
+            out/**/*.zip
           retention-days: 7
           if-no-files-found: ignore
 
-      # 12) Notification Telegram en cas d'échec
       - name: Notify failure via Telegram
         if: failure()
         env:
           TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
-        shell: bash
         run: |
           if [ -z "$TELEGRAM_ADMIN_CHAT_ID" ]; then
             echo "TELEGRAM_ADMIN_CHAT_ID manquant: notif ignorée."
