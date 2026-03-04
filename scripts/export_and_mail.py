@@ -5,8 +5,8 @@ import io
 import base64
 import zipfile
 import datetime as dt
-from dataclasses import dataclass
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
+
 import requests
 
 from openpyxl import Workbook
@@ -35,9 +35,7 @@ def env_int(name: str, default: int) -> int:
     except Exception:
         return default
 
-def today_paris_ymd() -> str:
-    # GitHub runner UTC: on utilise RUN_DATE fourni par workflow sinon UTC date.
-    # Le workflow V2 fixe déjà RUN_DATE Europe/Paris.
+def today_ymd_utc() -> str:
     return dt.date.today().strftime("%Y-%m-%d")
 
 WORKER_BASE_URL    = env_str("WORKER_BASE_URL")
@@ -53,19 +51,21 @@ MAIL_ROUTING_JSON  = env_str("MAIL_ROUTING_JSON", "")  # override possible
 GOOGLE_PLACES_API_KEY = env_str("GOOGLE_PLACES_API_KEY", "")
 GEMINI_API_KEY        = env_str("GEMINI_API_KEY", "")
 
-SEND_MODE    = env_str("SEND_MODE", "individual")  # individual | agency_manager | admin
-RUN_DATE     = env_str("RUN_DATE", today_paris_ymd())
-AGENCY       = env_str("AGENCY", "").upper()       # GR|VR|GRS|SLS
-INITIALS     = env_str("INITIALS", "").upper()     # JL etc.
+SEND_MODE    = env_str("SEND_MODE", "individual").lower()  # individual | agency_manager | admin
+RUN_DATE     = env_str("RUN_DATE", today_ymd_utc())
+AGENCY       = env_str("AGENCY", "").upper()               # GR|VR|GRS|SLS
+INITIALS     = env_str("INITIALS", "").upper()             # JL etc.
 
-MAX_OCR_IMAGES   = env_int("MAX_OCR_IMAGES", 50)    # safe
-MAX_PHOTO_IMAGES = env_int("MAX_PHOTO_IMAGES", 15)  # safe
+MAX_OCR_IMAGES   = env_int("MAX_OCR_IMAGES", 50)
+MAX_PHOTO_IMAGES = env_int("MAX_PHOTO_IMAGES", 15)
 
-OUT_DIR = env_str("OUT_DIR", ".")  # GitHub artifacts will pickup *.xlsx
+OUT_DIR = env_str("OUT_DIR", ".")
 MEDIA_DIR = os.path.join(OUT_DIR, "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
 
 VALID_AGENCIES = {"GR", "VR", "GRS", "SLS"}
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 
 # ============================================================
@@ -91,8 +91,7 @@ DEFAULT_ROUTING = {
             "commercial": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"},
         },
     },
-    "admin": {"initials": "SL", "email": "samuel.lengue@ras-interim.fr"},
-    # mapping initials->email (facilite individual/media)
+    # format "users" string simple
     "users": {
         "JL": "jennifer.laurens@ras-interim.fr",
         "CZ": "celine.zunarelli@ras-interim.fr",
@@ -102,36 +101,69 @@ DEFAULT_ROUTING = {
         "ST": "severine.thevenin@ras-interim.fr",
         "AC": "aurelie.curt@ras-interim.fr",
         "SL": "samuel.lengue@ras-interim.fr",
-    }
+    },
+    "admin": {"initials": "SL", "email": "samuel.lengue@ras-interim.fr"},
 }
 
 def load_routing() -> Dict[str, Any]:
     if MAIL_ROUTING_JSON:
         try:
-            return json.loads(MAIL_ROUTING_JSON)
-        except Exception:
-            # fallback
-            return DEFAULT_ROUTING
+            data = json.loads(MAIL_ROUTING_JSON)
+            if isinstance(data, dict) and data:
+                return data
+        except Exception as e:
+            print(f"[WARN] MAIL_ROUTING_JSON invalid JSON, fallback default. err={e}")
     return DEFAULT_ROUTING
 
 ROUTING = load_routing()
 
+def clean_email(s: str) -> str:
+    # supprime tous les espaces (y compris au milieu)
+    s = (s or "").strip()
+    s = re.sub(r"\s+", "", s)
+    return s
+
+def is_valid_email(s: str) -> bool:
+    s = clean_email(s)
+    return bool(EMAIL_RE.match(s))
+
+def routing_user_email(initials: str) -> Optional[str]:
+    """
+    Supporte 2 formats:
+      users: { "SL": "mail@..." }
+      users: { "SL": {"email":"mail@...","agency":"...","role":"..."} }
+    """
+    initials = (initials or "").upper().strip()
+    users = ROUTING.get("users") or {}
+
+    if initials in users:
+        v = users[initials]
+        if isinstance(v, str):
+            em = clean_email(v)
+            return em if is_valid_email(em) else None
+        if isinstance(v, dict):
+            em = clean_email(v.get("email") or "")
+            return em if is_valid_email(em) else None
+    return None
 
 def email_for_initials(initials: str) -> Optional[str]:
     initials = (initials or "").upper().strip()
     if not initials:
         return None
-    # 1) routing users
-    users = ROUTING.get("users") or {}
-    if initials in users:
-        return users[initials]
+
+    # 1) users mapping (2 formats)
+    em = routing_user_email(initials)
+    if em:
+        return em
+
     # 2) scan agencies roles
     agencies = ROUTING.get("agencies") or {}
     for ag, cfg in agencies.items():
         for role in ("manager", "commercial"):
             r = (cfg or {}).get(role) or {}
-            if (r.get("initials") or "").upper() == initials and r.get("email"):
-                return r["email"]
+            if (r.get("initials") or "").upper() == initials:
+                em2 = clean_email(r.get("email") or "")
+                return em2 if is_valid_email(em2) else None
     return None
 
 
@@ -142,26 +174,28 @@ def email_for_initials(initials: str) -> Optional[str]:
 def worker_dump(kind: str, date: str) -> List[Dict[str, Any]]:
     """
     /dump returns JSON lines, one record per line.
+    kind: prospects|closes|photos|cards
     """
-    assert WORKER_BASE_URL and EXPORT_TOKEN
+    if not WORKER_BASE_URL or not EXPORT_TOKEN:
+        raise RuntimeError("Missing WORKER_BASE_URL / EXPORT_TOKEN")
     url = f"{WORKER_BASE_URL.rstrip('/')}/dump?date={date}&kind={kind}"
     r = requests.get(url, headers={"X-Export-Token": EXPORT_TOKEN}, timeout=20)
     if r.status_code != 200:
         raise RuntimeError(f"/dump failed {kind} {r.status_code}: {r.text[:200]}")
     lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
-    out = []
+    out: List[Dict[str, Any]] = []
     for ln in lines:
         try:
             out.append(json.loads(ln))
         except Exception:
-            # ignore bad line
             pass
     return out
-
 
 def tg_get_file_url(file_id: str) -> Optional[str]:
     if not file_id:
         return None
+    if not TELEGRAM_TOKEN:
+        raise RuntimeError("Missing TELEGRAM_TOKEN")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile"
     r = requests.post(url, json={"file_id": file_id}, timeout=15)
     j = r.json()
@@ -169,7 +203,6 @@ def tg_get_file_url(file_id: str) -> Optional[str]:
         return None
     fp = j["result"]["file_path"]
     return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fp}"
-
 
 def download_bytes(url: str) -> bytes:
     r = requests.get(url, timeout=30)
@@ -182,14 +215,13 @@ def download_bytes(url: str) -> bytes:
 # ============================================================
 
 PHONE_RE = re.compile(r"(\+33|0)\s*[1-9](?:[\s\.-]*\d{2}){4}")
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
+EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
 
 def normalize_phone(s: str) -> str:
     s = (s or "").strip()
     if not s:
         return ""
     s2 = re.sub(r"[^\d+]", "", s)
-    # keep +33 if present
     return s2
 
 def best_phone(text: str) -> str:
@@ -201,7 +233,7 @@ def best_phone(text: str) -> str:
 def best_email(text: str) -> str:
     if not text:
         return ""
-    m = EMAIL_RE.search(text)
+    m = EMAIL_IN_TEXT_RE.search(text)
     return (m.group(0).strip().lower()) if m else ""
 
 
@@ -210,14 +242,9 @@ def best_email(text: str) -> str:
 # ============================================================
 
 def places_retry_phone(name: str, city: str) -> str:
-    """
-    Worker already tries Places; here we retry in Python if phone is empty.
-    """
     if not GOOGLE_PLACES_API_KEY or not name:
         return ""
-
     try:
-        # searchText
         r1 = requests.post(
             "https://places.googleapis.com/v1/places:searchText",
             headers={
@@ -255,13 +282,12 @@ def places_retry_phone(name: str, city: str) -> str:
 
 
 # ============================================================
-# OCR + (optional) GEMINI
+# OCR + GEMINI (best effort)
 # ============================================================
 
 def ocr_image_bytes(img_bytes: bytes) -> str:
     try:
         im = Image.open(io.BytesIO(img_bytes))
-        # simple cleanup: convert to RGB
         if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
         txt = pytesseract.image_to_string(im, lang="fra+eng")
@@ -270,11 +296,6 @@ def ocr_image_bytes(img_bytes: bytes) -> str:
         return ""
 
 def gemini_extract_card(text: str) -> Dict[str, str]:
-    """
-    Minimal Gemini call (optional).
-    If GEMINI_API_KEY missing => fallback regex parsing.
-    """
-    # fallback
     out = {
         "email": best_email(text),
         "phone": best_phone(text),
@@ -285,16 +306,12 @@ def gemini_extract_card(text: str) -> Dict[str, str]:
     if not GEMINI_API_KEY or not text:
         return out
 
-    # Gemini REST (light) – best effort. If fails, keep fallback.
     try:
-        # Google Generative Language API endpoint may vary by model availability.
-        # We keep it resilient: if request fails => fallback.
         endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
         prompt = (
             "Tu es un extracteur de carte de visite.\n"
-            "A partir du texte OCR ci-dessous, retourne STRICTEMENT un JSON avec les clés:\n"
+            "Retourne STRICTEMENT un JSON avec les clés:\n"
             "name, company, title, email, phone\n"
-            "phone doit être au format FR si possible.\n"
             "Si inconnu, mets une chaîne vide.\n\n"
             f"TEXTE OCR:\n{text}\n"
         )
@@ -313,9 +330,7 @@ def gemini_extract_card(text: str) -> Dict[str, str]:
         for p in cand:
             if isinstance(p, dict) and p.get("text"):
                 raw += p["text"]
-
         raw = raw.strip()
-        # extract JSON block
         m = re.search(r"\{.*\}", raw, re.S)
         if not m:
             return out
@@ -341,13 +356,15 @@ def autosize(ws):
             v = ws.cell(row=row, column=col).value
             if v is None:
                 continue
-            max_len = max(max_len, len(str(v))[:80] if hasattr(len(str(v)), "__call__") else 10)
+            s = str(v)
+            if len(s) > 80:
+                s = s[:80]
+            max_len = max(max_len, len(s))
             max_len = min(max_len, 60)
         ws.column_dimensions[get_column_letter(col)].width = max_len
 
 def make_wb() -> Workbook:
     wb = Workbook()
-    # remove default sheet
     wb.remove(wb.active)
     return wb
 
@@ -357,7 +374,6 @@ def add_sheet_table(wb: Workbook, title: str, headers: List[str], rows: List[Lis
     for r in rows:
         ws.append(r)
 
-    # style header
     for c in range(1, len(headers) + 1):
         cell = ws.cell(row=1, column=c)
         cell.font = Font(bold=True)
@@ -374,26 +390,19 @@ def add_sheet_table(wb: Workbook, title: str, headers: List[str], rows: List[Lis
 
 def build_media_zip(date: str, agency: str, initials: str,
                     photos: List[Dict[str, Any]], cards: List[Dict[str, Any]]) -> Optional[Tuple[str, bytes]]:
-    """
-    Construit un zip contenant toutes les images (photos lieux + cartes)
-    + un fichier index.csv.
-    """
-    # filter to user
     photos_u = [p for p in photos if (p.get("agency") == agency and (p.get("user") or "").upper() == initials)]
     cards_u  = [c for c in cards  if (c.get("agency") == agency and (c.get("user") or "").upper() == initials)]
 
     if not photos_u and not cards_u:
         return None
 
-    # limits
     photos_u = photos_u[:MAX_PHOTO_IMAGES]
     cards_u  = cards_u[:MAX_OCR_IMAGES]
 
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        # index
         lines = ["type;file;date;agency;initials;city;comment;geo_lat;geo_lon"]
-        # photos
+
         for i, p in enumerate(photos_u, start=1):
             fid = p.get("file_id") or ""
             url = tg_get_file_url(fid)
@@ -404,13 +413,12 @@ def build_media_zip(date: str, agency: str, initials: str,
             z.writestr(fname, img)
 
             geo = p.get("geo") or {}
+            comment = p.get("comment") or p.get("meeting") or ""
             lines.append(
                 f"photo;{fname};{date};{agency};{initials};{(p.get('city') or '')};"
-                f"{(p.get('comment') or p.get('meeting') or '')};"
-                f"{geo.get('lat') or ''};{geo.get('lon') or ''}"
+                f"{comment};{geo.get('lat') or ''};{geo.get('lon') or ''}"
             )
 
-        # cards
         for i, c in enumerate(cards_u, start=1):
             fid = c.get("file_id") or ""
             url = tg_get_file_url(fid)
@@ -419,9 +427,7 @@ def build_media_zip(date: str, agency: str, initials: str,
             img = download_bytes(url)
             fname = f"cards/{date}_{agency}_{initials}_{i:02d}.jpg"
             z.writestr(fname, img)
-            lines.append(
-                f"card;{fname};{date};{agency};{initials};;{(c.get('comment') or '')};;"
-            )
+            lines.append(f"card;{fname};{date};{agency};{initials};;{(c.get('comment') or '')};;")
 
         z.writestr("index.csv", ("\n".join(lines)).encode("utf-8"))
 
@@ -436,6 +442,10 @@ def build_media_zip(date: str, agency: str, initials: str,
 def brevo_send_email(to_email: str, subject: str, html: str, attachments: Optional[List[Tuple[str, bytes]]] = None):
     if not BREVO_API_KEY:
         raise RuntimeError("BREVO_API_KEY missing")
+
+    to_email = clean_email(to_email)
+    if not is_valid_email(to_email):
+        raise RuntimeError(f"Invalid recipient email: '{to_email}'")
 
     payload = {
         "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
@@ -471,21 +481,9 @@ def brevo_send_email(to_email: str, subject: str, html: str, attachments: Option
 # DATA PREP
 # ============================================================
 
-def split_by_agency(records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    out: Dict[str, List[Dict[str, Any]]] = {}
-    for r in records:
-        ag = (r.get("agency") or "").upper()
-        if ag not in VALID_AGENCIES:
-            continue
-        out.setdefault(ag, []).append(r)
-    return out
-
 def uniq_users(records: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
-    """
-    Return unique (agency, initials) combos present in records.
-    """
     seen = set()
-    out = []
+    out: List[Tuple[str, str]] = []
     for r in records:
         ag = (r.get("agency") or "").upper()
         ini = (r.get("initials") or r.get("user") or "").upper()
@@ -530,15 +528,13 @@ CLOSE_HEADERS = [
     "declaratif", "closed_at"
 ]
 
-
 def rows_prospects(prospects: List[Dict[str, Any]]) -> List[List[Any]]:
     rows = []
     for p in prospects:
-        # retry phone if missing (optional)
         phone = (p.get("phone") or "").strip()
         if not phone:
-            phone = places_retry_phone(p.get("name") or p.get("nom") or "", p.get("city") or "")
-        row = [
+            phone = places_retry_phone(p.get("name") or "", p.get("city") or "")
+        rows.append([
             p.get("date", ""),
             (p.get("agency") or "").upper(),
             (p.get("initials") or "").upper(),
@@ -558,10 +554,8 @@ def rows_prospects(prospects: List[Dict[str, Any]]) -> List[List[Any]]:
             p.get("website", ""),
             p.get("resume", ""),
             p.get("commande", ""),
-        ]
-        rows.append(row)
+        ])
     return rows
-
 
 def rows_photos(photos: List[Dict[str, Any]]) -> List[List[Any]]:
     rows = []
@@ -579,7 +573,6 @@ def rows_photos(photos: List[Dict[str, Any]]) -> List[List[Any]]:
         ])
     return rows
 
-
 def rows_closes(closes: List[Dict[str, Any]]) -> List[List[Any]]:
     rows = []
     for c in closes:
@@ -595,16 +588,11 @@ def rows_closes(closes: List[Dict[str, Any]]) -> List[List[Any]]:
         ])
     return rows
 
-
 def rows_cards_with_ocr(cards: List[Dict[str, Any]]) -> List[List[Any]]:
-    """
-    OCR each card and extract fields.
-    """
     rows = []
-    for i, c in enumerate(cards[:MAX_OCR_IMAGES], start=1):
+    for c in cards[:MAX_OCR_IMAGES]:
         fid = c.get("file_id") or ""
         url = tg_get_file_url(fid)
-        ocr_txt = ""
         extracted = {"email": "", "phone": "", "name": "", "company": "", "title": ""}
 
         if url:
@@ -641,14 +629,10 @@ def build_excel(date: str,
                 cards: List[Dict[str, Any]],
                 title_suffix: str) -> str:
     wb = make_wb()
-
     add_sheet_table(wb, "PROSPECTS", PROSPECT_HEADERS, rows_prospects(prospects))
     add_sheet_table(wb, "CLOSES", CLOSE_HEADERS, rows_closes(closes))
-
-    # MEDIA sheets (metadata)
     add_sheet_table(wb, "PHOTOS", PHOTO_HEADERS, rows_photos(photos))
     add_sheet_table(wb, "CARDS", CARD_HEADERS, rows_cards_with_ocr(cards))
-
     filename = os.path.join(OUT_DIR, f"PROSPECTION_{date}_{title_suffix}.xlsx")
     wb.save(filename)
     return filename
@@ -668,15 +652,21 @@ def send_individual_pack(date: str, agency: str, initials: str,
         print(f"[WARN] No email for initials={initials}, skip individual pack.")
         return
 
-    # Filter to this user+agency
-    p_u = [p for p in prospects if (p.get("agency") == agency and (p.get("initials") or "").upper() == initials)]
-    c_u = [c for c in closes    if (c.get("agency") == agency and (c.get("initials") or "").upper() == initials)]
-    ph_u = [ph for ph in photos if (ph.get("agency") == agency and (ph.get("user") or "").upper() == initials)]
-    ca_u = [ca for ca in cards  if (ca.get("agency") == agency and (ca.get("user") or "").upper() == initials)]
+    initials = initials.upper().strip()
+
+    p_u  = [p  for p  in prospects if (p.get("agency") == agency and (p.get("initials") or "").upper() == initials)]
+    c_u  = [c  for c  in closes    if (c.get("agency") == agency and (c.get("initials") or "").upper() == initials)]
+    ph_u = [ph for ph in photos    if (ph.get("agency") == agency and (ph.get("user") or "").upper() == initials)]
+    ca_u = [ca for ca in cards     if (ca.get("agency") == agency and (ca.get("user") or "").upper() == initials)]
+
+    # Ne pas spammer si vraiment vide
+    if not p_u and not c_u and not ph_u and not ca_u:
+        print(f"[INFO] No activity for {agency}/{initials}, skip individual pack.")
+        return
 
     xlsx = build_excel(date, p_u, c_u, ph_u, ca_u, f"INDIV_{agency}_{initials}")
 
-    attachments = []
+    attachments: List[Tuple[str, bytes]] = []
     with open(xlsx, "rb") as f:
         attachments.append((os.path.basename(xlsx), f.read()))
 
@@ -694,6 +684,7 @@ def send_individual_pack(date: str, agency: str, initials: str,
         f"</ul>"
         f"<p>— Bot Prospection</p>"
     )
+
     brevo_send_email(to_email, subject, html, attachments=attachments)
     print(f"[OK] individual pack sent to {to_email} ({agency}/{initials})")
 
@@ -704,16 +695,16 @@ def send_agency_manager_pack(date: str, agency: str,
     agencies_cfg = ROUTING.get("agencies") or {}
     cfg = agencies_cfg.get(agency) or {}
     manager = (cfg.get("manager") or {})
-    to_email = manager.get("email")
-    if not to_email:
-        print(f"[WARN] No manager email for agency={agency}")
+    to_email = clean_email(manager.get("email") or "")
+
+    if not is_valid_email(to_email):
+        print(f"[WARN] No valid manager email for agency={agency} ({to_email})")
         return
 
-    # Agency consolidated (WITHOUT media attachments)
     p_ag = [p for p in prospects if (p.get("agency") == agency)]
     c_ag = [c for c in closes    if (c.get("agency") == agency)]
 
-    # For managers, we keep media sheets empty to match your current usage
+    # Managers : pas de médias joints (comme ton fonctionnement actuel)
     xlsx = build_excel(date, p_ag, c_ag, [], [], f"AGENCE_{agency}")
 
     with open(xlsx, "rb") as f:
@@ -726,19 +717,20 @@ def send_agency_manager_pack(date: str, agency: str,
         f"<p>(Médias non joints au consolidé agence — envoyés individuellement au preneur.)</p>"
         f"<p>— Bot Prospection</p>"
     )
+
     brevo_send_email(to_email, subject, html, attachments=attachments)
     print(f"[OK] agency manager pack sent to {to_email} (agency={agency})")
 
 
 def send_admin_pack(date: str, prospects: List[Dict[str, Any]], closes: List[Dict[str, Any]]):
     admin = ROUTING.get("admin") or {}
-    to_email = admin.get("email")
-    if not to_email:
-        print("[WARN] No admin email configured")
+    to_email = clean_email(admin.get("email") or "")
+
+    if not is_valid_email(to_email):
+        print(f"[WARN] No valid admin email configured ({to_email})")
         return
 
     xlsx = build_excel(date, prospects, closes, [], [], "ADMIN_ALL")
-
     with open(xlsx, "rb") as f:
         attachments = [(os.path.basename(xlsx), f.read())]
 
@@ -749,6 +741,7 @@ def send_admin_pack(date: str, prospects: List[Dict[str, Any]], closes: List[Dic
         f"<p>(Médias envoyés individuellement à chaque preneur, y compris SL lorsqu’il aide une agence.)</p>"
         f"<p>— Bot Prospection</p>"
     )
+
     brevo_send_email(to_email, subject, html, attachments=attachments)
     print(f"[OK] admin pack sent to {to_email}")
 
@@ -766,11 +759,11 @@ def main():
     prospects = worker_dump("prospects", RUN_DATE)
     closes    = worker_dump("closes",    RUN_DATE)
     photos    = worker_dump("photos",    RUN_DATE)
-    cards     = worker_dump("cards",     RUN_DATE)  # NEW V6
+    cards     = worker_dump("cards",     RUN_DATE)
 
-    # ========================================================
+    # ------------------------
     # MODE: individual
-    # ========================================================
+    # ------------------------
     if SEND_MODE == "individual":
         if AGENCY not in VALID_AGENCIES:
             raise RuntimeError("AGENCY required (GR|VR|GRS|SLS) for mode=individual")
@@ -780,38 +773,33 @@ def main():
         send_individual_pack(RUN_DATE, AGENCY, INITIALS, prospects, closes, photos, cards)
         return
 
-    # ========================================================
-    # MODE: agency_manager (scheduled 17:45)
-    # - send consolidé agence aux managers
-    # - send MEDIA packs à tous ceux qui ont pris des médias (photos/cards)
-    # ========================================================
+    # ------------------------
+    # MODE: agency_manager
+    # - consolidé agence aux managers
+    # - packs médias + packs perso aux preneurs (y compris SL si activité)
+    # ------------------------
     if SEND_MODE == "agency_manager":
-        # 1) managers consolidés par agence
         for ag in sorted(VALID_AGENCIES):
             send_agency_manager_pack(RUN_DATE, ag, prospects, closes)
 
-        # 2) MEDIA packs (photos/cards) à chaque preneur (important pour SL quand il aide)
-        media_users = set()
-        for (ag, ini) in uniq_users(photos) + uniq_users(cards):
-            media_users.add((ag, ini))
+        media_users: Set[Tuple[str, str]] = set(uniq_users(photos) + uniq_users(cards))
 
+        # Important : si quelqu’un n’a que des prospects (sans médias), il recevra via "individual" quand dispatch direct.
+        # Ici, on veut surtout garantir les médias.
         for ag, ini in sorted(media_users):
             send_individual_pack(RUN_DATE, ag, ini, prospects, closes, photos, cards)
 
         return
 
-    # ========================================================
-    # MODE: admin (scheduled 17:47)
-    # - send consolidé global à SL
-    # - send MEDIA packs à tous les preneurs (optionnel, mais utile)
-    # ========================================================
+    # ------------------------
+    # MODE: admin
+    # - consolidé global à SL
+    # - packs médias aux preneurs (utile)
+    # ------------------------
     if SEND_MODE == "admin":
         send_admin_pack(RUN_DATE, prospects, closes)
 
-        media_users = set()
-        for (ag, ini) in uniq_users(photos) + uniq_users(cards):
-            media_users.add((ag, ini))
-
+        media_users: Set[Tuple[str, str]] = set(uniq_users(photos) + uniq_users(cards))
         for ag, ini in sorted(media_users):
             send_individual_pack(RUN_DATE, ag, ini, prospects, closes, photos, cards)
 
