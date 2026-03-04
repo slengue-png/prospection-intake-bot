@@ -1,14 +1,27 @@
 name: Prospection - Export & Mail
 
 on:
-  schedule:
-    - cron: "45 16 * * *"   # ~18:45 France été / à ajuster si besoin
   workflow_dispatch:
     inputs:
+      mode:
+        description: "individual | agency_manager | admin"
+        required: false
+        default: "agency_manager"
       run_date:
-        description: "Date (YYYY-MM-DD). Vide = aujourd'hui"
+        description: "Date (YYYY-MM-DD). Vide = aujourd'hui (UTC runner)"
         required: false
         default: ""
+      agency:
+        description: "GR | VR | GRS | SLS (utile si mode=individual)"
+        required: false
+        default: ""
+      initials:
+        description: "Initiales (utile si mode=individual)"
+        required: false
+        default: ""
+  schedule:
+    # GitHub = UTC. Ajuste selon heure souhaitée FR.
+    - cron: "45 16 * * *"
 
 jobs:
   export:
@@ -22,7 +35,7 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - name: Run export
+      - name: Run export & mail
         env:
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
@@ -37,7 +50,9 @@ jobs:
 
           MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
 
-          SEND_MODE: "agency_manager"
+          SEND_MODE: ${{ inputs.mode }}
           RUN_DATE: ${{ inputs.run_date }}
+          AGENCY: ${{ inputs.agency }}
+          INITIALS: ${{ inputs.initials }}
         run: |
           python scripts/export_and_mail.py
