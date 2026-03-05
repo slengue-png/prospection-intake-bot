@@ -4,60 +4,70 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "Mode"
+        description: "Mode d'envoi"
         required: true
         default: "individual"
         type: choice
-        options: [individual, agency_manager, admin]
+        options:
+          - individual
+          - agency_manager
+          - admin
 
       run_date:
-        description: "Date (YYYY-MM-DD). Vide = aujourd'hui Europe/Paris"
+        description: "YYYY-MM-DD Europe/Paris (vide = aujourd'hui Paris)"
         required: false
-        default: ""
         type: string
 
       agency:
         description: "Agence (requis si individual)"
         required: false
+        default: "VR"
         type: choice
-        options: [GR, VR, GRS, SLS]
+        options:
+          - GR
+          - VR
+          - GRS
+          - SLS
 
       initials:
         description: "Initiales (requis si individual)"
         required: false
+        default: "SL"
         type: choice
-        options: [JL, CZ, JB, LB, PV, ST, AC, SL]
+        options:
+          - JL
+          - CZ
+          - JB
+          - LB
+          - PV
+          - ST
+          - AC
+          - SL
 
       debug:
-        description: "DEBUG (0/1)"
+        description: "DEBUG (1 = génère debug_*.jsonl dans out/)"
         required: false
         default: "0"
         type: choice
-        options: ["0","1"]
+        options:
+          - "0"
+          - "1"
 
-      max_ocr_images:
-        description: "Max cartes (OCR)"
-        required: false
-        default: "50"
-        type: string
-
-      max_photo_images:
-        description: "Max photos"
-        required: false
-        default: "15"
-        type: string
+  schedule:
+    - cron: "45 16 * * 1-5"
+    - cron: "47 16 * * 1-5"
+    - cron: "45 15 * * 1-5"
+    - cron: "47 15 * * 1-5"
 
 jobs:
   export_and_mail:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 30
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
@@ -71,27 +81,58 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Compute RUN_DATE Paris if empty
-        id: dates
-        run: |
-          RD="${{ inputs.run_date }}"
-          if [ -z "$RD" ]; then
-            RD=$(TZ="Europe/Paris" date +%Y-%m-%d)
-          fi
-          echo "run_date=$RD" >> $GITHUB_OUTPUT
-
-      - name: Validate inputs
+      - name: Resolve context (schedule vs manual)
+        id: ctx
         run: |
           MODE="${{ inputs.mode }}"
+          RUN_DATE="${{ inputs.run_date }}"
           AGENCY="${{ inputs.agency }}"
           INITIALS="${{ inputs.initials }}"
+          DEBUG="${{ inputs.debug }}"
+
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PARIS_HOUR=$(TZ="Europe/Paris" date +%H)
+            PARIS_MIN=$(TZ="Europe/Paris" date +%M)
+
+            if [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "45" ]; then
+              MODE="agency_manager"
+            elif [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "47" ]; then
+              MODE="admin"
+            else
+              echo "should_run=0" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          if [ -z "$RUN_DATE" ]; then
+            RUN_DATE=$(TZ="Europe/Paris" date +%Y-%m-%d)
+          fi
+
+          echo "should_run=1" >> $GITHUB_OUTPUT
+          echo "mode=$MODE" >> $GITHUB_OUTPUT
+          echo "run_date=$RUN_DATE" >> $GITHUB_OUTPUT
+          echo "agency=$AGENCY" >> $GITHUB_OUTPUT
+          echo "initials=$INITIALS" >> $GITHUB_OUTPUT
+          echo "debug=$DEBUG" >> $GITHUB_OUTPUT
+
+      - name: Skip (schedule guard)
+        if: ${{ steps.ctx.outputs.should_run != '1' }}
+        run: echo "Skip propre."
+
+      - name: Validate manual inputs
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          MODE="${{ steps.ctx.outputs.mode }}"
+          AGENCY="${{ steps.ctx.outputs.agency }}"
+          INITIALS="${{ steps.ctx.outputs.initials }}"
 
           if [ "$MODE" = "individual" ]; then
-            if [ -z "$AGENCY" ]; then echo "::error::AGENCY requis pour mode=individual"; exit 1; fi
-            if [ -z "$INITIALS" ]; then echo "::error::INITIALS requis pour mode=individual"; exit 1; fi
+            if [ -z "$AGENCY" ]; then echo "::error::AGENCY requis"; exit 1; fi
+            if [ -z "$INITIALS" ]; then echo "::error::INITIALS requis"; exit 1; fi
           fi
 
       - name: Run export & mail
+        if: ${{ steps.ctx.outputs.should_run == '1' }}
         env:
           WORKER_BASE_URL:        ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN:           ${{ secrets.EXPORT_TOKEN }}
@@ -105,28 +146,29 @@ jobs:
           GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_PLACES_API_KEY:  ${{ secrets.GOOGLE_PLACES_API_KEY }}
 
-          SEND_MODE:              ${{ inputs.mode }}
-          RUN_DATE:               ${{ steps.dates.outputs.run_date }}
-          AGENCY:                 ${{ inputs.agency }}
-          INITIALS:               ${{ inputs.initials }}
-
-          MAX_OCR_IMAGES:         ${{ inputs.max_ocr_images }}
-          MAX_PHOTO_IMAGES:       ${{ inputs.max_photo_images }}
+          SEND_MODE:              ${{ steps.ctx.outputs.mode }}
+          RUN_DATE:               ${{ steps.ctx.outputs.run_date }}
+          AGENCY:                 ${{ steps.ctx.outputs.agency }}
+          INITIALS:               ${{ steps.ctx.outputs.initials }}
 
           OUT_DIR:                out
-          DEBUG:                  ${{ inputs.debug }}
+          DEBUG:                  ${{ steps.ctx.outputs.debug }}
+
+          MAX_OCR_IMAGES:         "50"
+          MAX_PHOTO_IMAGES:       "15"
 
         run: |
-          echo "🚀 mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS debug=$DEBUG"
+          echo "🚀 Lancement — mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS debug=$DEBUG"
           python scripts/export_and_mail.py
 
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prospection-${{ inputs.mode }}-${{ steps.dates.outputs.run_date }}-${{ github.run_id }}
+          name: prospection-${{ steps.ctx.outputs.mode }}-${{ steps.ctx.outputs.run_date }}-${{ github.run_id }}
           path: |
             out/**/*.xlsx
             out/**/*.zip
+            out/**/*.jsonl
           retention-days: 7
-          if-no-files-found: warn
+          if-no-files-found: ignore
