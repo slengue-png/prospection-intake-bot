@@ -1,58 +1,143 @@
-name: Prospection - Export & Mail
+name: Prospection Export
 
 on:
   workflow_dispatch:
     inputs:
+
       mode:
-        description: "individual | agency_manager | admin"
-        required: false
-        default: "agency_manager"
+        description: "Mode d'envoi"
+        type: choice
+        required: true
+        default: individual
+        options:
+          - individual
+          - agency_manager
+          - admin
+
       run_date:
-        description: "Date (YYYY-MM-DD). Vide = aujourd'hui (UTC runner)"
+        description: "Date (YYYY-MM-DD) — vide = aujourd'hui Europe/Paris"
+        type: string
         required: false
         default: ""
+
       agency:
-        description: "GR | VR | GRS | SLS (utile si mode=individual)"
+        description: "Agence (utile si mode=individual)"
+        type: choice
         required: false
-        default: ""
+        default: VR
+        options:
+          - GR
+          - VR
+          - GRS
+          - SLS
+
       initials:
         description: "Initiales (utile si mode=individual)"
+        type: choice
         required: false
-        default: ""
+        default: SL
+        options:
+          - JL
+          - CZ
+          - JB
+          - LB
+          - PV
+          - ST
+          - AC
+          - SL
+
+
   schedule:
-    # GitHub = UTC. Ajuste selon heure souhaitée FR.
-    - cron: "45 16 * * *"
+    # Déclenche toutes les 15 minutes
+    # Le script décidera si c'est 17h45 ou 23h59 Paris
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: prospection-export
+  cancel-in-progress: false
+
 
 jobs:
   export:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - run: pip install -r requirements.txt
 
-      - name: Run export & mail
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+
+
+      - name: Compute RUN_DATE (Europe/Paris)
+        id: date
+        shell: bash
+        run: |
+          if [ -n "${{ inputs.run_date }}" ]; then
+            echo "RUN_DATE=${{ inputs.run_date }}" >> $GITHUB_OUTPUT
+          else
+            echo "RUN_DATE=$(TZ=Europe/Paris date +%F)" >> $GITHUB_OUTPUT
+          fi
+
+
+      - name: Debug inputs
+        run: |
+          echo "MODE=${{ inputs.mode }}"
+          echo "DATE=${{ steps.date.outputs.RUN_DATE }}"
+          echo "AGENCY=${{ inputs.agency }}"
+          echo "INITIALS=${{ inputs.initials }}"
+
+
+      - name: Run export
         env:
+
+          # =========================
+          # Worker / Telegram
+          # =========================
+
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
 
-          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # =========================
+          # Brevo Mail
+          # =========================
 
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
           BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
-          BREVO_SENDER_NAME: "Prospection Bot"
+          BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
+
+          # =========================
+          # Enrichissement
+          # =========================
+
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+
+          # =========================
+          # Routing (optionnel)
+          # =========================
 
           MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
 
+          # =========================
+          # Paramètres export
+          # =========================
+
           SEND_MODE: ${{ inputs.mode }}
-          RUN_DATE: ${{ inputs.run_date }}
+          RUN_DATE: ${{ steps.date.outputs.RUN_DATE }}
           AGENCY: ${{ inputs.agency }}
           INITIALS: ${{ inputs.initials }}
+
         run: |
           python scripts/export_and_mail.py
