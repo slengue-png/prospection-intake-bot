@@ -4,171 +4,92 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "individual | agency_manager | admin"
+        description: "Mode"
         required: true
         default: "individual"
         type: choice
-        options:
-          - individual
-          - agency_manager
-          - admin
+        options: [individual, agency_manager, admin]
+
       run_date:
-        description: "YYYY-MM-DD Europe/Paris (vide = aujourd'hui Paris)"
+        description: "Date (YYYY-MM-DD). Vide = aujourd'hui Europe/Paris"
         required: false
+        default: ""
         type: string
 
       agency:
-        description: "GR | VR | GRS | SLS (requis si individual)"
+        description: "Agence (requis si individual)"
         required: false
         type: choice
-        options:
-          - GR
-          - VR
-          - GRS
-          - SLS
+        options: [GR, VR, GRS, SLS]
 
       initials:
-        description: "JL, CZ, JB, LB, PV, ST, AC, SL (requis si individual)"
+        description: "Initiales (requis si individual)"
         required: false
         type: choice
-        options:
-          - JL
-          - CZ
-          - JB
-          - LB
-          - PV
-          - ST
-          - AC
-          - SL
+        options: [JL, CZ, JB, LB, PV, ST, AC, SL]
+
+      debug:
+        description: "DEBUG (0/1)"
+        required: false
+        default: "0"
+        type: choice
+        options: ["0","1"]
 
       max_ocr_images:
-        description: "Nb max images OCR (defaut: 50)"
+        description: "Max cartes (OCR)"
         required: false
         default: "50"
         type: string
+
       max_photo_images:
-        description: "Nb max images mode photo (defaut: 15)"
+        description: "Max photos"
         required: false
         default: "15"
         type: string
 
-  schedule:
-    # HIVER (UTC+1) : 17:45 Paris = 16:45 UTC
-    - cron: "45 16 * * 1-5"
-    - cron: "47 16 * * 1-5"
-    # ÉTÉ (UTC+2) : 17:45 Paris = 15:45 UTC
-    - cron: "45 15 * * 1-5"
-    - cron: "47 15 * * 1-5"
-
-concurrency:
-  group: prospection-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: false
-
 jobs:
   export_and_mail:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
-      - name: Validate inputs (dispatch only)
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        run: |
-          MODE="${{ inputs.mode }}"
-          AGENCY="${{ inputs.agency }}"
-          INITIALS="${{ inputs.initials }}"
-          RUN_DATE="${{ inputs.run_date }}"
-
-          if [[ ! "$MODE" =~ ^(individual|agency_manager|admin)$ ]]; then
-            echo "::error::mode invalide: '$MODE' (individual|agency_manager|admin)"
-            exit 1
-          fi
-
-          if [ "$MODE" = "individual" ]; then
-            if [ -z "$AGENCY" ]; then echo "::error::AGENCY requis pour mode=individual"; exit 1; fi
-            if [ -z "$INITIALS" ]; then echo "::error::INITIALS requis pour mode=individual"; exit 1; fi
-          fi
-
-          if [ -n "$RUN_DATE" ]; then
-            if ! [[ "$RUN_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-              echo "::error::RUN_DATE invalide: '$RUN_DATE' (YYYY-MM-DD)"
-              exit 1
-            fi
-          fi
-
-          echo "✅ Inputs validés."
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Cache apt packages
-        uses: awalsh128/cache-apt-pkgs-action@latest
-        with:
-          packages: tesseract-ocr tesseract-ocr-fra
-          version: 1.0
-
-      - name: Install system deps (fallback si cache miss)
+      - name: Install system deps (tesseract)
         run: |
-          if ! command -v tesseract >/dev/null 2>&1; then
-            sudo apt-get update -qq
-            sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
-          else
-            echo "✅ Tesseract déjà présent (cache)."
-          fi
-
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          sudo apt-get update -qq
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra
 
       - name: Install python deps
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Determine context (mode/date) + schedule guard
-        id: ctx
+      - name: Compute RUN_DATE Paris if empty
+        id: dates
+        run: |
+          RD="${{ inputs.run_date }}"
+          if [ -z "$RD" ]; then
+            RD=$(TZ="Europe/Paris" date +%Y-%m-%d)
+          fi
+          echo "run_date=$RD" >> $GITHUB_OUTPUT
+
+      - name: Validate inputs
         run: |
           MODE="${{ inputs.mode }}"
-          RUN_DATE="${{ inputs.run_date }}"
-          SHOULD_RUN="1"
+          AGENCY="${{ inputs.agency }}"
+          INITIALS="${{ inputs.initials }}"
 
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            PARIS_HOUR=$(TZ="Europe/Paris" date +%H)
-            PARIS_MIN=$(TZ="Europe/Paris" date +%M)
-            echo "⏰ Paris now: ${PARIS_HOUR}:${PARIS_MIN}"
-
-            if [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "45" ]; then
-              MODE="agency_manager"
-            elif [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "47" ]; then
-              MODE="admin"
-            else
-              SHOULD_RUN="0"
-              MODE="skip"
-              echo "🟡 Guard: pas l'heure cible (17:45/17:47 Paris). Run ignoré."
-            fi
+          if [ "$MODE" = "individual" ]; then
+            if [ -z "$AGENCY" ]; then echo "::error::AGENCY requis pour mode=individual"; exit 1; fi
+            if [ -z "$INITIALS" ]; then echo "::error::INITIALS requis pour mode=individual"; exit 1; fi
           fi
-
-          if [ -z "$RUN_DATE" ]; then
-            RUN_DATE=$(TZ="Europe/Paris" date +%Y-%m-%d)
-          fi
-
-          echo "mode=$MODE" >> $GITHUB_OUTPUT
-          echo "run_date=$RUN_DATE" >> $GITHUB_OUTPUT
-          echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
-
-      - name: Skip (schedule guard)
-        if: ${{ steps.ctx.outputs.should_run != '1' }}
-        run: |
-          echo "✅ Skip propre: schedule hors 17:45/17:47 Paris."
-          exit 0
 
       - name: Run export & mail
         env:
@@ -184,56 +105,28 @@ jobs:
           GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
           GOOGLE_PLACES_API_KEY:  ${{ secrets.GOOGLE_PLACES_API_KEY }}
 
-          SEND_MODE:              ${{ steps.ctx.outputs.mode }}
-          RUN_DATE:               ${{ steps.ctx.outputs.run_date }}
+          SEND_MODE:              ${{ inputs.mode }}
+          RUN_DATE:               ${{ steps.dates.outputs.run_date }}
           AGENCY:                 ${{ inputs.agency }}
           INITIALS:               ${{ inputs.initials }}
 
-          MAX_OCR_IMAGES:         ${{ inputs.max_ocr_images || '50' }}
-          MAX_PHOTO_IMAGES:       ${{ inputs.max_photo_images || '15' }}
+          MAX_OCR_IMAGES:         ${{ inputs.max_ocr_images }}
+          MAX_PHOTO_IMAGES:       ${{ inputs.max_photo_images }}
 
-          # ✅ IMPORTANT: on évite 'out' (souvent fichier dans repo)
-          OUT_DIR:                exports
+          OUT_DIR:                out
+          DEBUG:                  ${{ inputs.debug }}
 
         run: |
-          echo "🚀 Lancement — mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS"
+          echo "🚀 mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS debug=$DEBUG"
           python scripts/export_and_mail.py
 
-      - name: Upload Excel artifacts
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: prospection-${{ steps.ctx.outputs.mode }}-${{ steps.ctx.outputs.run_date }}-${{ github.run_id }}
+          name: prospection-${{ inputs.mode }}-${{ steps.dates.outputs.run_date }}-${{ github.run_id }}
           path: |
-            exports/**/*.xlsx
-            exports/**/*.zip
+            out/**/*.xlsx
+            out/**/*.zip
           retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Notify failure via Telegram
-        if: failure()
-        env:
-          TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
-        run: |
-          if [ -z "$TELEGRAM_ADMIN_CHAT_ID" ]; then
-            echo "TELEGRAM_ADMIN_CHAT_ID manquant: notif ignorée."
-            exit 0
-          fi
-
-          MSG="⚠️ *Workflow PROSPECTION FAILED*%0A"
-          MSG="${MSG}Mode : ${{ steps.ctx.outputs.mode }}%0A"
-          MSG="${MSG}Date : ${{ steps.ctx.outputs.run_date }}%0A"
-          MSG="${MSG}Agency : ${{ inputs.agency }}%0A"
-          MSG="${MSG}Run ID : ${{ github.run_id }}%0A"
-          MSG="${MSG}Repo : ${{ github.repository }}%0A"
-          MSG="${MSG}Lien : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
-          curl -s -X POST \
-            "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-            -d "chat_id=${TELEGRAM_ADMIN_CHAT_ID}" \
-            -d "text=${MSG}" \
-            -d "parse_mode=Markdown" \
-            --max-time 10 \
-            --retry 3 \
-            --retry-delay 2
+          if-no-files-found: warn
