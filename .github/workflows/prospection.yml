@@ -4,47 +4,65 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "individual | agency_manager | admin"
+        description: "Mode d'envoi"
         required: true
-        default: "individual"
+        default: individual
         type: choice
         options:
           - individual
           - agency_manager
           - admin
+
       run_date:
         description: "YYYY-MM-DD Europe/Paris (vide = aujourd'hui Paris)"
         required: false
+        default: ""
         type: string
+
       agency:
-        description: "GR | VR | GRS | SLS (requis si individual ou agency_manager)"
+        description: "Agence (requis si individual)"
         required: false
-        type: string
+        default: VR
+        type: choice
+        options:
+          - GR
+          - VR
+          - GRS
+          - SLS
+
       initials:
-        description: "Ex: JL, CZ, JB, LB, PV, ST, AC, SL (requis si individual)"
+        description: "Initiales (requis si individual)"
         required: false
-        type: string
+        default: SL
+        type: choice
+        options:
+          - JL
+          - CZ
+          - JB
+          - LB
+          - PV
+          - ST
+          - AC
+          - SL
+
       max_ocr_images:
-        description: "Nb max images OCR (defaut: 50)"
+        description: "Nb max cartes (defaut: 50)"
         required: false
         default: "50"
         type: string
+
       max_photo_images:
-        description: "Nb max images mode photo (defaut: 15)"
+        description: "Nb max photos (defaut: 15)"
         required: false
         default: "15"
         type: string
 
   schedule:
-    # HIVER (UTC+1) : 17:45 Paris = 16:45 UTC
-    - cron: "45 16 * * 1-5"
-    - cron: "47 16 * * 1-5"
-    # ÉTÉ (UTC+2) : 17:45 Paris = 15:45 UTC
-    - cron: "45 15 * * 1-5"
-    - cron: "47 15 * * 1-5"
+    # On lance souvent, et on garde un "guard" Paris => 17:45 et 23:59
+    - cron: "*/5 * * * 1-5"
 
 concurrency:
-  group: prospection-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  group: prospection-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -55,6 +73,7 @@ jobs:
     steps:
       - name: Validate inputs (dispatch only)
         if: ${{ github.event_name == 'workflow_dispatch' }}
+        shell: bash
         run: |
           MODE="${{ inputs.mode }}"
           AGENCY="${{ inputs.agency }}"
@@ -62,7 +81,7 @@ jobs:
           RUN_DATE="${{ inputs.run_date }}"
 
           if [[ ! "$MODE" =~ ^(individual|agency_manager|admin)$ ]]; then
-            echo "::error::mode invalide: '$MODE' (individual|agency_manager|admin)"
+            echo "::error::mode invalide: '$MODE'"
             exit 1
           fi
 
@@ -71,21 +90,9 @@ jobs:
             if [ -z "$INITIALS" ]; then echo "::error::INITIALS requis pour mode=individual"; exit 1; fi
           fi
 
-          if [ "$MODE" = "agency_manager" ] && [ -z "$AGENCY" ]; then
-            echo "::error::AGENCY requis pour mode=agency_manager"
-            exit 1
-          fi
-
           if [ -n "$RUN_DATE" ]; then
             if ! [[ "$RUN_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
               echo "::error::RUN_DATE invalide: '$RUN_DATE' (YYYY-MM-DD)"
-              exit 1
-            fi
-          fi
-
-          if [ -n "$AGENCY" ]; then
-            if [[ ! "$AGENCY" =~ ^(GR|VR|GRS|SLS)$ ]]; then
-              echo "::error::AGENCY invalide: '$AGENCY' (GR|VR|GRS|SLS)"
               exit 1
             fi
           fi
@@ -107,6 +114,7 @@ jobs:
           version: 1.0
 
       - name: Install system deps (fallback si cache miss)
+        shell: bash
         run: |
           if ! command -v tesseract >/dev/null 2>&1; then
             sudo apt-get update -qq
@@ -115,39 +123,38 @@ jobs:
             echo "✅ Tesseract déjà présent (cache)."
           fi
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install python deps
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Determine context (mode/date) + schedule guard
         id: ctx
+        shell: bash
         run: |
           MODE="${{ inputs.mode }}"
           RUN_DATE="${{ inputs.run_date }}"
           SHOULD_RUN="1"
 
+          # si schedule: on déclenche seulement aux heures cibles Paris
           if [ "${{ github.event_name }}" = "schedule" ]; then
             PARIS_HOUR=$(TZ="Europe/Paris" date +%H)
             PARIS_MIN=$(TZ="Europe/Paris" date +%M)
             echo "⏰ Paris now: ${PARIS_HOUR}:${PARIS_MIN}"
 
+            # 17:45 => agency_manager
             if [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "45" ]; then
               MODE="agency_manager"
-            elif [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "47" ]; then
+
+            # 23:59 => admin
+            elif [ "$PARIS_HOUR" = "23" ] && [ "$PARIS_MIN" = "59" ]; then
               MODE="admin"
+
             else
               SHOULD_RUN="0"
               MODE="skip"
-              echo "🟡 Guard: pas l'heure cible (17:45/17:47 Paris). Run ignoré."
+              echo "🟡 Guard: pas l'heure cible (17:45 ou 23:59 Paris)."
             fi
           fi
 
@@ -162,7 +169,7 @@ jobs:
       - name: Skip (schedule guard)
         if: ${{ steps.ctx.outputs.should_run != '1' }}
         run: |
-          echo "✅ Skip propre: schedule hors 17:45/17:47 Paris."
+          echo "✅ Skip propre: schedule hors 17:45/23:59 Paris."
           exit 0
 
       - name: Run export & mail
@@ -184,10 +191,13 @@ jobs:
           AGENCY:                 ${{ inputs.agency }}
           INITIALS:               ${{ inputs.initials }}
 
-          # ✅ IMPORTANT: fallback pour schedule (inputs absents)
-          MAX_OCR_IMAGES:         ${{ inputs.max_ocr_images || '50' }}
-          MAX_PHOTO_IMAGES:       ${{ inputs.max_photo_images || '15' }}
+          MAX_OCR_IMAGES:         ${{ inputs.max_ocr_images }}
+          MAX_PHOTO_IMAGES:       ${{ inputs.max_photo_images }}
 
+          # ✅ IMPORTANT : on force le script à écrire dans /out
+          OUT_DIR:                out
+
+        shell: bash
         run: |
           echo "🚀 Lancement — mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS"
           python scripts/export_and_mail.py
@@ -208,25 +218,26 @@ jobs:
         env:
           TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_ADMIN_CHAT_ID: ${{ secrets.TELEGRAM_ADMIN_CHAT_ID }}
+        shell: bash
         run: |
           if [ -z "$TELEGRAM_ADMIN_CHAT_ID" ]; then
             echo "TELEGRAM_ADMIN_CHAT_ID manquant: notif ignorée."
             exit 0
           fi
 
-          MSG="⚠️ *Workflow PROSPECTION FAILED*%0A"
-          MSG="${MSG}Mode : ${{ steps.ctx.outputs.mode }}%0A"
-          MSG="${MSG}Date : ${{ steps.ctx.outputs.run_date }}%0A"
-          MSG="${MSG}Agency : ${{ inputs.agency }}%0A"
-          MSG="${MSG}Run ID : ${{ github.run_id }}%0A"
-          MSG="${MSG}Repo : ${{ github.repository }}%0A"
+          MSG="⚠️ Workflow PROSPECTION FAILED\n"
+          MSG="${MSG}Mode : ${{ steps.ctx.outputs.mode }}\n"
+          MSG="${MSG}Date : ${{ steps.ctx.outputs.run_date }}\n"
+          MSG="${MSG}Agency : ${{ inputs.agency }}\n"
+          MSG="${MSG}Run ID : ${{ github.run_id }}\n"
+          MSG="${MSG}Repo : ${{ github.repository }}\n"
           MSG="${MSG}Lien : https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           curl -s -X POST \
             "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             -d "chat_id=${TELEGRAM_ADMIN_CHAT_ID}" \
-            -d "text=${MSG}" \
-            -d "parse_mode=Markdown" \
+            --data-urlencode "text=${MSG}" \
+            -d "parse_mode=HTML" \
             --max-time 10 \
             --retry 3 \
             --retry-delay 2
