@@ -1,5 +1,10 @@
 openpyxl==3.1.5
-pillow==11.1.0
-pytesseract==0.3.10
+PyYAML==6.0.2
+pillow==10.4.0
 requests==2.32.3
-python-magic==0.4.27
+
+easyocr==1.7.1
+torch==2.2.2
+torchvision==0.17.2
+numpy==1.26.4
+opencv-python-headless==4.9.0.80
