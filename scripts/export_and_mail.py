@@ -8,7 +8,8 @@ import datetime as dt
 from typing import Dict, List, Any, Optional, Tuple, Set
 
 import requests
-from PIL import Image, ImageOps, ImageEnhance
+from PIL import Image, ImageOps, ImageFilter
+
 import pytesseract
 
 from openpyxl import Workbook
@@ -38,8 +39,6 @@ def env_int(name: str, default: int) -> int:
 def today_ymd_utc() -> str:
     return dt.date.today().strftime("%Y-%m-%d")
 
-def truthy(s: str) -> bool:
-    return str(s or "").strip().lower() in {"1","true","yes","y","on"}
 
 WORKER_BASE_URL    = env_str("WORKER_BASE_URL")
 EXPORT_TOKEN       = env_str("EXPORT_TOKEN")
@@ -48,6 +47,7 @@ TELEGRAM_TOKEN     = env_str("TELEGRAM_TOKEN")
 BREVO_API_KEY      = env_str("BREVO_API_KEY")
 BREVO_SENDER_EMAIL = env_str("BREVO_SENDER_EMAIL", "no-reply@example.com")
 BREVO_SENDER_NAME  = env_str("BREVO_SENDER_NAME",  "Prospection Bot")
+
 MAIL_ROUTING_JSON  = env_str("MAIL_ROUTING_JSON", "")
 
 GOOGLE_PLACES_API_KEY = env_str("GOOGLE_PLACES_API_KEY", "")
@@ -62,29 +62,30 @@ MAX_OCR_IMAGES   = env_int("MAX_OCR_IMAGES", 50)
 MAX_PHOTO_IMAGES = env_int("MAX_PHOTO_IMAGES", 15)
 
 OUT_DIR = env_str("OUT_DIR", "out").strip() or "out"
-DEBUG = truthy(env_str("DEBUG", "0"))
-
-# ✅ Anti-crash OUT_DIR
 if os.path.exists(OUT_DIR) and not os.path.isdir(OUT_DIR):
     print(f"[WARN] OUT_DIR='{OUT_DIR}' existe mais n'est pas un dossier. Fallback -> 'exports'")
     OUT_DIR = "exports"
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# debug (tu peux mettre DEBUG=1 en env pour générer un jsonl avec détails extraction)
+DEBUG = env_str("DEBUG", "0") == "1"
+
 VALID_AGENCIES = {"GR", "VR", "GRS", "SLS"}
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
-PHONE_RE = re.compile(r"(\+33|0)\s*[1-9](?:[\s\.-]*\d{2}){4}")
 EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"(\+33|0)\s*[1-9](?:[\s\.-]*\d{2}){4}")
+SIRET_RE = re.compile(r"\b\d{14}\b")
+POSTAL_RE = re.compile(r"\b(\d{5})\b")
 
+URL_RE = re.compile(r"\bhttps?://[^\s]+|\bwww\.[^\s]+", re.I)
+
+# 1 seul onglet (format cible)
 HEADERS = [
     "date","agency","initials","name","address","postal_code","city",
     "siret","naf","dirigeant","interlocuteur","contact_firstname","contact_lastname",
     "phone","phone2","email","website","resume","commande"
 ]
-
-def dlog(msg: str):
-    if DEBUG:
-        print(msg)
 
 
 # ============================================================
@@ -136,28 +137,18 @@ def is_valid_email(s: str) -> bool:
     s = clean_email(s)
     return bool(EMAIL_RE.match(s))
 
-def routing_user_email(initials: str) -> Optional[str]:
-    initials = (initials or "").upper().strip()
-    users = ROUTING.get("users") or {}
-    if initials in users:
-        v = users[initials]
-        if isinstance(v, str):
-            em = clean_email(v)
-            return em if is_valid_email(em) else None
-        if isinstance(v, dict):
-            em = clean_email(v.get("email") or "")
-            return em if is_valid_email(em) else None
-    return None
-
 def email_for_initials(initials: str) -> Optional[str]:
     initials = (initials or "").upper().strip()
     if not initials:
         return None
-    em = routing_user_email(initials)
-    if em:
-        return em
+
+    users = ROUTING.get("users") or {}
+    if initials in users:
+        em = clean_email(users[initials] if isinstance(users[initials], str) else (users[initials] or {}).get("email",""))
+        return em if is_valid_email(em) else None
+
     agencies = ROUTING.get("agencies") or {}
-    for ag, cfg in agencies.items():
+    for _, cfg in agencies.items():
         for role in ("manager","commercial"):
             r = (cfg or {}).get(role) or {}
             if (r.get("initials") or "").upper() == initials:
@@ -174,7 +165,7 @@ def worker_dump(kind: str, date: str) -> List[Dict[str, Any]]:
     if not WORKER_BASE_URL or not EXPORT_TOKEN:
         raise RuntimeError("Missing WORKER_BASE_URL / EXPORT_TOKEN")
     url = f"{WORKER_BASE_URL.rstrip('/')}/dump?date={date}&kind={kind}"
-    r = requests.get(url, headers={"X-Export-Token": EXPORT_TOKEN}, timeout=45)
+    r = requests.get(url, headers={"X-Export-Token": EXPORT_TOKEN}, timeout=30)
     if r.status_code != 200:
         raise RuntimeError(f"/dump failed {kind} {r.status_code}: {r.text[:400]}")
     lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
@@ -192,10 +183,9 @@ def tg_get_file_url(file_id: str) -> Optional[str]:
     if not TELEGRAM_TOKEN:
         raise RuntimeError("Missing TELEGRAM_TOKEN")
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile"
-    r = requests.post(url, json={"file_id": file_id}, timeout=25)
+    r = requests.post(url, json={"file_id": file_id}, timeout=20)
     j = r.json()
     if not j.get("ok"):
-        dlog(f"[DBG] getFile failed for file_id={file_id}: {j}")
         return None
     fp = j["result"]["file_path"]
     return f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fp}"
@@ -204,20 +194,6 @@ def download_bytes(url: str) -> bytes:
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
-
-def pick_file_id(obj: Dict[str, Any]) -> str:
-    # ✅ robuste : accepte plusieurs formats Worker
-    for k in ("file_id", "fileId", "tg_file_id", "telegram_file_id", "photo_file_id", "document_file_id"):
-        v = obj.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    # parfois: {"file": {"id": "..."}}
-    f = obj.get("file")
-    if isinstance(f, dict):
-        v = f.get("id") or f.get("file_id") or f.get("fileId")
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return ""
 
 
 # ============================================================
@@ -228,7 +204,11 @@ def normalize_phone(s: str) -> str:
     s = (s or "").strip()
     if not s:
         return ""
-    return re.sub(r"[^\d+]", "", s)
+    s = re.sub(r"[^\d+]", "", s)
+    # convert +33 -> 0 if possible
+    if s.startswith("+33") and len(s) >= 11:
+        s = "0" + s[3:]
+    return s
 
 def best_phone(text: str) -> str:
     if not text:
@@ -241,6 +221,40 @@ def best_email(text: str) -> str:
         return ""
     m = EMAIL_IN_TEXT_RE.search(text)
     return (m.group(0).strip().lower()) if m else ""
+
+def best_url(text: str) -> str:
+    if not text:
+        return ""
+    m = URL_RE.search(text)
+    if not m:
+        return ""
+    u = m.group(0).strip().rstrip(").,;")
+    if u.lower().startswith("www."):
+        u = "http://" + u
+    return u
+
+def best_siret(text: str) -> str:
+    if not text:
+        return ""
+    m = SIRET_RE.search(re.sub(r"\s+", "", text))
+    return m.group(0) if m else ""
+
+def best_postal_city(text: str) -> Tuple[str, str]:
+    if not text:
+        return "", ""
+    # cherche pattern "38340 VOREPPE"
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    for ln in lines:
+        m = re.search(r"\b(\d{5})\s+([A-Za-zÀ-ÿ'\- ]{2,})\b", ln)
+        if m:
+            pc = m.group(1)
+            city = m.group(2).strip()
+            # évite les trucs trop longs
+            if 2 <= len(city) <= 40:
+                return pc, city
+    # fallback
+    m2 = POSTAL_RE.search(text)
+    return (m2.group(1), "") if m2 else ("","")
 
 def split_human_name(full: str) -> Tuple[str,str]:
     s = (full or "").strip()
@@ -255,10 +269,12 @@ def split_human_name(full: str) -> Tuple[str,str]:
 def ensure_contact_fallback(d: Dict[str, Any]) -> Dict[str, Any]:
     fn = (d.get("contact_firstname") or "").strip()
     ln = (d.get("contact_lastname") or "").strip()
+
     if (not fn and not ln) and (d.get("dirigeant") or "").strip():
         f, l = split_human_name(d.get("dirigeant") or "")
         d["contact_firstname"] = d.get("contact_firstname") or f
         d["contact_lastname"]  = d.get("contact_lastname") or (l or d.get("dirigeant") or "")
+
     if not (d.get("interlocuteur") or "").strip():
         combo = f"{(d.get('contact_firstname') or '').strip()} {(d.get('contact_lastname') or '').strip()}".strip()
         if combo:
@@ -276,7 +292,7 @@ def search_gouv_company(name: str, city: str) -> Dict[str, str]:
     try:
         q = f"{name} {city}".strip()
         url = f"https://recherche-entreprises.api.gouv.fr/search?q={requests.utils.quote(q)}&page=1&per_page=1"
-        r = requests.get(url, headers={"accept":"application/json"}, timeout=20)
+        r = requests.get(url, headers={"accept":"application/json"}, timeout=15)
         j = r.json()
         res = (j.get("results") or [])
         if not res:
@@ -294,12 +310,20 @@ def search_gouv_company(name: str, city: str) -> Dict[str, str]:
                 prenom = p.get("prenom") or p.get("prenoms") or ""
                 nom = p.get("nom") or p.get("nom_usage") or ""
                 dirigeant = f"{prenom} {nom}".strip()
+
         naf = (e.get("activite_principale") or e.get("naf") or "").replace(".","").replace(" ","").upper()
+
+        addr = (
+            siege.get("adresse")
+            or " ".join([str(x) for x in [siege.get("numero_voie"), siege.get("type_voie"), siege.get("libelle_voie")] if x])
+            or ""
+        ).strip()
+
         return {
             "name": e.get("nom_raison_sociale") or e.get("denomination") or name,
             "siret": (siege.get("siret") or ""),
             "naf": naf,
-            "address": (siege.get("adresse") or siege.get("libelle_voie") or ""),
+            "address": addr,
             "postal_code": (siege.get("code_postal") or ""),
             "city": (siege.get("libelle_commune") or city),
             "dirigeant": dirigeant,
@@ -324,7 +348,7 @@ def places_enrich(name: str, city: str) -> Dict[str, str]:
                 "languageCode":"fr",
                 "regionCode":"FR",
             },
-            timeout=20
+            timeout=15
         )
         j1 = r1.json()
         p = (j1.get("places") or [None])[0]
@@ -332,14 +356,13 @@ def places_enrich(name: str, city: str) -> Dict[str, str]:
             return {}
         pid = p["id"]
         website = p.get("websiteUri") or ""
-
         r2 = requests.get(
             f"https://places.googleapis.com/v1/places/{pid}",
             headers={
                 "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
                 "X-Goog-FieldMask":"nationalPhoneNumber,internationalPhoneNumber,websiteUri",
             },
-            timeout=20
+            timeout=15
         )
         j2 = r2.json()
         phone = j2.get("nationalPhoneNumber") or j2.get("internationalPhoneNumber") or ""
@@ -352,54 +375,80 @@ def scrape_email_from_site(url: str) -> str:
     if not url:
         return ""
     try:
-        r = requests.get(url, headers={"user-agent":"Mozilla/5.0 (ProspectionBot)"}, timeout=10)
+        r = requests.get(url, headers={"user-agent":"Mozilla/5.0 (ProspectionBot)"}, timeout=10, allow_redirects=True)
         if r.status_code >= 300:
             return ""
         html = r.text[:250000]
         matches = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}", html)
         if not matches:
             return ""
-        filtered = [m for m in matches if not re.search(r"no-?reply", m, re.I)]
+        filtered = [m for m in matches if not re.search(r"no-?reply|example\.com", m, re.I)]
         return (filtered[0] if filtered else matches[0]).strip().lower()
     except Exception:
         return ""
 
 
 # ============================================================
-# OCR (robuste)
+# OCR (multi-pass + preprocessing)
 # ============================================================
 
-def _prep_for_ocr(im: Image.Image) -> Image.Image:
-    # grayscale + autocontrast + upscale
-    im = ImageOps.exif_transpose(im)  # corrige rotation EXIF
-    im = im.convert("L")
-    im = ImageOps.autocontrast(im)
-    # léger boost contraste
-    im = ImageEnhance.Contrast(im).enhance(1.6)
-    # upscale si petit
-    w, h = im.size
-    if max(w, h) < 1200:
-        scale = 1200 / max(w, h)
-        im = im.resize((int(w*scale), int(h*scale)))
-    return im
+def _pil_open(img_bytes: bytes) -> Optional[Image.Image]:
+    try:
+        im = Image.open(io.BytesIO(img_bytes))
+        if im.mode not in ("RGB","L"):
+            im = im.convert("RGB")
+        return im
+    except Exception:
+        return None
+
+def _preprocess_variants(im: Image.Image) -> List[Image.Image]:
+    variants: List[Image.Image] = []
+
+    # base
+    base = im.copy()
+    variants.append(base)
+
+    # grayscale + autocontrast
+    g = ImageOps.grayscale(im)
+    g = ImageOps.autocontrast(g)
+    variants.append(g)
+
+    # upscale x2 + sharpen
+    up = im.resize((im.size[0]*2, im.size[1]*2))
+    up = up.filter(ImageFilter.SHARPEN)
+    variants.append(up)
+
+    # grayscale + threshold
+    gt = ImageOps.grayscale(im)
+    gt = ImageOps.autocontrast(gt)
+    gt = gt.point(lambda p: 255 if p > 160 else 0)
+    variants.append(gt)
+
+    return variants
 
 def ocr_image_bytes(img_bytes: bytes) -> str:
     if not img_bytes:
         return ""
-    try:
-        im = Image.open(io.BytesIO(img_bytes))
-        im = _prep_for_ocr(im)
-        # config OCR “carte de visite / bloc”
-        cfg = "--oem 3 --psm 6"
-        txt = pytesseract.image_to_string(im, lang="fra+eng", config=cfg)
-        return (txt or "").strip()
-    except Exception as e:
-        dlog(f"[DBG] OCR exception: {e}")
+    im = _pil_open(img_bytes)
+    if im is None:
         return ""
+    texts: List[str] = []
+    config = "--oem 3 --psm 6"
+    for v in _preprocess_variants(im):
+        try:
+            txt = pytesseract.image_to_string(v, lang="fra+eng", config=config)
+            txt = (txt or "").strip()
+            if txt:
+                texts.append(txt)
+        except Exception:
+            pass
+    # garde le plus "long" (souvent le plus informatif)
+    texts = sorted(texts, key=lambda s: len(s), reverse=True)
+    return texts[0] if texts else ""
 
 
 # ============================================================
-# GEMINI VISION (image -> JSON)
+# GEMINI (Vision + Normalisation)
 # ============================================================
 
 def _guess_mime(img_bytes: bytes) -> str:
@@ -428,13 +477,12 @@ def gemini_vision_json(img_bytes: bytes, prompt: str) -> Dict[str, Any]:
                 {"inlineData": {"mimeType": mime, "data": b64}}
             ]
         }],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 600}
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 700}
     }
 
     try:
-        r = requests.post(endpoint, params={"key": GEMINI_API_KEY}, json=payload, timeout=35)
+        r = requests.post(endpoint, params={"key": GEMINI_API_KEY}, json=payload, timeout=40)
         if r.status_code >= 300:
-            dlog(f"[DBG] Gemini HTTP {r.status_code}: {r.text[:200]}")
             return {}
         j = r.json()
         parts = (((j.get("candidates") or [None])[0] or {}).get("content") or {}).get("parts") or []
@@ -447,43 +495,112 @@ def gemini_vision_json(img_bytes: bytes, prompt: str) -> Dict[str, Any]:
         raw = re.sub(r"```$", "", raw).strip()
         m = re.search(r"\{.*\}", raw, re.S)
         if not m:
-            dlog(f"[DBG] Gemini no JSON. raw={raw[:200]}")
             return {}
         return json.loads(m.group(0))
-    except Exception as e:
-        dlog(f"[DBG] Gemini exception: {e}")
+    except Exception:
         return {}
 
-def gemini_extract_business_card(img_bytes: bytes) -> Dict[str, str]:
-    prompt = (
-        "Tu es un extracteur STRICT de carte de visite française.\n"
-        "Retourne STRICTEMENT un JSON (aucun texte autour), clés EXACTES:\n"
-        "name, company, title, email, phone, website, city\n"
-        "Contraintes:\n"
-        "- Valeur inconnue => \"\"\n"
-        "- email en minuscules\n"
-        "- phone: numéro FR si présent (0XXXXXXXXX ou +33XXXXXXXXX)\n"
-        "- company: raison sociale si affichée\n"
-    )
-    data = gemini_vision_json(img_bytes, prompt) or {}
-    return {
-        "name": (data.get("name") or "").strip(),
-        "company": (data.get("company") or "").strip(),
-        "title": (data.get("title") or "").strip(),
-        "email": (data.get("email") or "").strip().lower(),
-        "phone": normalize_phone(data.get("phone") or ""),
-        "website": (data.get("website") or "").strip(),
-        "city": (data.get("city") or "").strip(),
+def gemini_text_json(prompt: str) -> Dict[str, Any]:
+    if not GEMINI_API_KEY or not prompt.strip():
+        return {}
+    endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+    payload = {
+        "contents": [{
+            "parts": [{"text": prompt}]
+        }],
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 700}
     }
+    try:
+        r = requests.post(endpoint, params={"key": GEMINI_API_KEY}, json=payload, timeout=40)
+        if r.status_code >= 300:
+            return {}
+        j = r.json()
+        parts = (((j.get("candidates") or [None])[0] or {}).get("content") or {}).get("parts") or []
+        raw = ""
+        for p in parts:
+            if isinstance(p, dict) and p.get("text"):
+                raw += p["text"]
+        raw = (raw or "").strip()
+        raw = re.sub(r"^```json", "", raw, flags=re.I).strip()
+        raw = re.sub(r"```$", "", raw).strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return {}
+        return json.loads(m.group(0))
+    except Exception:
+        return {}
 
-def gemini_extract_facade_logo(img_bytes: bytes) -> Dict[str, str]:
+def gemini_extract_business_card(img_bytes: bytes) -> Dict[str, Any]:
     prompt = (
-        "Tu analyses une photo de prospection (façade, enseigne, logo, devanture).\n"
-        "Retourne STRICTEMENT un JSON avec les clés EXACTES: company, city\n"
-        "Si tu n'es pas sûr => \"\".\n"
+        "RÔLE: Tu es un extracteur de carte de visite (France).\n"
+        "Tu dois lire l'IMAGE et retourner STRICTEMENT un JSON valide (aucun texte autour).\n"
+        "Clés EXACTES:\n"
+        "{"
+        "\"person_fullname\":\"\","
+        "\"person_title\":\"\","
+        "\"company_name\":\"\","
+        "\"company_address\":\"\","
+        "\"postal_code\":\"\","
+        "\"city\":\"\","
+        "\"phone\":\"\","
+        "\"phone2\":\"\","
+        "\"email\":\"\","
+        "\"website\":\"\","
+        "\"siret\":\"\""
+        "}\n"
+        "Règles:\n"
+        "- Si inconnu -> \"\"\n"
+        "- email en minuscules\n"
+        "- phone en format FR si possible (0XXXXXXXXX)\n"
+        "- siret = 14 chiffres si présent\n"
+        "- N'invente rien.\n"
     )
-    data = gemini_vision_json(img_bytes, prompt) or {}
-    return {"company": (data.get("company") or "").strip(), "city": (data.get("city") or "").strip()}
+    return gemini_vision_json(img_bytes, prompt) or {}
+
+def gemini_extract_facade(img_bytes: bytes) -> Dict[str, Any]:
+    prompt = (
+        "RÔLE: Tu analyses une photo de prospection (façade/enseigne/logo/devanture).\n"
+        "Retourne STRICTEMENT un JSON valide (aucun texte autour) avec clés EXACTES:\n"
+        "{"
+        "\"company_name\":\"\","
+        "\"city\":\"\""
+        "}\n"
+        "Règles:\n"
+        "- Si tu n'es pas sûr -> \"\"\n"
+        "- N'invente pas.\n"
+    )
+    return gemini_vision_json(img_bytes, prompt) or {}
+
+def gemini_normalize(structured: Dict[str, Any], ocr_text: str, kind: str) -> Dict[str, Any]:
+    """
+    kind = 'card' ou 'photo'
+    On force Gemini à NORMALISER (pas inventer).
+    """
+    if not GEMINI_API_KEY:
+        return {}
+
+    # limite taille OCR
+    ocr_trim = (ocr_text or "").strip()
+    if len(ocr_trim) > 6000:
+        ocr_trim = ocr_trim[:6000]
+
+    prompt = (
+        f"RÔLE: Tu es un normaliseur de données de prospection (France).\n"
+        f"OBJECTIF: produire un JSON FINAL propre, cohérent, sans invention.\n"
+        f"TYPE: {kind}\n\n"
+        f"JSON_CANDIDAT:\n{json.dumps(structured, ensure_ascii=False)}\n\n"
+        f"TEXTE_OCR_BRUT (peut être bruité):\n{ocr_trim}\n\n"
+        "INSTRUCTIONS STRICTES:\n"
+        "- Retourne STRICTEMENT un JSON valide, aucune phrase autour.\n"
+        "- Ne rajoute pas de champs.\n"
+        "- Si une info est douteuse -> laisse \"\".\n"
+        "- Nettoie: espaces, majuscules abusives, URL (garde https:// si possible), phone au format 0XXXXXXXXX.\n"
+        "- postal_code = 5 chiffres.\n"
+        "- city = nom de ville sans CP.\n"
+        "- company_name = raison sociale (pas le nom de personne).\n"
+    )
+    out = gemini_text_json(prompt) or {}
+    return out if isinstance(out, dict) else {}
 
 
 # ============================================================
@@ -492,8 +609,8 @@ def gemini_extract_facade_logo(img_bytes: bytes) -> Dict[str, str]:
 
 def build_media_zip(date: str, agency: str, initials: str,
                     photos: List[Dict[str, Any]], cards: List[Dict[str, Any]]) -> Optional[Tuple[str, bytes]]:
-    photos_u = [p for p in photos if (p.get("agency") == agency and (str(p.get("user") or p.get("initials") or "")).upper() == initials)]
-    cards_u  = [c for c in cards  if (c.get("agency") == agency and (str(c.get("user") or c.get("initials") or "")).upper() == initials)]
+    photos_u = [p for p in photos if (p.get("agency") == agency and (p.get("user") or "").upper() == initials)]
+    cards_u  = [c for c in cards  if (c.get("agency") == agency and (c.get("user") or "").upper() == initials)]
     if not photos_u and not cards_u:
         return None
 
@@ -505,8 +622,8 @@ def build_media_zip(date: str, agency: str, initials: str,
         lines = ["type;file;date;agency;initials;city;comment;geo_lat;geo_lon"]
 
         for i, p in enumerate(photos_u, start=1):
-            fid = pick_file_id(p)
-            url = tg_get_file_url(fid) if fid else None
+            fid = p.get("file_id") or ""
+            url = tg_get_file_url(fid)
             if not url:
                 continue
             img = download_bytes(url)
@@ -521,8 +638,8 @@ def build_media_zip(date: str, agency: str, initials: str,
             )
 
         for i, c in enumerate(cards_u, start=1):
-            fid = pick_file_id(c)
-            url = tg_get_file_url(fid) if fid else None
+            fid = c.get("file_id") or ""
+            url = tg_get_file_url(fid)
             if not url:
                 continue
             img = download_bytes(url)
@@ -532,7 +649,8 @@ def build_media_zip(date: str, agency: str, initials: str,
 
         z.writestr("index.csv", ("\n".join(lines)).encode("utf-8"))
 
-    return f"MEDIA_{date}_{agency}_{initials}.zip", buf.getvalue()
+    zip_name = f"MEDIA_{date}_{agency}_{initials}.zip"
+    return zip_name, buf.getvalue()
 
 
 # ============================================================
@@ -556,11 +674,18 @@ def brevo_send_email(to_email: str, subject: str, html: str, attachments: Option
     if attachments:
         payload["attachment"] = []
         for filename, content in attachments:
-            payload["attachment"].append({"name": filename, "content": base64.b64encode(content).decode("ascii")})
+            payload["attachment"].append({
+                "name": filename,
+                "content": base64.b64encode(content).decode("ascii")
+            })
 
     r = requests.post(
         "https://api.brevo.com/v3/smtp/email",
-        headers={"accept": "application/json", "api-key": BREVO_API_KEY, "content-type": "application/json"},
+        headers={
+            "accept": "application/json",
+            "api-key": BREVO_API_KEY,
+            "content-type": "application/json"
+        },
         data=json.dumps(payload),
         timeout=60
     )
@@ -596,16 +721,7 @@ def to_row(d: Dict[str, Any]) -> List[Any]:
     return [d.get(h, "") for h in HEADERS]
 
 def build_excel_one_sheet(date: str, rows: List[Dict[str, Any]], suffix: str) -> str:
-    # ✅ on supprime les lignes 100% vides (sauf date/agency/initials)
-    cleaned = []
-    for r in rows:
-        rr = dict(r)
-        score = record_score(rr)
-        # garde si au moins un champ métier rempli
-        if score > 0:
-            cleaned.append(rr)
-
-    rows_sorted = sorted(cleaned, key=lambda x: record_score(x), reverse=True)
+    rows_sorted = sorted(rows, key=lambda x: record_score(x), reverse=True)
 
     wb = Workbook()
     ws = wb.active
@@ -629,14 +745,106 @@ def build_excel_one_sheet(date: str, rows: List[Dict[str, Any]], suffix: str) ->
 
 
 # ============================================================
-# UNIFY SOURCES -> ONE ROW MODEL
+# PIPELINES (Card / Photo)
+# ============================================================
+
+def _debug_write(obj: Dict[str, Any], path: str):
+    if not DEBUG:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+def _merge_keep(existing: Dict[str, Any], incoming: Dict[str, Any]):
+    for k, v in (incoming or {}).items():
+        if not str(existing.get(k,"") or "").strip() and str(v or "").strip():
+            existing[k] = v
+
+def pipeline_card(img_bytes: bytes) -> Tuple[Dict[str, Any], str]:
+    """
+    Retourne (structured, ocr_text)
+    structured: dict proche "carte" (champs card)
+    """
+    structured = {
+        "person_fullname": "",
+        "person_title": "",
+        "company_name": "",
+        "company_address": "",
+        "postal_code": "",
+        "city": "",
+        "phone": "",
+        "phone2": "",
+        "email": "",
+        "website": "",
+        "siret": ""
+    }
+
+    # 1) Gemini Vision sur image (prioritaire)
+    vis = gemini_extract_business_card(img_bytes) if GEMINI_API_KEY else {}
+    if isinstance(vis, dict):
+        # nettoyages mini
+        vis["email"] = (vis.get("email") or "").strip().lower()
+        vis["phone"] = normalize_phone(vis.get("phone") or "")
+        vis["phone2"] = normalize_phone(vis.get("phone2") or "")
+        vis["website"] = (vis.get("website") or "").strip()
+        vis["siret"] = re.sub(r"\D", "", str(vis.get("siret") or ""))[:14]
+        _merge_keep(structured, vis)
+
+    # 2) OCR multi-pass (toujours), pour compléter
+    ocr_txt = ocr_image_bytes(img_bytes)
+    if ocr_txt:
+        # email / phone / url / siret / cp+city
+        if not structured["email"]:
+            structured["email"] = best_email(ocr_txt)
+        if not structured["phone"]:
+            structured["phone"] = best_phone(ocr_txt)
+        if not structured["website"]:
+            structured["website"] = best_url(ocr_txt)
+        if not structured["siret"]:
+            structured["siret"] = best_siret(ocr_txt)
+
+        if not structured["postal_code"] or not structured["city"]:
+            pc, city = best_postal_city(ocr_txt)
+            if not structured["postal_code"]:
+                structured["postal_code"] = pc
+            if not structured["city"]:
+                structured["city"] = city
+
+        # tentative adresse : si on a cp, on prend la ligne qui le contient comme base
+        if not structured["company_address"] and structured["postal_code"]:
+            for ln in [l.strip() for l in ocr_txt.splitlines() if l.strip()]:
+                if structured["postal_code"] in ln:
+                    structured["company_address"] = ln.strip()
+                    break
+
+    return structured, ocr_txt
+
+def pipeline_photo(img_bytes: bytes, city_hint: str) -> Tuple[Dict[str, Any], str]:
+    structured = {"company_name": "", "city": (city_hint or "").strip()}
+    vis = gemini_extract_facade(img_bytes) if GEMINI_API_KEY else {}
+    if isinstance(vis, dict):
+        _merge_keep(structured, {"company_name": (vis.get("company_name") or "").strip(),
+                                 "city": (vis.get("city") or "").strip()})
+    ocr_txt = ocr_image_bytes(img_bytes)
+    if ocr_txt:
+        # si ville manquante -> tente cp+ville
+        if not structured["city"]:
+            _, city = best_postal_city(ocr_txt)
+            structured["city"] = city
+    return structured, ocr_txt
+
+
+# ============================================================
+# UNIFY -> ONE ROW MODEL
 # ============================================================
 
 def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
     d = {
         "date": p.get("date",""),
         "agency": (p.get("agency") or "").upper(),
-        "initials": (p.get("initials") or p.get("user") or "").upper(),
+        "initials": (p.get("initials") or "").upper(),
         "name": p.get("name",""),
         "address": p.get("address",""),
         "postal_code": p.get("postal_code",""),
@@ -666,60 +874,97 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
         "resume": (comment or "").strip(),
         "commande": "",
     }
+
     if not img_bytes:
         return base
 
-    # 1) Gemini (si dispo)
-    vis = gemini_extract_business_card(img_bytes) if GEMINI_API_KEY else {
-        "name":"","company":"","title":"","email":"","phone":"","website":"","city":""
-    }
+    # 1) Vision + OCR (complément)
+    structured, ocr_txt = pipeline_card(img_bytes)
 
-    # 2) OCR TOUJOURS pour compléter (carte = OCR est très utile)
-    ocr_txt = ocr_image_bytes(img_bytes)
-    if ocr_txt:
-        vis["email"] = vis.get("email") or best_email(ocr_txt)
-        vis["phone"] = vis.get("phone") or best_phone(ocr_txt)
-        # heuristique company si Gemini vide
-        if not vis.get("company"):
-            # on prend la première ligne “non vide” qui ressemble à un nom de boîte
-            lines = [ln.strip() for ln in ocr_txt.splitlines() if ln.strip()]
-            if lines:
-                cand = lines[0][:80]
-                # évite de prendre un prénom/nom seul si possible
-                if len(cand.split()) >= 2:
-                    vis["company"] = cand
+    # 2) Enrichissements (API gouv + places + scrape)
+    company = (structured.get("company_name") or "").strip()
+    city = (structured.get("city") or "").strip()
 
-    company = (vis.get("company") or "").strip()
-    city = (vis.get("city") or "").strip()
+    # si pas de company mais un email domaine -> tente company via domaine (option simple)
+    # (on garde soft pour ne pas inventer)
+    if not company and structured.get("website"):
+        company = company  # rien ici pour l’instant
 
     gouv = search_gouv_company(company, city) if company else {}
-    place = places_enrich(gouv.get("name") or company, gouv.get("city") or city)
+    places = places_enrich(gouv.get("name") or company, gouv.get("city") or city)
 
-    website = (vis.get("website") or place.get("website") or "").strip()
-    email_site = scrape_email_from_site(website) if website and not vis.get("email") else ""
+    website = (structured.get("website") or places.get("website") or "").strip()
+    email_site = scrape_email_from_site(website) if website and not structured.get("email") else ""
 
-    full_name = (vis.get("name") or "").strip()
-    fn, ln = split_human_name(full_name)
+    # 3) Normalisation Gemini (texte) : réconcilie structured + OCR
+    normalized = {}
+    if GEMINI_API_KEY:
+        normalized = gemini_normalize(structured, ocr_txt, kind="card")
+
+    final_card = dict(structured)
+    if isinstance(normalized, dict) and normalized:
+        # on remplace par le normalisé (mais sans perdre tel/email déjà ok)
+        final_card.update(normalized)
+
+    # re-nettoyage
+    final_card["email"] = (final_card.get("email") or "").strip().lower()
+    final_card["phone"] = normalize_phone(final_card.get("phone") or "")
+    final_card["phone2"] = normalize_phone(final_card.get("phone2") or "")
+    final_card["website"] = (final_card.get("website") or "").strip()
+    final_card["siret"] = re.sub(r"\D", "", str(final_card.get("siret") or ""))[:14]
+
+    # merge enrichissements sans écraser
+    # adresse / cp / ville / siret / naf / dirigeant
+    def keep_if_empty(key, val):
+        if not str(final_card.get(key,"") or "").strip() and str(val or "").strip():
+            final_card[key] = val
+
+    keep_if_empty("company_name", gouv.get("name"))
+    keep_if_empty("company_address", gouv.get("address"))
+    keep_if_empty("postal_code", gouv.get("postal_code"))
+    keep_if_empty("city", gouv.get("city"))
+    keep_if_empty("siret", gouv.get("siret"))
+    keep_if_empty("naf", gouv.get("naf"))
+    keep_if_empty("dirigeant", gouv.get("dirigeant"))
+
+    keep_if_empty("phone", places.get("phone"))
+    keep_if_empty("website", places.get("website"))
+    keep_if_empty("email", email_site)
+
+    # 4) Mapping -> ton format Excel
+    fullname = (final_card.get("person_fullname") or "").strip()
+    fn, ln = split_human_name(fullname)
 
     row = dict(base)
     row.update({
-        "name": gouv.get("name") or company or "",
-        "address": gouv.get("address") or "",
-        "postal_code": gouv.get("postal_code") or "",
-        "city": gouv.get("city") or city or "",
-
-        "siret": gouv.get("siret") or "",
-        "naf": gouv.get("naf") or "",
-        "dirigeant": gouv.get("dirigeant") or "",
-
-        "interlocuteur": full_name or "",
+        "name": final_card.get("company_name") or "",
+        "address": final_card.get("company_address") or "",
+        "postal_code": final_card.get("postal_code") or "",
+        "city": final_card.get("city") or "",
+        "siret": final_card.get("siret") or "",
+        "naf": final_card.get("naf") or "",
+        "dirigeant": final_card.get("dirigeant") or "",
+        "interlocuteur": fullname or "",
         "contact_firstname": fn,
         "contact_lastname": ln,
-
-        "phone": vis.get("phone") or place.get("phone") or "",
-        "email": vis.get("email") or email_site or "",
-        "website": website,
+        "phone": final_card.get("phone") or "",
+        "phone2": final_card.get("phone2") or "",
+        "email": final_card.get("email") or "",
+        "website": final_card.get("website") or "",
     })
+
+    if DEBUG:
+        _debug_write({
+            "kind": "card",
+            "date": date, "agency": agency, "initials": initials,
+            "structured_initial": structured,
+            "normalized": normalized,
+            "gouv": gouv,
+            "places": places,
+            "row": row,
+            "ocr_excerpt": (ocr_txt[:800] if ocr_txt else "")
+        }, os.path.join(OUT_DIR, f"debug_{date}_{agency}_{initials}.jsonl"))
+
     return ensure_contact_fallback(row)
 
 def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comment: str, img_bytes: bytes) -> Dict[str, Any]:
@@ -732,28 +977,21 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
         "resume": (comment or "").strip(),
         "commande": "",
     }
+
     if not img_bytes:
         return base
 
-    vis = gemini_extract_facade_logo(img_bytes) if GEMINI_API_KEY else {"company":"", "city":""}
-    company = (vis.get("company") or "").strip()
-    city = (vis.get("city") or "").strip() or (city_hint or "").strip()
-
-    # fallback OCR “façade” si Gemini vide
-    if not company:
-        ocr_txt = ocr_image_bytes(img_bytes)
-        if ocr_txt:
-            lines = [ln.strip() for ln in ocr_txt.splitlines() if ln.strip()]
-            if lines:
-                company = lines[0][:80]
+    structured, ocr_txt = pipeline_photo(img_bytes, city_hint=city_hint)
+    # enrich
+    company = (structured.get("company_name") or "").strip()
+    city = (structured.get("city") or "").strip()
 
     if not company:
         return base
 
     gouv = search_gouv_company(company, city)
-    place = places_enrich(gouv.get("name") or company, gouv.get("city") or city)
-
-    website = (place.get("website") or "").strip()
+    places = places_enrich(gouv.get("name") or company, gouv.get("city") or city)
+    website = (places.get("website") or "").strip()
     email_site = scrape_email_from_site(website) if website else ""
 
     row = dict(base)
@@ -762,15 +1000,25 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
         "address": gouv.get("address") or "",
         "postal_code": gouv.get("postal_code") or "",
         "city": gouv.get("city") or city,
-
         "siret": gouv.get("siret") or "",
         "naf": gouv.get("naf") or "",
         "dirigeant": gouv.get("dirigeant") or "",
-
-        "phone": place.get("phone") or "",
+        "phone": places.get("phone") or "",
         "website": website,
         "email": email_site or "",
     })
+
+    if DEBUG:
+        _debug_write({
+            "kind": "photo",
+            "date": date, "agency": agency, "initials": initials,
+            "structured": structured,
+            "gouv": gouv,
+            "places": places,
+            "row": row,
+            "ocr_excerpt": (ocr_txt[:800] if ocr_txt else "")
+        }, os.path.join(OUT_DIR, f"debug_{date}_{agency}_{initials}.jsonl"))
+
     return ensure_contact_fallback(row)
 
 
@@ -803,41 +1051,39 @@ def send_individual_pack(date: str, agency: str, initials: str,
 
     initials = initials.upper().strip()
 
-    p_u = [p for p in prospects if (p.get("agency") == agency and (str(p.get("initials") or p.get("user") or "")).upper() == initials)]
-    ph_u = [ph for ph in photos if (ph.get("agency") == agency and (str(ph.get("user") or ph.get("initials") or "")).upper() == initials)]
-    ca_u = [ca for ca in cards  if (ca.get("agency") == agency and (str(ca.get("user") or ca.get("initials") or "")).upper() == initials)]
-
-    print(f"[INFO] {agency}/{initials}: prospects={len(p_u)} photos={len(ph_u)} cards={len(ca_u)}")
+    p_u = [p for p in prospects if (p.get("agency") == agency and (p.get("initials") or "").upper() == initials)]
+    ph_u = [ph for ph in photos if (ph.get("agency") == agency and (ph.get("user") or "").upper() == initials)]
+    ca_u = [ca for ca in cards  if (ca.get("agency") == agency and (ca.get("user") or "").upper() == initials)]
 
     rows: List[Dict[str, Any]] = []
     rows.extend([unify_from_prospect(p) for p in p_u])
 
     for ph in ph_u[:MAX_PHOTO_IMAGES]:
-        fid = pick_file_id(ph)
-        url = tg_get_file_url(fid) if fid else None
+        fid = ph.get("file_id") or ""
+        url = tg_get_file_url(fid)
         city_hint = ph.get("city") or ""
         comment = ph.get("comment") or ph.get("meeting") or ""
         if not url:
-            dlog(f"[DBG] photo missing url fid='{fid}' keys={list(ph.keys())}")
+            rows.append(unify_from_photo(date, agency, initials, city_hint, comment, b""))
             continue
         try:
             img = download_bytes(url)
             rows.append(unify_from_photo(date, agency, initials, city_hint, comment, img))
-        except Exception as e:
-            dlog(f"[DBG] photo download/extract failed: {e}")
+        except Exception:
+            rows.append(unify_from_photo(date, agency, initials, city_hint, comment, b""))
 
     for ca in ca_u[:MAX_OCR_IMAGES]:
-        fid = pick_file_id(ca)
-        url = tg_get_file_url(fid) if fid else None
+        fid = ca.get("file_id") or ""
+        url = tg_get_file_url(fid)
         comment = ca.get("comment") or ""
         if not url:
-            dlog(f"[DBG] card missing url fid='{fid}' keys={list(ca.keys())}")
+            rows.append(unify_from_card(date, agency, initials, comment, b""))
             continue
         try:
             img = download_bytes(url)
             rows.append(unify_from_card(date, agency, initials, comment, img))
-        except Exception as e:
-            dlog(f"[DBG] card download/extract failed: {e}")
+        except Exception:
+            rows.append(unify_from_card(date, agency, initials, comment, b""))
 
     if not rows:
         print(f"[INFO] No rows for {agency}/{initials}, skip.")
@@ -856,7 +1102,7 @@ def send_individual_pack(date: str, agency: str, initials: str,
     subject = f"Prospection {date} — {agency}/{initials} (Excel + médias)"
     html = (
         f"<p>Bonjour,</p>"
-        f"<p>Export prospection <b>{date}</b> — <b>{agency}/{initials}</b>.</p>"
+        f"<p>Voici ton export de prospection du <b>{date}</b> pour <b>{agency}/{initials}</b>.</p>"
         f"<ul>"
         f"<li><b>Excel</b> (1 onglet, trié par complétude)</li>"
         f"<li><b>ZIP médias</b> (photos + cartes)</li>"
@@ -932,14 +1178,12 @@ def main():
     run_date = RUN_DATE if RUN_DATE else today_ymd_utc()
 
     print(f"🚀 export_and_mail.py — mode={SEND_MODE} date={run_date} agency={AGENCY} initials={INITIALS}")
-    print(f"📦 OUT_DIR={OUT_DIR} | DEBUG={'ON' if DEBUG else 'OFF'}")
-    print(f"🔑 Gemini={'ON' if GEMINI_API_KEY else 'OFF'} | Places={'ON' if GOOGLE_PLACES_API_KEY else 'OFF'}")
+    print(f"📦 OUT_DIR={OUT_DIR}")
+    print(f"🔑 Gemini={'ON' if GEMINI_API_KEY else 'OFF'} | Places={'ON' if GOOGLE_PLACES_API_KEY else 'OFF'} | DEBUG={'ON' if DEBUG else 'OFF'}")
 
     prospects = worker_dump("prospects", run_date)
     photos    = worker_dump("photos",    run_date)
     cards     = worker_dump("cards",     run_date)
-
-    print(f"[INFO] dump totals: prospects={len(prospects)} photos={len(photos)} cards={len(cards)}")
 
     if SEND_MODE == "individual":
         if AGENCY not in VALID_AGENCIES:
