@@ -69,8 +69,8 @@ os.makedirs(OUT_DIR, exist_ok=True)
 VALID_AGENCIES = {"GR", "VR", "GRS", "SLS"}
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
-PHONE_RE = re.compile(r"(\+33|0)\s*[1-9](?:[\s\.-]*\d{2}){4}")
 EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
+PHONE_RE = re.compile(r"(?:(?:\+33|0)[\s\.-]*[1-9](?:[\s\.-]*\d{2}){4})")
 URL_RE = re.compile(r"(https?://[^\s)]+|www\.[^\s)]+)", re.I)
 CP_RE = re.compile(r"\b(0[1-9]\d{3}|[1-8]\d{4}|9[0-5]\d{3}|97\d{3}|98\d{3})\b")
 
@@ -204,13 +204,67 @@ def normalize_phone(s: str) -> str:
     s = (s or "").strip()
     if not s:
         return ""
-    return re.sub(r"[^\d+]", "", s)
+    s = re.sub(r"[^\d+]", "", s)
+    if s.startswith("+33"):
+        s = "0" + s[3:]
+    return s
 
-def best_phone(text: str) -> str:
+def extract_all_phones(text: str) -> List[str]:
     if not text:
-        return ""
-    m = PHONE_RE.search(text)
-    return normalize_phone(m.group(0)) if m else ""
+        return []
+    out = []
+    seen = set()
+    for m in PHONE_RE.finditer(text):
+        p = normalize_phone(m.group(0))
+        if len(re.sub(r"\D", "", p)) < 10:
+            continue
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+def split_phones_by_priority(phones: List[str]) -> Tuple[str, str]:
+    """
+    phone  = priorité au fixe 01..05
+    phone2 = priorité au mobile 06/07
+    si aucun fixe, le 1er numéro trouvé va dans phone
+    """
+    fixed = []
+    mobile = []
+    other = []
+
+    for p in phones:
+        pn = normalize_phone(p)
+        if pn.startswith(("01", "02", "03", "04", "05")):
+            fixed.append(pn)
+        elif pn.startswith(("06", "07")):
+            mobile.append(pn)
+        else:
+            other.append(pn)
+
+    phone = ""
+    phone2 = ""
+
+    if fixed:
+        phone = fixed[0]
+        if mobile:
+            phone2 = mobile[0]
+        elif len(fixed) > 1:
+            phone2 = fixed[1]
+        elif other:
+            phone2 = other[0]
+    elif mobile:
+        phone = mobile[0]
+        if len(mobile) > 1:
+            phone2 = mobile[1]
+        elif other:
+            phone2 = other[0]
+    elif other:
+        phone = other[0]
+        if len(other) > 1:
+            phone2 = other[1]
+
+    return phone, phone2
 
 def best_email(text: str) -> str:
     if not text:
@@ -289,17 +343,51 @@ def split_human_name(full: str) -> Tuple[str, str]:
         return "", parts[0]
     return parts[0], " ".join(parts[1:])
 
+def strip_postal_city_from_address(addr: str, postal_code: str, city: str) -> str:
+    addr = (addr or "").strip()
+    if not addr:
+        return ""
+
+    pc = (postal_code or "").strip()
+    ct = (city or "").strip()
+
+    addr = re.sub(r"\s+", " ", addr)
+
+    if pc and ct:
+        tail = f"{pc} {ct}".strip()
+        addr = re.sub(rf"(?:\s|-)?{re.escape(tail)}\s*$", "", addr, flags=re.IGNORECASE).strip()
+
+    if pc:
+        addr = re.sub(rf"(?:\s|-)?{re.escape(pc)}\s*$", "", addr).strip()
+
+    addr = re.sub(r"\s+", " ", addr).strip()
+    return addr
+
+def normalize_row_address(row: Dict[str, Any]) -> Dict[str, Any]:
+    row["address"] = strip_postal_city_from_address(
+        row.get("address", ""),
+        row.get("postal_code", ""),
+        row.get("city", ""),
+    )
+    return row
+
 def ensure_contact_fallback(d: Dict[str, Any]) -> Dict[str, Any]:
     fn = (d.get("contact_firstname") or "").strip()
     ln = (d.get("contact_lastname") or "").strip()
-    if (not fn and not ln) and (d.get("dirigeant") or "").strip():
-        f, l = split_human_name(d.get("dirigeant") or "")
-        d["contact_firstname"] = d.get("contact_firstname") or f
-        d["contact_lastname"]  = d.get("contact_lastname") or (l or d.get("dirigeant") or "")
+    dirigeant = (d.get("dirigeant") or "").strip()
+
+    if (not fn and not ln) and dirigeant:
+        f, l = split_human_name(dirigeant)
+        d["contact_firstname"] = f or ""
+        d["contact_lastname"]  = l or (dirigeant or "")
+
     if not (d.get("interlocuteur") or "").strip():
         combo = f"{(d.get('contact_firstname') or '').strip()} {(d.get('contact_lastname') or '').strip()}".strip()
         if combo:
             d["interlocuteur"] = combo
+        elif dirigeant:
+            d["interlocuteur"] = dirigeant
+
     return d
 
 
@@ -376,13 +464,15 @@ def gemini_vision_json(img_bytes: bytes, prompt: str, max_tokens: int = 650) -> 
 def gemini_extract_business_card(img_bytes: bytes) -> Dict[str, str]:
     prompt = (
         "Tu es un extracteur de carte de visite.\n"
-        "Lis l'IMAGE (ne te base PAS sur un OCR).\n"
+        "Lis l'IMAGE uniquement.\n"
         "Retourne STRICTEMENT un JSON avec les clés EXACTES:\n"
         "name, company, title, email, phone, website, postal_code, city, address\n"
         "Règles:\n"
         "- Si inconnu: \"\"\n"
         "- email en minuscules\n"
         "- postal_code: 5 chiffres\n"
+        "- name = prénom + nom de la personne de la carte si visible\n"
+        "- address = adresse postale sans forcer le code postal/ville si tu n'es pas sûr\n"
     )
     d = gemini_vision_json(img_bytes, prompt, max_tokens=700) or {}
     return {
@@ -408,7 +498,7 @@ def gemini_extract_facade_logo(img_bytes: bytes) -> Dict[str, str]:
     d = gemini_vision_json(img_bytes, prompt, max_tokens=350) or {}
     return {"company": str(d.get("company") or "").strip(), "city": str(d.get("city") or "").strip()}
 
-print(f"🔑 Gemini={'ON' if GEMINI_API_KEY else 'OFF'} | Places={'ON' if GOOGLE_PLACES_API_KEY else 'OFF'}")
+
 # ============================================================
 # ENRICH: GOUV + PLACES + SCRAPE
 # ============================================================
@@ -493,7 +583,11 @@ def places_enrich(name: str, city: str = "") -> Dict[str, str]:
         website2 = j2.get("websiteUri") or website
         addr = (j2.get("formattedAddress") or "").strip()
 
-        return {"phone": normalize_phone(phone), "website": (website2 or "").strip(), "address": addr}
+        return {
+            "phone": normalize_phone(phone),
+            "website": (website2 or "").strip(),
+            "address": addr,
+        }
     except Exception:
         return {}
 
@@ -585,7 +679,9 @@ def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
         "resume": p.get("resume",""),
         "commande": p.get("commande",""),
     }
-    return ensure_contact_fallback(d)
+    d = ensure_contact_fallback(d)
+    d = normalize_row_address(d)
+    return d
 
 def unify_from_card(date: str, agency: str, initials: str, comment: str, img_bytes: bytes) -> Dict[str, Any]:
     base = {
@@ -608,12 +704,28 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     # 2) OCR complément
     ocr_txt = ocr_image_bytes(img_bytes)
     email_ocr = best_email(ocr_txt)
-    phone_ocr = best_phone(ocr_txt)
     urls_ocr = extract_urls(ocr_txt)
     cp_ocr = extract_postal_code(ocr_txt)
+    phones_ocr = extract_all_phones(ocr_txt)
+
+    # phone from gemini + OCR
+    phones_all = []
+    if vis.get("phone"):
+        phones_all.append(normalize_phone(vis.get("phone")))
+    phones_all.extend(phones_ocr)
+
+    # dédoublonnage
+    seen = set()
+    dedup_phones = []
+    for p in phones_all:
+        p = normalize_phone(p)
+        if p and p not in seen:
+            seen.add(p)
+            dedup_phones.append(p)
+
+    phone, phone2 = split_phones_by_priority(dedup_phones)
 
     email = (vis.get("email") or email_ocr or "").strip().lower()
-    phone = normalize_phone(vis.get("phone") or phone_ocr or "")
     website = (vis.get("website") or (urls_ocr[0] if urls_ocr else "") or "").strip()
 
     postal_code = (vis.get("postal_code") or cp_ocr or "").strip()
@@ -635,8 +747,8 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
 
     final_website = (website or place.get("website") or "").strip()
     final_email = email or (scrape_email_from_site(final_website) if final_website else "")
-    final_phone = phone or place.get("phone") or ""
 
+    # nom de la carte = contact
     full_name = (vis.get("name") or "").strip()
     fn, ln = split_human_name(full_name)
 
@@ -646,6 +758,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
         "address": (gouv.get("address") or address or place.get("address") or "").strip(),
         "postal_code": (gouv.get("postal_code") or postal_code or "").strip(),
         "city": (gouv.get("city") or city or "").strip(),
+
         "siret": (gouv.get("siret") or "").strip(),
         "naf": (gouv.get("naf") or "").strip(),
         "dirigeant": (gouv.get("dirigeant") or "").strip(),
@@ -654,11 +767,15 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
         "contact_firstname": fn,
         "contact_lastname": ln,
 
-        "phone": final_phone,
+        "phone": phone,
+        "phone2": phone2,
         "email": (final_email or "").strip().lower(),
         "website": final_website,
     })
-    return ensure_contact_fallback(row)
+
+    row = ensure_contact_fallback(row)
+    row = normalize_row_address(row)
+    return row
 
 def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comment: str, img_bytes: bytes) -> Dict[str, Any]:
     base = {
@@ -682,6 +799,9 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     urls_ocr = extract_urls(ocr_txt)
     website = (urls_ocr[0] if urls_ocr else "").strip()
 
+    phones_ocr = extract_all_phones(ocr_txt)
+    phone, phone2 = split_phones_by_priority(phones_ocr)
+
     company_guess = deduce_company(company_raw, email_ocr, website)
     if not company_guess:
         return base
@@ -703,11 +823,14 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
         "siret": (gouv.get("siret") or "").strip(),
         "naf": (gouv.get("naf") or "").strip(),
         "dirigeant": (gouv.get("dirigeant") or "").strip(),
-        "phone": (place.get("phone") or "").strip(),
+        "phone": phone or (place.get("phone") or "").strip(),
+        "phone2": phone2,
         "website": final_website,
         "email": final_email,
     })
-    return ensure_contact_fallback(row)
+    row = ensure_contact_fallback(row)
+    row = normalize_row_address(row)
+    return row
 
 
 # ============================================================
@@ -894,7 +1017,6 @@ def send_agency_manager_pack(date: str, agency: str,
         print(f"[WARN] No valid manager email for agency={agency} ({to_email})")
         return
 
-    # Consolidé agence = prospects + cartes + photos (tout le monde)
     rows: List[Dict[str, Any]] = []
     p_ag = [p for p in prospects if (p.get("agency") == agency)]
     rows.extend([unify_from_prospect(p) for p in p_ag])
