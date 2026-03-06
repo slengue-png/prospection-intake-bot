@@ -408,7 +408,7 @@ def gemini_extract_facade_logo(img_bytes: bytes) -> Dict[str, str]:
     d = gemini_vision_json(img_bytes, prompt, max_tokens=350) or {}
     return {"company": str(d.get("company") or "").strip(), "city": str(d.get("city") or "").strip()}
 
-
+print(f"🔑 Gemini={'ON' if GEMINI_API_KEY else 'OFF'} | Places={'ON' if GOOGLE_PLACES_API_KEY else 'OFF'}")
 # ============================================================
 # ENRICH: GOUV + PLACES + SCRAPE
 # ============================================================
