@@ -76,7 +76,7 @@ CP_RE = re.compile(r"\b(0[1-9]\d{3}|[1-8]\d{4}|9[0-5]\d{3}|97\d{3}|98\d{3})\b")
 
 HEADERS = [
     "date","agency","initials","name","address","postal_code","city",
-    "siret","naf","dirigeant","interlocuteur","contact_firstname","contact_lastname",
+    "siret","naf","activity_summary","dirigeant","interlocuteur","contact_firstname","contact_lastname",
     "phone","phone2","email","website","resume","commande"
 ]
 
@@ -224,11 +224,6 @@ def extract_all_phones(text: str) -> List[str]:
     return out
 
 def split_phones_by_priority(phones: List[str]) -> Tuple[str, str]:
-    """
-    phone  = priorité au fixe 01..05
-    phone2 = priorité au mobile 06/07
-    si aucun fixe, le 1er numéro trouvé va dans phone
-    """
     fixed = []
     mobile = []
     other = []
@@ -464,15 +459,15 @@ def gemini_vision_json(img_bytes: bytes, prompt: str, max_tokens: int = 650) -> 
 def gemini_extract_business_card(img_bytes: bytes) -> Dict[str, str]:
     prompt = (
         "Tu es un extracteur de carte de visite.\n"
-        "Lis l'IMAGE uniquement.\n"
+        "Lis l'IMAGE (ne te base PAS sur un OCR).\n"
         "Retourne STRICTEMENT un JSON avec les clés EXACTES:\n"
         "name, company, title, email, phone, website, postal_code, city, address\n"
         "Règles:\n"
         "- Si inconnu: \"\"\n"
         "- email en minuscules\n"
         "- postal_code: 5 chiffres\n"
-        "- name = prénom + nom de la personne de la carte si visible\n"
-        "- address = adresse postale sans forcer le code postal/ville si tu n'es pas sûr\n"
+        "- name = prénom + nom si visibles\n"
+        "- address = adresse la plus propre possible\n"
     )
     d = gemini_vision_json(img_bytes, prompt, max_tokens=700) or {}
     return {
@@ -497,6 +492,52 @@ def gemini_extract_facade_logo(img_bytes: bytes) -> Dict[str, str]:
     )
     d = gemini_vision_json(img_bytes, prompt, max_tokens=350) or {}
     return {"company": str(d.get("company") or "").strip(), "city": str(d.get("city") or "").strip()}
+
+def gemini_activity_summary(name: str, naf: str, website: str, company_hint: str = "") -> str:
+    if not GEMINI_API_KEY:
+        return ""
+
+    endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
+
+    prompt = (
+        "Tu es un normaliseur d'activité d'entreprise.\n"
+        "Retourne STRICTEMENT un JSON avec la clé EXACTE: activity_summary\n"
+        "Règles:\n"
+        "- activité très courte, factuelle\n"
+        "- maximum 60 caractères\n"
+        "- pas de marketing\n"
+        "- si inconnu: \"\"\n"
+        f"Nom entreprise: {name}\n"
+        f"Code NAF: {naf}\n"
+        f"Site web: {website}\n"
+        f"Indice complémentaire: {company_hint}\n"
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 120}
+    }
+
+    try:
+        r = requests.post(endpoint, params={"key": GEMINI_API_KEY}, json=payload, timeout=30)
+        if r.status_code >= 300:
+            return ""
+        j = r.json()
+        parts = (((j.get("candidates") or [None])[0] or {}).get("content") or {}).get("parts") or []
+        raw = ""
+        for p in parts:
+            if isinstance(p, dict) and p.get("text"):
+                raw += p["text"]
+        raw = (raw or "").strip()
+        raw = re.sub(r"^```json", "", raw, flags=re.I).strip()
+        raw = re.sub(r"```$", "", raw).strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return ""
+        d = json.loads(m.group(0))
+        return str(d.get("activity_summary") or "").strip()[:60]
+    except Exception:
+        return ""
 
 
 # ============================================================
@@ -583,11 +624,7 @@ def places_enrich(name: str, city: str = "") -> Dict[str, str]:
         website2 = j2.get("websiteUri") or website
         addr = (j2.get("formattedAddress") or "").strip()
 
-        return {
-            "phone": normalize_phone(phone),
-            "website": (website2 or "").strip(),
-            "address": addr,
-        }
+        return {"phone": normalize_phone(phone), "website": (website2 or "").strip(), "address": addr}
     except Exception:
         return {}
 
@@ -627,8 +664,10 @@ def autosize(ws):
         ws.column_dimensions[get_column_letter(col)].width = max_len
 
 def record_score(d: Dict[str, Any]) -> int:
-    fields = ["name","address","postal_code","city","siret","naf","dirigeant","interlocuteur",
-              "contact_firstname","contact_lastname","phone","phone2","email","website","resume","commande"]
+    fields = [
+        "name","address","postal_code","city","siret","naf","activity_summary","dirigeant",
+        "interlocuteur","contact_firstname","contact_lastname","phone","phone2","email","website","resume","commande"
+    ]
     return sum(1 for k in fields if str(d.get(k,"") or "").strip() != "")
 
 def to_row(d: Dict[str, Any]) -> List[Any]:
@@ -668,6 +707,7 @@ def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
         "city": p.get("city",""),
         "siret": p.get("siret",""),
         "naf": p.get("naf",""),
+        "activity_summary": p.get("activity_summary",""),
         "dirigeant": p.get("dirigeant",""),
         "interlocuteur": p.get("interlocuteur",""),
         "contact_firstname": p.get("contact_firstname",""),
@@ -687,7 +727,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     base = {
         "date": date, "agency": agency, "initials": initials,
         "name": "", "address": "", "postal_code": "", "city": "",
-        "siret": "", "naf": "", "dirigeant": "",
+        "siret": "", "naf": "", "activity_summary": "", "dirigeant": "",
         "interlocuteur": "", "contact_firstname": "", "contact_lastname": "",
         "phone": "", "phone2": "", "email": "", "website": "",
         "resume": (comment or "").strip(),
@@ -708,13 +748,11 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     cp_ocr = extract_postal_code(ocr_txt)
     phones_ocr = extract_all_phones(ocr_txt)
 
-    # phone from gemini + OCR
     phones_all = []
     if vis.get("phone"):
         phones_all.append(normalize_phone(vis.get("phone")))
     phones_all.extend(phones_ocr)
 
-    # dédoublonnage
     seen = set()
     dedup_phones = []
     for p in phones_all:
@@ -734,12 +772,10 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
 
     company_guess = deduce_company(vis.get("company") or "", email, website)
 
-    # 3) API gouv: sans ville -> avec ville si besoin
     gouv = search_gouv_company(company_guess, "") if company_guess else {}
     if not gouv and company_guess and city:
         gouv = search_gouv_company(company_guess, city)
 
-    # 4) Places
     place = {}
     if company_guess:
         place = places_enrich(gouv.get("name") or company_guess, city) if city else places_enrich(gouv.get("name") or company_guess, "")
@@ -748,9 +784,18 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     final_website = (website or place.get("website") or "").strip()
     final_email = email or (scrape_email_from_site(final_website) if final_website else "")
 
-    # nom de la carte = contact
+    if not phone and place.get("phone"):
+        phone = normalize_phone(place.get("phone") or "")
+
     full_name = (vis.get("name") or "").strip()
     fn, ln = split_human_name(full_name)
+
+    activity_summary = gemini_activity_summary(
+        name=(gouv.get("name") or company_guess or "").strip(),
+        naf=(gouv.get("naf") or "").strip(),
+        website=final_website,
+        company_hint=(vis.get("company") or "").strip()
+    )
 
     row = dict(base)
     row.update({
@@ -761,6 +806,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
 
         "siret": (gouv.get("siret") or "").strip(),
         "naf": (gouv.get("naf") or "").strip(),
+        "activity_summary": activity_summary,
         "dirigeant": (gouv.get("dirigeant") or "").strip(),
 
         "interlocuteur": full_name or "",
@@ -781,7 +827,7 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     base = {
         "date": date, "agency": agency, "initials": initials,
         "name": "", "address": "", "postal_code": "", "city": (city_hint or "").strip(),
-        "siret": "", "naf": "", "dirigeant": "",
+        "siret": "", "naf": "", "activity_summary": "", "dirigeant": "",
         "interlocuteur": "", "contact_firstname": "", "contact_lastname": "",
         "phone": "", "phone2": "", "email": "", "website": "",
         "resume": (comment or "").strip(),
@@ -814,6 +860,16 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     final_website = (website or place.get("website") or "").strip()
     final_email = (email_ocr or "").strip().lower() or (scrape_email_from_site(final_website) if final_website else "")
 
+    if not phone and place.get("phone"):
+        phone = normalize_phone(place.get("phone") or "")
+
+    activity_summary = gemini_activity_summary(
+        name=(gouv.get("name") or company_guess or "").strip(),
+        naf=(gouv.get("naf") or "").strip(),
+        website=final_website,
+        company_hint=company_raw
+    )
+
     row = dict(base)
     row.update({
         "name": (gouv.get("name") or company_guess).strip(),
@@ -822,12 +878,14 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
         "city": (gouv.get("city") or city).strip(),
         "siret": (gouv.get("siret") or "").strip(),
         "naf": (gouv.get("naf") or "").strip(),
+        "activity_summary": activity_summary,
         "dirigeant": (gouv.get("dirigeant") or "").strip(),
-        "phone": phone or (place.get("phone") or "").strip(),
+        "phone": phone,
         "phone2": phone2,
         "website": final_website,
         "email": final_email,
     })
+
     row = ensure_contact_fallback(row)
     row = normalize_row_address(row)
     return row
