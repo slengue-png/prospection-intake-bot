@@ -72,7 +72,7 @@ EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:(?:\+33|0)[\s\.-]*[1-9](?:[\s\.-]*\d{2}){4})")
 URL_RE = re.compile(r"(https?://[^\s)]+|www\.[^\s)]+)", re.I)
-CP_RE = re.compile(r"\b(0[1-9]\d{3}|[1-8]\d{4}|9[0-5]\d{3}|97\d{3}|98\d{3})\b")
+CP_RE = re.compile(r"\b((?:0[1-9]|[1-8]\d|9[0-5])\s?\d{3}|97\d{3}|98\d{3})\b")
 
 HEADERS = [
     "date","agency","initials","name","address","postal_code","city",
@@ -281,11 +281,14 @@ def extract_urls(text: str) -> List[str]:
             out.append(u)
     return out
 
+def normalize_cp(cp: str) -> str:
+    return re.sub(r"\s+", "", (cp or "").strip())
+
 def extract_postal_code(text: str) -> str:
     if not text:
         return ""
     cps = CP_RE.findall(text)
-    return cps[0] if cps else ""
+    return normalize_cp(cps[0]) if cps else ""
 
 def domain_from_email(email: str) -> str:
     email = (email or "").strip().lower()
@@ -318,14 +321,37 @@ def brand_from_domain(dom: str) -> str:
     dom = re.sub(r"\s+", " ", dom).strip()
     return dom
 
+def normalize_text(s: str) -> str:
+    s = (s or "").lower().strip()
+    s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
+    s = s.replace("à", "a").replace("â", "a")
+    s = s.replace("î", "i").replace("ï", "i")
+    s = s.replace("ô", "o")
+    s = s.replace("ù", "u").replace("û", "u").replace("ü", "u")
+    s = s.replace("ç", "c")
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def normalize_company_name(s: str) -> str:
+    s = normalize_text(s)
+    stop = {
+        "sas","sasu","sa","sarl","eurl","scop","scp","snc","sci",
+        "societe","compagnie","groupe","generale","france","holding","services"
+    }
+    parts = [p for p in s.split() if p not in stop]
+    return " ".join(parts).strip()
+
 def deduce_company(company_raw: str, email: str, website: str) -> str:
     company_raw = (company_raw or "").strip()
-    dom_email = domain_from_email(email)
-    dom_web = domain_from_url(website)
-    if dom_email:
-        return brand_from_domain(dom_email)
-    if dom_web:
-        return brand_from_domain(dom_web)
+    dom_email = brand_from_domain(domain_from_email(email))
+    dom_web = brand_from_domain(domain_from_url(website))
+
+    for cand in [company_raw, dom_web, dom_email]:
+        cand = re.sub(r"\s+", " ", (cand or "").strip())
+        if len(cand) >= 4:
+            return cand
+
     return company_raw
 
 def split_human_name(full: str) -> Tuple[str, str]:
@@ -365,6 +391,28 @@ def normalize_row_address(row: Dict[str, Any]) -> Dict[str, Any]:
         row.get("city", ""),
     )
     return row
+
+def extract_local_address_from_text(text: str) -> Tuple[str, str, str]:
+    if not text:
+        return "", "", ""
+
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
+    lines = [ln for ln in lines if ln]
+
+    for ln in lines:
+        m = CP_RE.search(ln)
+        if not m:
+            continue
+
+        cp = normalize_cp(m.group(1))
+        after = ln[m.end():].strip(" -,:;")
+        city = after[:50].strip()
+        addr = re.sub(r"\s+", " ", ln).strip()
+        city = re.sub(r"\s+", " ", city).strip()
+
+        return addr, cp, city
+
+    return "", "", ""
 
 def ensure_contact_fallback(d: Dict[str, Any]) -> Dict[str, Any]:
     fn = (d.get("contact_firstname") or "").strip()
@@ -477,7 +525,7 @@ def gemini_extract_business_card(img_bytes: bytes) -> Dict[str, str]:
         "email": str(d.get("email") or "").strip().lower(),
         "phone": normalize_phone(str(d.get("phone") or "")),
         "website": str(d.get("website") or "").strip(),
-        "postal_code": str(d.get("postal_code") or "").strip(),
+        "postal_code": normalize_cp(str(d.get("postal_code") or "").strip()),
         "city": str(d.get("city") or "").strip(),
         "address": str(d.get("address") or "").strip(),
     }
@@ -577,12 +625,132 @@ def search_gouv_company(name: str, city: str = "") -> Dict[str, str]:
             "siret": (siege.get("siret") or ""),
             "naf": naf,
             "address": (siege.get("adresse") or siege.get("libelle_voie") or ""),
-            "postal_code": (siege.get("code_postal") or ""),
+            "postal_code": normalize_cp(siege.get("code_postal") or ""),
             "city": (siege.get("libelle_commune") or city),
             "dirigeant": dirigeant,
         }
     except Exception:
         return {}
+
+def build_company_candidates(company_raw: str, email: str, website: str, city: str, ocr_text: str) -> List[str]:
+    cands = []
+    raw = (company_raw or "").strip()
+    dom_email = brand_from_domain(domain_from_email(email))
+    dom_web = brand_from_domain(domain_from_url(website))
+
+    for x in [raw, dom_email, dom_web]:
+        x = re.sub(r"\s+", " ", (x or "").strip())
+        if x and x not in cands:
+            cands.append(x)
+
+    base = cands[:]
+    for x in base:
+        if city:
+            y = f"{x} {city}".strip()
+            if y not in cands:
+                cands.append(y)
+
+    if ocr_text:
+        lines = [re.sub(r"\s+", " ", ln).strip() for ln in ocr_text.splitlines()]
+        for ln in lines[:8]:
+            if len(ln) < 4 or len(ln) > 50:
+                continue
+            if "@" in ln or "www" in ln.lower():
+                continue
+            if re.search(r"\d", ln):
+                continue
+            norm = normalize_company_name(ln)
+            if len(norm) >= 4 and norm not in [normalize_company_name(c) for c in cands]:
+                cands.append(ln)
+                break
+
+    out = []
+    seen = set()
+    for c in cands:
+        key = normalize_company_name(c)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(c)
+    return out[:6]
+
+def search_gouv_company_ranked(company_raw: str, email: str, website: str, city: str, ocr_text: str) -> Dict[str, str]:
+    candidates = build_company_candidates(company_raw, email, website, city, ocr_text)
+    if not candidates:
+        return {}
+
+    brand_email = normalize_company_name(brand_from_domain(domain_from_email(email)))
+    brand_web = normalize_company_name(brand_from_domain(domain_from_url(website)))
+    city_n = normalize_text(city)
+
+    best_score = -999
+    best = {}
+
+    for q in candidates:
+        try:
+            url = f"https://recherche-entreprises.api.gouv.fr/search?q={requests.utils.quote(q)}&page=1&per_page=8"
+            r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
+            if r.status_code != 200:
+                continue
+            j = r.json()
+            results = j.get("results") or []
+        except Exception:
+            continue
+
+        for e in results:
+            siege = e.get("siege") or {}
+            denom = (e.get("nom_raison_sociale") or e.get("denomination") or "").strip()
+            denom_n = normalize_company_name(denom)
+            result_city = (siege.get("libelle_commune") or "").strip()
+            result_city_n = normalize_text(result_city)
+
+            score = 0
+
+            for token in [brand_email, brand_web, normalize_company_name(company_raw), normalize_company_name(q)]:
+                if token and token in denom_n:
+                    score += 20
+
+            if city_n and result_city_n:
+                if city_n == result_city_n:
+                    score += 30
+                elif city_n in result_city_n or result_city_n in city_n:
+                    score += 15
+
+            if brand_email and brand_email in denom_n:
+                score += 20
+            if brand_web and brand_web in denom_n:
+                score += 20
+
+            if normalize_company_name(company_raw) and normalize_company_name(company_raw) not in denom_n and brand_email == "" and brand_web == "":
+                score -= 5
+
+            if score > best_score:
+                best_score = score
+
+                dirigeant = ""
+                arr = e.get("dirigeants") or e.get("representants") or []
+                if arr:
+                    first = arr[0]
+                    if isinstance(first, str):
+                        dirigeant = first
+                    elif isinstance(first, dict):
+                        p = first.get("personne") or first
+                        prenom = p.get("prenom") or p.get("prenoms") or ""
+                        nom = p.get("nom") or p.get("nom_usage") or ""
+                        dirigeant = f"{prenom} {nom}".strip()
+
+                naf = (e.get("activite_principale") or e.get("naf") or "").replace(".", "").replace(" ", "").upper()
+
+                best = {
+                    "name": denom,
+                    "siret": (siege.get("siret") or ""),
+                    "naf": naf,
+                    "address": (siege.get("adresse") or siege.get("libelle_voie") or ""),
+                    "postal_code": normalize_cp(siege.get("code_postal") or ""),
+                    "city": result_city,
+                    "dirigeant": dirigeant,
+                }
+
+    return best
 
 def places_enrich(name: str, city: str = "") -> Dict[str, str]:
     if not GOOGLE_PLACES_API_KEY or not name:
@@ -736,17 +904,22 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     if not img_bytes:
         return base
 
-    # 1) Gemini image-first
+    # 1) Lecture locale carte
     vis = gemini_extract_business_card(img_bytes) if GEMINI_API_KEY else {
         "name":"","company":"","title":"","email":"","phone":"","website":"","postal_code":"","city":"","address":""
     }
 
-    # 2) OCR complément
     ocr_txt = ocr_image_bytes(img_bytes)
     email_ocr = best_email(ocr_txt)
     urls_ocr = extract_urls(ocr_txt)
-    cp_ocr = extract_postal_code(ocr_txt)
     phones_ocr = extract_all_phones(ocr_txt)
+    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text(ocr_txt)
+
+    full_name = (vis.get("name") or "").strip()
+    fn, ln = split_human_name(full_name)
+
+    local_email = (vis.get("email") or email_ocr or "").strip().lower()
+    local_website = (vis.get("website") or (urls_ocr[0] if urls_ocr else "") or "").strip()
 
     phones_all = []
     if vis.get("phone"):
@@ -763,35 +936,45 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
 
     phone, phone2 = split_phones_by_priority(dedup_phones)
 
-    email = (vis.get("email") or email_ocr or "").strip().lower()
-    website = (vis.get("website") or (urls_ocr[0] if urls_ocr else "") or "").strip()
+    local_postal_code = normalize_cp((vis.get("postal_code") or local_cp_ocr or "").strip())
+    local_city = (vis.get("city") or local_city_ocr or "").strip()
+    local_address = (vis.get("address") or local_addr_ocr or "").strip()
 
-    postal_code = (vis.get("postal_code") or cp_ocr or "").strip()
-    city = (vis.get("city") or "").strip()
-    address = (vis.get("address") or "").strip()
+    company_guess = deduce_company(vis.get("company") or "", local_email, local_website)
 
-    company_guess = deduce_company(vis.get("company") or "", email, website)
+    # 2) API gouv améliorée
+    gouv = search_gouv_company_ranked(
+        company_raw=company_guess,
+        email=local_email,
+        website=local_website,
+        city=local_city,
+        ocr_text=ocr_txt
+    )
 
-    gouv = search_gouv_company(company_guess, "") if company_guess else {}
-    if not gouv and company_guess and city:
-        gouv = search_gouv_company(company_guess, city)
+    if not gouv and company_guess:
+        gouv = search_gouv_company(company_guess, local_city)
 
+    # 3) Places en complément
     place = {}
     if company_guess:
-        place = places_enrich(gouv.get("name") or company_guess, city) if city else places_enrich(gouv.get("name") or company_guess, "")
+        place = places_enrich(gouv.get("name") or company_guess, local_city) if local_city else places_enrich(gouv.get("name") or company_guess, "")
         place = place or {}
 
-    final_website = (website or place.get("website") or "").strip()
-    final_email = email or (scrape_email_from_site(final_website) if final_website else "")
+    final_name = (gouv.get("name") or company_guess or "").strip()
+
+    # Priorité aux données locales
+    final_address = local_address or (gouv.get("address") or "") or (place.get("address") or "")
+    final_postal_code = local_postal_code or normalize_cp(gouv.get("postal_code") or "")
+    final_city = local_city or (gouv.get("city") or "").strip()
+
+    final_website = local_website or (place.get("website") or "").strip()
+    final_email = local_email or (scrape_email_from_site(final_website) if final_website else "")
 
     if not phone and place.get("phone"):
         phone = normalize_phone(place.get("phone") or "")
 
-    full_name = (vis.get("name") or "").strip()
-    fn, ln = split_human_name(full_name)
-
     activity_summary = gemini_activity_summary(
-        name=(gouv.get("name") or company_guess or "").strip(),
+        name=final_name,
         naf=(gouv.get("naf") or "").strip(),
         website=final_website,
         company_hint=(vis.get("company") or "").strip()
@@ -799,10 +982,10 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
 
     row = dict(base)
     row.update({
-        "name": (gouv.get("name") or company_guess or "").strip(),
-        "address": (gouv.get("address") or address or place.get("address") or "").strip(),
-        "postal_code": (gouv.get("postal_code") or postal_code or "").strip(),
-        "city": (gouv.get("city") or city or "").strip(),
+        "name": final_name,
+        "address": final_address,
+        "postal_code": final_postal_code,
+        "city": final_city,
 
         "siret": (gouv.get("siret") or "").strip(),
         "naf": (gouv.get("naf") or "").strip(),
@@ -852,8 +1035,14 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     if not company_guess:
         return base
 
-    gouv = search_gouv_company(company_guess, "")
-    if not gouv and city:
+    gouv = search_gouv_company_ranked(
+        company_raw=company_guess,
+        email=email_ocr,
+        website=website,
+        city=city,
+        ocr_text=ocr_txt
+    )
+    if not gouv:
         gouv = search_gouv_company(company_guess, city)
 
     place = places_enrich(gouv.get("name") or company_guess, city) if GOOGLE_PLACES_API_KEY else {}
