@@ -74,7 +74,7 @@ os.makedirs(OUT_DIR, exist_ok=True)
 VALID_AGENCIES = {"GR", "VR", "GRS", "SLS"}
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
-EMAIL_IN_TEXT_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}")
+EMAIL_IN_TEXT_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
 PHONE_RE = re.compile(r"(?:(?:\+33|0)[\s\.-]*[1-9](?:[\s\.-]*\d{2}){4})")
 URL_RE = re.compile(r"(https?://[^\s)]+|www\.[^\s)]+)", re.I)
 CP_RE = re.compile(r"\b((?:0[1-9]|[1-8]\d|9[0-5])\s?\d{3}|97\d{3}|98\d{3})\b")
@@ -306,6 +306,8 @@ def extract_urls(text: str) -> List[str]:
         u = m.group(0).strip()
         if u.lower().startswith("www."):
             u = "https://" + u
+        # nettoie ponctuation de fin
+        u = u.rstrip(".,;:")
         k = u.lower()
         if k not in seen:
             seen.add(k)
@@ -329,7 +331,7 @@ def domain_from_email(email: str) -> str:
     if "@" not in email:
         return ""
     dom = email.split("@", 1)[1].strip()
-    dom = re.sub(r"[^a-z0-9\.\-]", "", dom)
+    dom = re.sub(r"[^a-z0-9.\-]", "", dom)
     if dom in {"gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "yahoo.fr", "icloud.com", "free.fr", "orange.fr", "laposte.net"}:
         return ""
     return dom
@@ -342,7 +344,7 @@ def domain_from_url(url: str) -> str:
     u = re.sub(r"^https?://", "", u)
     u = u.split("/", 1)[0]
     u = u.split(":", 1)[0]
-    u = re.sub(r"[^a-z0-9\.\-]", "", u)
+    u = re.sub(r"[^a-z0-9.\-]", "", u)
     if u.startswith("www."):
         u = u[4:]
     return u
@@ -409,24 +411,37 @@ def is_probable_person_name(s: str) -> bool:
     s = re.sub(r"\s+", " ", (s or "").strip())
     if not s:
         return False
-    if "@" in s or "www" in s.lower():
+    low = normalize_text(s)
+    if "@" in s or "www" in low:
         return False
     if re.search(r"\d", s):
+        return False
+
+    # faux positifs vus dans ton fichier
+    bad_exact = {
+        "alt gr", "ait gr", "alt qr", "ait qr", "cs", "sas", "sarl", "sa"
+    }
+    if low in bad_exact:
         return False
 
     bad_tokens = {
         "restaurant", "responsable", "commerce", "collectivite", "territoire",
         "recyclage", "valorisation", "dechets", "drh", "developpement", "rh",
         "onyx", "auvergne", "rhone", "alpes", "sas", "sarl", "eurl", "sa",
-        "service", "environnement", "gestion"
+        "service", "environnement", "gestion", "cedex", "centr", "alp", "cs"
     }
-    norm = normalize_text(s)
-    words = norm.split()
+    words = low.split()
     if len(words) < 2 or len(words) > 4:
         return False
     if any(w in bad_tokens for w in words):
         return False
-    return True
+
+    # au moins 2 mots avec vraisemblance nom/prénom
+    good = 0
+    for w in words:
+        if len(w) >= 2:
+            good += 1
+    return good >= 2
 
 
 def extract_contact_name_from_ocr(text: str) -> str:
@@ -480,20 +495,37 @@ def extract_local_address_from_text(text: str) -> Tuple[str, str, str]:
     lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
     lines = [ln for ln in lines if ln]
 
-    for ln in lines:
+    best_addr = ""
+    best_cp = ""
+    best_city = ""
+
+    # priorité à la ligne qui contient CP + au moins un mot avant et après
+    for i, ln in enumerate(lines):
         m = CP_RE.search(ln)
         if not m:
             continue
 
         cp = normalize_cp(m.group(1))
+        before = ln[:m.start()].strip(" -,:;")
         after = ln[m.end():].strip(" -,:;")
-        city = after[:50].strip()
-        addr = re.sub(r"\s+", " ", ln).strip()
+
+        # si la ligne est trop courte, on regarde la ligne précédente
+        addr_line = ln
+        if len(before) < 4 and i > 0:
+            prev = lines[i - 1]
+            if not CP_RE.search(prev):
+                addr_line = f"{prev} {ln}".strip()
+
+        city = after[:60].strip()
+
+        addr_line = re.sub(r"\s+", " ", addr_line).strip()
         city = re.sub(r"\s+", " ", city).strip()
 
-        return addr, cp, city
+        if cp:
+            best_addr, best_cp, best_city = addr_line, cp, city
+            break
 
-    return "", "", ""
+    return best_addr, best_cp, best_city
 
 
 def ensure_contact_fallback(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -1071,7 +1103,7 @@ def scrape_email_from_site(url: str) -> str:
         if r.status_code >= 300:
             return ""
         html = r.text[:250000]
-        matches = re.findall(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[A-Za-z]{2,}", html)
+        matches = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", html)
         if not matches:
             return ""
         filtered = [m for m in matches if not re.search(r"no-?reply", m, re.I)]
@@ -1107,22 +1139,46 @@ def record_score(d: Dict[str, Any]) -> int:
     return sum(1 for k in fields if str(d.get(k, "") or "").strip() != "")
 
 
+def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best_by_key: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        key = "|".join([
+            normalize_text(r.get("agency", "")),
+            normalize_text(r.get("initials", "")),
+            normalize_company_name(r.get("name", "")),
+            normalize_text(r.get("email", "")),
+            normalize_text(r.get("phone", "")),
+            normalize_text(r.get("address", "")),
+            normalize_text(r.get("city", "")),
+        ])
+        if key == "|||||||":
+            key = json.dumps(r, ensure_ascii=False)
+        prev = best_by_key.get(key)
+        if prev is None or record_score(r) > record_score(prev):
+            best_by_key[key] = r
+    return list(best_by_key.values())
+
+
 def to_row(d: Dict[str, Any]) -> List[Any]:
     return [d.get(h, "") for h in HEADERS]
 
 
 def build_excel_one_sheet(date: str, rows: List[Dict[str, Any]], suffix: str) -> str:
+    rows = dedupe_rows(rows)
     rows_sorted = sorted(rows, key=lambda x: record_score(x), reverse=True)
+
     wb = Workbook()
     ws = wb.active
     ws.title = "DATA"
     ws.append(HEADERS)
     for r in rows_sorted:
         ws.append(to_row(r))
+
     for c in range(1, len(HEADERS) + 1):
         cell = ws.cell(row=1, column=c)
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
+
     ws.freeze_panes = "A2"
     autosize(ws)
     filename = os.path.join(OUT_DIR, f"PROSPECTION_{date}_{suffix}.xlsx")
@@ -1193,10 +1249,10 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     phones_ocr = extract_all_phones(ocr_txt)
     local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text(ocr_txt)
 
+    # interlocuteur carte prioritaire
     full_name = (vis.get("name") or "").strip()
     if not full_name:
         full_name = extract_contact_name_from_ocr(ocr_txt)
-
     fn, ln = split_human_name(full_name)
 
     local_email = (vis.get("email") or email_ocr or "").strip().lower()
