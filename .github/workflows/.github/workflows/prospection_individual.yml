@@ -1,0 +1,59 @@
+name: Prospection Individual Export
+
+on:
+  workflow_dispatch:
+    inputs:
+      agency:
+        description: "Agency"
+        required: true
+      initials:
+        description: "User initials"
+        required: true
+      run_date:
+        description: "Date"
+        required: false
+
+jobs:
+
+  run-individual:
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run individual export
+        env:
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
+
+          MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
+
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+
+          SEND_MODE: individual
+          RUN_DATE: ${{ inputs.run_date }}
+
+          AGENCY: ${{ inputs.agency }}
+          INITIALS: ${{ inputs.initials }}
+
+          MAX_OCR_IMAGES: 50
+          MAX_PHOTO_IMAGES: 15
+
+        run: |
+          python scripts/export_and_mail.py
