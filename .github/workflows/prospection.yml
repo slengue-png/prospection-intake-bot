@@ -1,235 +1,123 @@
-name: Prospection
+name: Prospection Export
 
 on:
+
   workflow_dispatch:
     inputs:
+
       mode:
-        description: "Mode d'envoi"
+        description: "Mode d'exécution"
         required: true
-        default: "individual"
+        default: "agency_manager"
         type: choice
         options:
           - individual
           - agency_manager
           - admin
 
-      run_date:
-        description: "Date YYYY-MM-DD (vide = aujourd'hui Europe/Paris)"
-        required: false
-        type: string
-
       agency:
-        description: "Agence (requis si mode=individual)"
+        description: "Agence (mode individual)"
         required: false
-        type: choice
-        options:
-          - ""
-          - GR
-          - VR
-          - GRS
-          - SLS
+        default: ""
 
       initials:
-        description: "Initiales (requis si mode=individual)"
+        description: "Initiales (mode individual)"
         required: false
-        type: choice
-        options:
-          - ""
-          - JL
-          - CZ
-          - JB
-          - LB
-          - PV
-          - ST
-          - AC
-          - SL
+        default: ""
 
-      max_ocr_images:
-        description: "Max cartes par personne"
+      run_date:
+        description: "Date (YYYY-MM-DD)"
         required: false
-        default: "50"
-        type: choice
-        options:
-          - "10"
-          - "20"
-          - "30"
-          - "50"
-          - "80"
-          - "120"
-
-      max_photo_images:
-        description: "Max photos par personne"
-        required: false
-        default: "15"
-        type: choice
-        options:
-          - "5"
-          - "10"
-          - "15"
-          - "25"
-          - "40"
+        default: ""
 
   schedule:
-    - cron: "45 15 * * 1-5"
-    - cron: "45 16 * * 1-5"
-    - cron: "47 15 * * 1-5"
-    - cron: "47 16 * * 1-5"
+    - cron: "45 15 * * *"   # 17:45 France
+    - cron: "59 21 * * *"   # 23:59 France
 
-concurrency:
-  group: prospection-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
 
 jobs:
-  export_and_mail:
+
+  export:
+
     runs-on: ubuntu-latest
-    timeout-minutes: 40
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+    - uses: actions/checkout@v4
 
-      - name: Install system deps
-        shell: bash
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra libmagic1
-          echo "=== Tesseract version ==="
-          tesseract --version || true
-          echo "=== Tesseract languages ==="
-          tesseract --list-langs || true
 
-      - name: Validate requirements.txt exists
-        shell: bash
-        run: |
-          set -e
-          ls -la
-          if [ ! -f "requirements.txt" ]; then
-            echo "::error::requirements.txt introuvable à la racine du repo"
-            exit 1
-          fi
-          echo "=== requirements.txt ==="
-          cat requirements.txt
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
 
-      - name: Install python deps
-        shell: bash
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-          python -c "import pytesseract; print('✅ pytesseract OK')"
 
-      - name: Compute context (mode/date) + schedule guard
-        id: ctx
-        shell: bash
-        run: |
-          MODE="${{ inputs.mode }}"
-          RUN_DATE="${{ inputs.run_date }}"
-          SHOULD_RUN="1"
+    - name: Install dependencies
+      run: |
+        pip install -r requirements.txt
 
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            PARIS_HOUR=$(TZ="Europe/Paris" date +%H)
-            PARIS_MIN=$(TZ="Europe/Paris" date +%M)
-            echo "Paris now: ${PARIS_HOUR}:${PARIS_MIN}"
 
-            if [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "45" ]; then
-              MODE="agency_manager"
-            elif [ "$PARIS_HOUR" = "17" ] && [ "$PARIS_MIN" = "47" ]; then
-              MODE="admin"
-            else
-              SHOULD_RUN="0"
-              MODE="skip"
-              echo "Guard: pas l'heure cible 17:45 / 17:47 Paris"
-            fi
-          fi
+    # -----------------------------
+    # Préparer le contexte
+    # -----------------------------
 
-          if [ -z "$RUN_DATE" ]; then
-            RUN_DATE=$(TZ="Europe/Paris" date +%Y-%m-%d)
-          fi
+    - name: Prepare context
+      id: ctx
+      run: |
 
-          echo "mode=$MODE" >> $GITHUB_OUTPUT
-          echo "run_date=$RUN_DATE" >> $GITHUB_OUTPUT
-          echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
+        MODE="${{ inputs.mode }}"
+        DATE="${{ inputs.run_date }}"
 
-      - name: Validate manual inputs
-        if: ${{ github.event_name == 'workflow_dispatch' }}
-        shell: bash
-        run: |
-          MODE="${{ steps.ctx.outputs.mode }}"
-          RUN_DATE="${{ steps.ctx.outputs.run_date }}"
-          AGENCY="${{ inputs.agency }}"
-          INITIALS="${{ inputs.initials }}"
+        if [ -z "$MODE" ]; then
+          MODE="agency_manager"
+        fi
 
-          if [[ ! "$MODE" =~ ^(individual|agency_manager|admin)$ ]]; then
-            echo "::error::mode invalide: $MODE"
-            exit 1
-          fi
+        if [ -z "$DATE" ]; then
+          DATE=$(date -u +%F)
+        fi
 
-          if [ "$MODE" = "individual" ]; then
-            if [ -z "$AGENCY" ]; then
-              echo "::error::AGENCY requis pour mode=individual"
-              exit 1
-            fi
-            if [ -z "$INITIALS" ]; then
-              echo "::error::INITIALS requis pour mode=individual"
-              exit 1
-            fi
-          fi
+        echo "mode=$MODE" >> $GITHUB_OUTPUT
+        echo "run_date=$DATE" >> $GITHUB_OUTPUT
+        echo "should_run=1" >> $GITHUB_OUTPUT
 
-          if [ -n "$RUN_DATE" ] && ! [[ "$RUN_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-            echo "::error::RUN_DATE invalide (YYYY-MM-DD): $RUN_DATE"
-            exit 1
-          fi
 
-          echo "✅ Inputs validés"
+    # -----------------------------
+    # Lancer export
+    # -----------------------------
 
-      - name: Skip schedule run if guard says no
-        if: ${{ steps.ctx.outputs.should_run != '1' }}
-        shell: bash
-        run: |
-          echo "Skip propre : run schedule hors heure cible"
-          exit 0
+    - name: Run export & mail
+      if: ${{ steps.ctx.outputs.should_run == '1' }}
 
-      - name: Run export & mail
-        shell: bash
-        env:
-          WORKER_BASE_URL:        ${{ secrets.WORKER_BASE_URL }}
-          EXPORT_TOKEN:           ${{ secrets.EXPORT_TOKEN }}
-          TELEGRAM_TOKEN:         ${{ secrets.TELEGRAM_TOKEN }}
+      env:
 
-          BREVO_API_KEY:          ${{ secrets.BREVO_API_KEY }}
-          BREVO_SENDER_EMAIL:     ${{ secrets.BREVO_SENDER_EMAIL }}
-          BREVO_SENDER_NAME:      ${{ secrets.BREVO_SENDER_NAME }}
-          MAIL_ROUTING_JSON:      ${{ secrets.MAIL_ROUTING_JSON }}
+        WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+        EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+        TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
 
-          GEMINI_API_KEY:         ${{ secrets.GEMINI_API_KEY }}
-          GOOGLE_PLACES_API_KEY:  ${{ secrets.GOOGLE_PLACES_API_KEY }}
+        BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+        BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+        BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
 
-          SEND_MODE:              ${{ steps.ctx.outputs.mode }}
-          RUN_DATE:               ${{ steps.ctx.outputs.run_date }}
-          AGENCY:                 ${{ inputs.agency }}
-          INITIALS:               ${{ inputs.initials }}
-          MAX_OCR_IMAGES:         ${{ inputs.max_ocr_images }}
-          MAX_PHOTO_IMAGES:       ${{ inputs.max_photo_images }}
-          OUT_DIR:                out
-        run: |
-          echo "GEMINI length=${#GEMINI_API_KEY}"
-          echo "PLACES length=${#GOOGLE_PLACES_API_KEY}"
-          echo "🚀 Lancement — mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS"
-          python scripts/export_and_mail.py
+        MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
 
-      - name: Upload artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: prospection-${{ steps.ctx.outputs.mode }}-${{ steps.ctx.outputs.run_date }}-${{ github.run_id }}
-          path: |
-            out/**/*.xlsx
-            out/**/*.zip
-            exports/**/*.xlsx
-            exports/**/*.zip
-          retention-days: 7
-          if-no-files-found: ignore
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+
+        SEND_MODE: ${{ steps.ctx.outputs.mode }}
+        RUN_DATE: ${{ steps.ctx.outputs.run_date }}
+
+        AGENCY: ${{ inputs.agency }}
+        INITIALS: ${{ inputs.initials }}
+
+        MAX_OCR_IMAGES: 50
+        MAX_PHOTO_IMAGES: 15
+
+        OUT_DIR: out
+
+      run: |
+
+        echo "GEMINI length=${#GEMINI_API_KEY}"
+        echo "PLACES length=${#GOOGLE_PLACES_API_KEY}"
+
+        echo "🚀 Lancement — mode=$SEND_MODE date=$RUN_DATE agency=$AGENCY initials=$INITIALS"
+
+        python scripts/export_and_mail.py
