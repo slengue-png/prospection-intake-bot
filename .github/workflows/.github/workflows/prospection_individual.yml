@@ -1,37 +1,61 @@
-name: Prospection Individual Export
+name: Prospection Close Individual
 
 on:
   workflow_dispatch:
     inputs:
+      mode:
+        description: "Mode d'envoi"
+        required: true
+        default: "individual"
+        type: choice
+        options:
+          - individual
+      run_date:
+        description: "Date métier Europe/Paris (YYYY-MM-DD)"
+        required: false
+        default: ""
       agency:
-        description: "Agency"
+        description: "Agence (GR|VR|GRS|SLS)"
         required: true
       initials:
-        description: "User initials"
+        description: "Initiales collaborateur"
         required: true
-      run_date:
-        description: "Date"
-        required: false
+
+concurrency:
+  group: prospection-close-${{ github.event.inputs.agency }}-${{ github.event.inputs.initials }}-${{ github.event.inputs.run_date || 'today' }}
+  cancel-in-progress: false
 
 jobs:
-
-  run-individual:
-
+  run-close:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
-
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
-      - name: Install deps
+      - name: Set Paris date
+        shell: bash
         run: |
-          pip install -r requirements.txt
+          if [ -n "${{ github.event.inputs.run_date }}" ]; then
+            echo "RUN_DATE=${{ github.event.inputs.run_date }}" >> $GITHUB_ENV
+          else
+            echo "RUN_DATE=$(TZ=Europe/Paris date +%F)" >> $GITHUB_ENV
+          fi
 
-      - name: Run individual export
+      - name: Install system OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra tesseract-ocr-eng
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run close export
         env:
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
@@ -47,13 +71,8 @@ jobs:
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
 
           SEND_MODE: individual
-          RUN_DATE: ${{ inputs.run_date }}
-
-          AGENCY: ${{ inputs.agency }}
-          INITIALS: ${{ inputs.initials }}
-
-          MAX_OCR_IMAGES: 50
-          MAX_PHOTO_IMAGES: 15
-
+          RUN_DATE: ${{ env.RUN_DATE }}
+          AGENCY: ${{ github.event.inputs.agency }}
+          INITIALS: ${{ github.event.inputs.initials }}
         run: |
           python scripts/export_and_mail.py
