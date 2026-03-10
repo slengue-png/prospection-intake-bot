@@ -104,19 +104,19 @@ DEFAULT_ROUTING = {
     "agencies": {
         "GR": {
             "manager": {"initials": "JL", "email": "jennifer.laurens@ras-interim.fr"},
-            "commercial": {"initials": "CZ", "email": "celine.zunarelli@ras-interim.fr"}
+            "commercial": {"initials": "CZ", "email": "celine.zunarelli@ras-interim.fr"},
         },
         "VR": {
             "manager": {"initials": "JB", "email": "jelena.carrasso@ras-interim.fr"},
-            "commercial": {"initials": "LB", "email": "laura.berthet@ras-interim.fr"}
+            "commercial": {"initials": "LB", "email": "laura.berthet@ras-interim.fr"},
         },
         "GRS": {
             "manager": {"initials": "PV", "email": "pauline.vieira@ras-interim.fr"},
-            "commercial": {"initials": "ST", "email": "severine.thevenin@ras-interim.fr"}
+            "commercial": {"initials": "ST", "email": "severine.thevenin@ras-interim.fr"},
         },
         "SLS": {
             "manager": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"},
-            "commercial": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"}
+            "commercial": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"},
         },
     },
     "users": {
@@ -210,7 +210,7 @@ STATS = {
     "ocr_tesseract_calls": 0,
 }
 
-GOUV_CACHE: Dict[str, Dict[str, str]] = {}
+GOUV_CACHE: Dict[str, Dict[str, Any]] = {}
 PLACES_CACHE: Dict[str, Dict[str, str]] = {}
 EMAIL_SCRAPE_CACHE: Dict[str, str] = {}
 GEMINI_ACTIVITY_CACHE: Dict[str, str] = {}
@@ -600,6 +600,175 @@ def ensure_contact_fallback(d: Dict[str, Any]) -> Dict[str, Any]:
     return d
 
 
+def normalize_upper(v: str) -> str:
+    return re.sub(r"\s+", " ", (v or "").strip()).upper()
+
+
+def clean_ocr_line(line: str) -> str:
+    s = re.sub(r"\s+", " ", (line or "").strip())
+    s = s.replace("|", " ").replace("•", " ").replace("—", " ").replace("–", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def clean_ocr_lines(text: str) -> List[str]:
+    bad_contains = [
+        "scannez-moi",
+        "scannez moi",
+        "en savoir plus",
+        "qr code",
+    ]
+    out = []
+    seen = set()
+
+    for raw in (text or "").splitlines():
+        ln = clean_ocr_line(raw)
+        if not ln:
+            continue
+
+        low = normalize_text(ln)
+        if any(x in low for x in bad_contains):
+            continue
+
+        key = low
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(ln)
+
+    return out
+
+
+def looks_like_company_line(line: str) -> bool:
+    ln = clean_ocr_line(line)
+    if not ln:
+        return False
+    low = normalize_text(ln)
+
+    if "@" in ln:
+        return False
+    if URL_RE.search(ln):
+        return False
+    if PHONE_RE.search(ln):
+        return False
+    if CP_RE.search(ln):
+        return False
+    if re.search(r"\d", ln):
+        return False
+
+    bad_words = {
+        "directeur", "responsable", "rh", "site", "manager",
+        "portable", "tel", "telephone", "mail", "email"
+    }
+    words = set(low.split())
+    if words & bad_words:
+        return False
+
+    if len(ln) < 4:
+        return False
+
+    return True
+
+
+def detect_company_from_lines(lines: List[str], gemini_company: str = "", website: str = "", email: str = "") -> str:
+    if gemini_company and len(gemini_company.strip()) >= 3:
+        return re.sub(r"\s+", " ", gemini_company).strip()
+
+    dom_web = brand_from_domain(domain_from_url(website))
+    dom_email = brand_from_domain(domain_from_email(email))
+
+    candidates = []
+    for i, ln in enumerate(lines[:8]):
+        if looks_like_company_line(ln):
+            score = 0
+            if i <= 1:
+                score += 20
+            if ln == ln.upper():
+                score += 15
+            if len(ln.split()) <= 4:
+                score += 10
+
+            low = normalize_company_name(ln)
+            if dom_web and normalize_company_name(dom_web) in low:
+                score += 25
+            if dom_email and normalize_company_name(dom_email) in low:
+                score += 25
+
+            candidates.append((score, ln))
+
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1].strip()
+
+    for cand in [dom_web, dom_email]:
+        cand = re.sub(r"\s+", " ", (cand or "").strip())
+        if len(cand) >= 3:
+            return cand
+
+    return ""
+
+
+def detect_person_name_from_lines(lines: List[str], company_line: str = "") -> str:
+    company_n = normalize_company_name(company_line)
+
+    for ln in lines[:12]:
+        if not is_probable_person_name(ln):
+            continue
+        if company_n and normalize_company_name(ln) == company_n:
+            continue
+        return ln.strip()
+
+    return ""
+
+
+def extract_role_from_lines(lines: List[str]) -> str:
+    role_words = [
+        "directeur", "responsable", "rh", "gérant", "gerant",
+        "site", "commercial", "president", "président"
+    ]
+    for ln in lines[:10]:
+        low = normalize_text(ln)
+        if any(w in low for w in role_words):
+            return ln.strip()
+    return ""
+
+
+def extract_best_company_hint(lines: List[str], gemini_company: str, website: str, email: str) -> str:
+    company = detect_company_from_lines(lines, gemini_company=gemini_company, website=website, email=email)
+    return deduce_company(company, email, website)
+
+
+def infer_activity_fallback(name: str, website: str = "", naf: str = "") -> str:
+    n = normalize_text(name)
+    w = normalize_text(domain_from_url(website))
+    z = f"{n} {w} {naf}".strip()
+
+    rules = [
+        (["menuiserie", "bois"], "MENUISERIE"),
+        (["vert marine", "aqualone", "aquatique", "piscine"], "CENTRE AQUATIQUE"),
+        (["cheval", "transport", "travaux publics", "benne"], "TRANSPORT / TRAVAUX PUBLICS"),
+    ]
+
+    for keys, label in rules:
+        if any(k in z for k in keys):
+            return label
+
+    return ""
+
+
+def enrich_activity_summary(name: str, naf: str, website: str, company_hint: str = "") -> str:
+    val = gemini_activity_summary(name=name, naf=naf, website=website, company_hint=company_hint)
+    if val:
+        return val
+    return infer_activity_fallback(name=name, website=website, naf=naf)
+
+
+def uppercase_business_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    for k in ["name", "address", "city", "dirigeant", "interlocuteur"]:
+        row[k] = normalize_upper(row.get(k, ""))
+    return row
+
+
 # ============================================================
 # HTTP HELPERS
 # ============================================================
@@ -778,6 +947,8 @@ def ocr_image_bytes(img_bytes: bytes, light: bool = False) -> str:
                 all_texts.append(t2)
 
     return merge_text_blocks(all_texts)
+
+
 # ============================================================
 # GEMINI
 # ============================================================
@@ -1442,7 +1613,7 @@ def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
     name = p.get("name", "")
     activity_summary = p.get("activity_summary", "")
     if not activity_summary and (name or naf or website):
-        activity_summary = gemini_activity_summary(name=name, naf=naf, website=website, company_hint=name)
+        activity_summary = enrich_activity_summary(name=name, naf=naf, website=website, company_hint=name)
 
     d = {
         "date": p.get("date", ""),
@@ -1470,6 +1641,7 @@ def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
         d["phone2"] = ""
     d = ensure_contact_fallback(d)
     d = normalize_row_address(d)
+    d = uppercase_business_fields(d)
     return d
 
 
@@ -1486,55 +1658,70 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     if not img_bytes:
         return base
 
-    # Priorité carte : Gemini d'abord, OCR hybride ensuite si manques
     vis = gemini_extract_business_card(img_bytes) if GEMINI_API_KEY else {
         "name": "", "company": "", "title": "", "email": "", "phone": "",
         "website": "", "postal_code": "", "city": "", "address": ""
     }
 
-    need_ocr = not any([vis.get("name"), vis.get("company"), vis.get("email"), vis.get("phone"), vis.get("website"), vis.get("address")])
-    ocr_txt = ocr_image_bytes(img_bytes, light=not need_ocr)
+    light_ocr = bool(vis.get("name") or vis.get("company") or vis.get("email") or vis.get("phone") or vis.get("website"))
+    ocr_txt = ocr_image_bytes(img_bytes, light=light_ocr)
+    lines = clean_ocr_lines(ocr_txt)
 
-    email_ocr = best_email(ocr_txt)
-    urls_ocr = extract_urls(ocr_txt)
-    phones_ocr = extract_all_phones(ocr_txt)
-    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text(ocr_txt)
+    email_ocr = best_email("\n".join(lines))
+    urls_ocr = extract_urls("\n".join(lines))
+    phones_ocr = extract_all_phones("\n".join(lines))
+    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text("\n".join(lines))
 
-    full_name = (vis.get("name") or "").strip()
-    if not full_name:
-        full_name = extract_contact_name_from_ocr(ocr_txt)
-    fn, ln = split_human_name(full_name)
-
+    local_website = (vis.get("website") or (urls_ocr[0] if urls_ocr else "") or "").strip()
     local_email = clean_email(vis.get("email") or email_ocr or "")
     if local_email and not is_valid_email(local_email):
         local_email = ""
-    local_website = (vis.get("website") or (urls_ocr[0] if urls_ocr else "") or "").strip()
 
-    phones_all = []
-    if vis.get("phone"):
-        phones_all.append(normalize_phone(vis.get("phone")))
-    phones_all.extend(phones_ocr)
-    dedup_phones = []
-    seen = set()
-    for p in phones_all:
-        p = normalize_phone(p)
-        if p and p not in seen:
-            seen.add(p)
-            dedup_phones.append(p)
-    phone, phone2 = split_phones_by_priority(dedup_phones)
+    company_line = detect_company_from_lines(
+        lines,
+        gemini_company=(vis.get("company") or "").strip(),
+        website=local_website,
+        email=local_email
+    )
+
+    person_name = (vis.get("name") or "").strip()
+    if not person_name:
+        person_name = detect_person_name_from_lines(lines, company_line=company_line)
+
+    fn, ln = split_human_name(person_name)
 
     local_postal_code = normalize_cp((vis.get("postal_code") or local_cp_ocr or "").strip())
     local_city = (vis.get("city") or local_city_ocr or "").strip()
     local_address = (vis.get("address") or local_addr_ocr or "").strip()
 
-    company_guess = deduce_company(vis.get("company") or "", local_email, local_website)
+    phones_all = []
+    if vis.get("phone"):
+        phones_all.append(normalize_phone(vis.get("phone")))
+    phones_all.extend(phones_ocr)
+
+    seen = set()
+    dedup_phones = []
+    for p in phones_all:
+        p = normalize_phone(p)
+        if p and p not in seen:
+            seen.add(p)
+            dedup_phones.append(p)
+
+    phone, phone2 = split_phones_by_priority(dedup_phones)
+
+    company_guess = extract_best_company_hint(
+        lines=lines,
+        gemini_company=(vis.get("company") or "").strip(),
+        website=local_website,
+        email=local_email
+    )
 
     gouv = search_gouv_company_ranked(
         company_raw=company_guess,
         email=local_email,
         website=local_website,
         city=local_city,
-        ocr_text=ocr_txt,
+        ocr_text="\n".join(lines),
         address_hint=local_address,
         postal_code_hint=local_postal_code
     )
@@ -1557,24 +1744,19 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
         place = places_enrich(place_query_name, local_city) if local_city else places_enrich(place_query_name, "")
         place = place or {}
 
-    # Priorité carte > API
-    final_name = (gouv.get("name") or company_guess or "").strip()
-    final_address = local_address or (gouv.get("address") or "") or (place.get("address") or "")
-    final_postal_code = local_postal_code or normalize_cp(gouv.get("postal_code") or "")
-    final_city = local_city or (gouv.get("city") or "").strip()
-    final_website = local_website or (place.get("website") or "").strip()
+    final_name = (company_line or gouv.get("name") or company_guess or "").strip()
+    final_address = (local_address or gouv.get("address") or place.get("address") or "").strip()
+    final_postal_code = normalize_cp(local_postal_code or gouv.get("postal_code") or "")
+    final_city = (local_city or gouv.get("city") or "").strip()
+    final_website = (local_website or place.get("website") or "").strip()
     final_email = local_email or (scrape_email_from_site(final_website) if final_website else "")
     final_email = clean_email(final_email) if is_valid_email(final_email) else ""
 
     if not phone and place.get("phone"):
         phone = normalize_phone(place.get("phone") or "")
 
-    activity_summary = gemini_activity_summary(
-        name=final_name,
-        naf=(gouv.get("naf") or "").strip(),
-        website=final_website,
-        company_hint=(vis.get("company") or "").strip()
-    )
+    final_dirigeant = (gouv.get("dirigeant") or "").strip()
+    final_interlocuteur = person_name.strip()
 
     row = dict(base)
     row.update({
@@ -1584,14 +1766,16 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
         "city": final_city,
         "siret": validate_siret((gouv.get("siret") or "").strip()),
         "naf": (gouv.get("naf") or "").strip(),
-        "activity_summary": activity_summary,
-        "dirigeant": (gouv.get("dirigeant") or "").strip(),
-
-        # priorité interlocuteur carte
-        "interlocuteur": full_name or "",
+        "activity_summary": enrich_activity_summary(
+            name=final_name,
+            naf=(gouv.get("naf") or "").strip(),
+            website=final_website,
+            company_hint=(company_guess or company_line or "")
+        ),
+        "dirigeant": final_dirigeant,
+        "interlocuteur": final_interlocuteur,
         "contact_firstname": fn,
         "contact_lastname": ln,
-
         "phone": phone,
         "phone2": phone2,
         "email": final_email,
@@ -1603,6 +1787,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
 
     row = ensure_contact_fallback(row)
     row = normalize_row_address(row)
+    row = uppercase_business_fields(row)
     return row
 
 
@@ -1620,21 +1805,30 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
         return base
 
     vis = gemini_extract_facade_logo(img_bytes) if GEMINI_API_KEY else {"company": "", "city": ""}
+    ocr_txt = ocr_image_bytes(img_bytes, light=not bool(vis.get("company")))
+    lines = clean_ocr_lines(ocr_txt)
+
     company_raw = (vis.get("company") or "").strip()
     city = (vis.get("city") or "").strip() or (city_hint or "").strip()
 
-    ocr_txt = ocr_image_bytes(img_bytes, light=not bool(company_raw))
-    email_ocr = best_email(ocr_txt)
-    urls_ocr = extract_urls(ocr_txt)
+    email_ocr = best_email("\n".join(lines))
+    urls_ocr = extract_urls("\n".join(lines))
+    phones_ocr = extract_all_phones("\n".join(lines))
+    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text("\n".join(lines))
+
     website = (urls_ocr[0] if urls_ocr else "").strip()
-    phones_ocr = extract_all_phones(ocr_txt)
     phone, phone2 = split_phones_by_priority(phones_ocr)
 
-    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text(ocr_txt)
     if not city:
         city = local_city_ocr
 
-    company_guess = deduce_company(company_raw, email_ocr, website)
+    company_guess = extract_best_company_hint(
+        lines=lines,
+        gemini_company=company_raw,
+        website=website,
+        email=email_ocr
+    )
+
     if not company_guess:
         return base
 
@@ -1643,7 +1837,7 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
         email=email_ocr,
         website=website,
         city=city,
-        ocr_text=ocr_txt,
+        ocr_text="\n".join(lines),
         address_hint=local_addr_ocr,
         postal_code_hint=local_cp_ocr
     )
@@ -1658,24 +1852,24 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     if not phone and place.get("phone"):
         phone = normalize_phone(place.get("phone") or "")
 
-    activity_summary = gemini_activity_summary(
-        name=(gouv.get("name") or company_guess or "").strip(),
-        naf=(gouv.get("naf") or "").strip(),
-        website=final_website,
-        company_hint=company_raw
-    )
-
     row = dict(base)
     row.update({
         "name": (gouv.get("name") or company_guess).strip(),
-        "address": strip_postal_city_from_address((local_addr_ocr or gouv.get("address") or place.get("address") or "").strip(),
-                                                  local_cp_ocr or (gouv.get("postal_code") or ""),
-                                                  local_city_ocr or (gouv.get("city") or city)),
+        "address": strip_postal_city_from_address(
+            (local_addr_ocr or gouv.get("address") or place.get("address") or "").strip(),
+            local_cp_ocr or (gouv.get("postal_code") or ""),
+            local_city_ocr or (gouv.get("city") or city),
+        ),
         "postal_code": (local_cp_ocr or gouv.get("postal_code") or "").strip(),
         "city": (local_city_ocr or gouv.get("city") or city).strip(),
         "siret": validate_siret((gouv.get("siret") or "").strip()),
         "naf": (gouv.get("naf") or "").strip(),
-        "activity_summary": activity_summary,
+        "activity_summary": enrich_activity_summary(
+            name=(gouv.get("name") or company_guess or "").strip(),
+            naf=(gouv.get("naf") or "").strip(),
+            website=final_website,
+            company_hint=company_raw
+        ),
         "dirigeant": (gouv.get("dirigeant") or "").strip(),
         "phone": phone,
         "phone2": phone2,
@@ -1688,6 +1882,7 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
 
     row = ensure_contact_fallback(row)
     row = normalize_row_address(row)
+    row = uppercase_business_fields(row)
     return row
 
 
