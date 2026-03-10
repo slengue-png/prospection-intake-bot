@@ -1,0 +1,89 @@
+name: Prospection Daily Recaps
+
+on:
+  schedule:
+    - cron: "45 15 * * 1-5"   # 17:45 rappel clôture via endpoint externe si utilisé ailleurs
+    - cron: "47 15 * * 1-5"   # 17:47 managers agence
+    - cron: "49 15 * * 1-5"   # 17:49 admin global
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Cible à exécuter"
+        required: true
+        default: "agency_manager"
+        type: choice
+        options:
+          - agency_manager
+          - admin
+      run_date:
+        description: "Date métier Europe/Paris (YYYY-MM-DD)"
+        required: false
+        default: ""
+
+concurrency:
+  group: prospection-daily-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set Paris date
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.run_date }}" ]; then
+            echo "RUN_DATE=${{ github.event.inputs.run_date }}" >> $GITHUB_ENV
+          else
+            echo "RUN_DATE=$(TZ=Europe/Paris date +%F)" >> $GITHUB_ENV
+          fi
+
+      - name: Decide mode
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "SEND_MODE=${{ github.event.inputs.target }}" >> $GITHUB_ENV
+          else
+            NOW_MINUTE="$(TZ=Europe/Paris date +%M)"
+            if [ "$NOW_MINUTE" = "47" ]; then
+              echo "SEND_MODE=agency_manager" >> $GITHUB_ENV
+            else
+              echo "SEND_MODE=admin" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Install system OCR
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tesseract-ocr tesseract-ocr-fra tesseract-ocr-eng
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily recap
+        env:
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          BREVO_SENDER_EMAIL: ${{ secrets.BREVO_SENDER_EMAIL }}
+          BREVO_SENDER_NAME: ${{ secrets.BREVO_SENDER_NAME }}
+
+          MAIL_ROUTING_JSON: ${{ secrets.MAIL_ROUTING_JSON }}
+
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+
+          SEND_MODE: ${{ env.SEND_MODE }}
+          RUN_DATE: ${{ env.RUN_DATE }}
+        run: |
+          python scripts/export_and_mail.py
