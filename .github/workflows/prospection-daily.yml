@@ -2,9 +2,8 @@ name: Prospection Daily Recaps
 
 on:
   schedule:
-    - cron: "45 15 * * 1-5"   # 17:45 rappel clôture via endpoint externe si utilisé ailleurs
-    - cron: "47 15 * * 1-5"   # 17:47 managers agence
-    - cron: "49 15 * * 1-5"   # 17:49 admin global
+    - cron: "47 15 * * 1-5"   # 17:47 France approx -> managers
+    - cron: "49 15 * * 1-5"   # 17:49 France approx -> admin
   workflow_dispatch:
     inputs:
       target:
@@ -16,9 +15,10 @@ on:
           - agency_manager
           - admin
       run_date:
-        description: "Date métier Europe/Paris (YYYY-MM-DD)"
+        description: "Date métier Europe/Paris (YYYY-MM-DD). Vide = aujourd'hui"
         required: false
         default: ""
+        type: string
 
 concurrency:
   group: prospection-daily-${{ github.ref }}
@@ -30,14 +30,16 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Set Paris date
+      - name: Set RUN_DATE
         shell: bash
         run: |
           if [ -n "${{ github.event.inputs.run_date }}" ]; then
@@ -46,7 +48,7 @@ jobs:
             echo "RUN_DATE=$(TZ=Europe/Paris date +%F)" >> $GITHUB_ENV
           fi
 
-      - name: Decide mode
+      - name: Decide SEND_MODE
         shell: bash
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
@@ -85,5 +87,6 @@ jobs:
 
           SEND_MODE: ${{ env.SEND_MODE }}
           RUN_DATE: ${{ env.RUN_DATE }}
+
         run: |
           python scripts/export_and_mail.py
