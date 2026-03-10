@@ -2,6 +2,6 @@ openpyxl==3.1.5
 pillow==10.4.0
 pytesseract==0.3.10
 requests==2.32.3
-easyocr
-numpy
-opencv-python-headless
+easyocr==1.7.2
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
