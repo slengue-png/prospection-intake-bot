@@ -42,7 +42,7 @@ def env_int(name: str, default: int) -> int:
 
 
 def paris_ymd_fallback() -> str:
-    # Fallback only. In workflows, RUN_DATE should always be injected in Europe/Paris.
+    # Le workflow doit normalement injecter RUN_DATE en Europe/Paris.
     return dt.date.today().strftime("%Y-%m-%d")
 
 
@@ -478,7 +478,8 @@ def is_probable_person_name(s: str) -> bool:
         "restaurant", "responsable", "commerce", "collectivite", "territoire",
         "recyclage", "valorisation", "dechets", "drh", "developpement", "rh",
         "onyx", "auvergne", "rhone", "alpes", "sas", "sarl", "eurl", "sa",
-        "service", "environnement", "gestion", "cedex", "centr", "alp", "cs"
+        "service", "environnement", "gestion", "cedex", "centr", "alp", "cs",
+        "experience", "luxe", "scannez", "scanner", "savoir", "plus", "aqualone"
     }
     words = low.split()
     if len(words) < 2 or len(words) > 4:
@@ -643,6 +644,7 @@ def looks_like_company_line(line: str) -> bool:
     ln = clean_ocr_line(line)
     if not ln:
         return False
+
     low = normalize_text(ln)
 
     if "@" in ln:
@@ -653,18 +655,19 @@ def looks_like_company_line(line: str) -> bool:
         return False
     if CP_RE.search(ln):
         return False
-    if re.search(r"\d", ln):
-        return False
 
     bad_words = {
         "directeur", "responsable", "rh", "site", "manager",
-        "portable", "tel", "telephone", "mail", "email"
+        "portable", "port", "tel", "telephone", "mail", "email",
+        "scannez", "scanner", "savoir", "experience", "luxe"
     }
     words = set(low.split())
     if words & bad_words:
         return False
 
-    if len(ln) < 4:
+    if len(ln) < 3:
+        return False
+    if len(ln) > 40:
         return False
 
     return True
@@ -679,22 +682,28 @@ def detect_company_from_lines(lines: List[str], gemini_company: str = "", websit
 
     candidates = []
     for i, ln in enumerate(lines[:8]):
-        if looks_like_company_line(ln):
-            score = 0
-            if i <= 1:
-                score += 20
-            if ln == ln.upper():
-                score += 15
-            if len(ln.split()) <= 4:
-                score += 10
+        if not looks_like_company_line(ln):
+            continue
 
-            low = normalize_company_name(ln)
-            if dom_web and normalize_company_name(dom_web) in low:
-                score += 25
-            if dom_email and normalize_company_name(dom_email) in low:
-                score += 25
+        low = normalize_company_name(ln)
+        score = 0
 
-            candidates.append((score, ln))
+        if i <= 1:
+            score += 25
+        if ln == ln.upper():
+            score += 20
+        if len(ln.split()) <= 3:
+            score += 15
+        if len(ln) <= 20:
+            score += 10
+        if dom_web and normalize_company_name(dom_web) in low:
+            score += 30
+        if dom_email and normalize_company_name(dom_email) in low:
+            score += 30
+        if len(ln.split()) in [2, 3]:
+            score += 10
+
+        candidates.append((score, ln))
 
     if candidates:
         candidates.sort(key=lambda x: x[0], reverse=True)
@@ -711,26 +720,54 @@ def detect_company_from_lines(lines: List[str], gemini_company: str = "", websit
 def detect_person_name_from_lines(lines: List[str], company_line: str = "") -> str:
     company_n = normalize_company_name(company_line)
 
+    bad_person_phrases = {
+        "le bois essence",
+        "de l experience du luxe",
+        "scannez moi pour en savoir plus",
+        "centre aquatique aqualone",
+    }
+
     for ln in lines[:12]:
+        low = normalize_text(ln)
+
+        if low in bad_person_phrases:
+            continue
+
+        if any(x in low for x in ["experience", "luxe", "scannez", "savoir plus"]):
+            continue
+
         if not is_probable_person_name(ln):
             continue
+
         if company_n and normalize_company_name(ln) == company_n:
             continue
+
         return ln.strip()
 
     return ""
 
 
-def extract_role_from_lines(lines: List[str]) -> str:
-    role_words = [
-        "directeur", "responsable", "rh", "gérant", "gerant",
-        "site", "commercial", "president", "président"
-    ]
-    for ln in lines[:10]:
-        low = normalize_text(ln)
-        if any(w in low for w in role_words):
-            return ln.strip()
-    return ""
+def clean_address_candidate(addr: str) -> str:
+    a = re.sub(r"\s+", " ", (addr or "").strip())
+    if not a:
+        return ""
+
+    low = normalize_text(a)
+
+    if "@" in a:
+        return ""
+    if URL_RE.search(a):
+        return ""
+    if PHONE_RE.search(a):
+        return ""
+    if low.startswith("port"):
+        return ""
+    if low.startswith("tel"):
+        return ""
+    if "portable" in low:
+        return ""
+
+    return a
 
 
 def extract_best_company_hint(lines: List[str], gemini_company: str, website: str, email: str) -> str:
@@ -744,14 +781,30 @@ def infer_activity_fallback(name: str, website: str = "", naf: str = "") -> str:
     z = f"{n} {w} {naf}".strip()
 
     rules = [
-        (["menuiserie", "bois"], "MENUISERIE"),
+        (["menuiserie", "bois", "atelier delaye"], "MENUISERIE"),
         (["vert marine", "aqualone", "aquatique", "piscine"], "CENTRE AQUATIQUE"),
-        (["cheval", "transport", "travaux publics", "benne"], "TRANSPORT / TRAVAUX PUBLICS"),
+        (["cheval molina", "groupe cheval", "transport", "travaux publics", "benne"], "TRANSPORT / TRAVAUX PUBLICS"),
+        (["euromaster", "pneu", "garage"], "PNEUMATIQUES / ENTRETIEN AUTO"),
+        (["lely", "environnement", "dechets"], "ENVIRONNEMENT / DECHETS"),
+        (["keolis", "transport voyageurs"], "TRANSPORT DE VOYAGEURS"),
+        (["resine"], "RÉSINE / REVÊTEMENTS"),
+        (["serrurerie", "boret"], "SERRURERIE / MÉTALLERIE"),
     ]
 
     for keys, label in rules:
         if any(k in z for k in keys):
             return label
+
+    naf_map = {
+        "4332B": "MENUISERIE",
+        "5610C": "RESTAURATION",
+        "3811Z": "COLLECTE DE DÉCHETS",
+        "4531Z": "PNEUMATIQUES / AUTO",
+        "7010Z": "SERVICES AUX ENTREPRISES",
+        "4333Z": "REVÊTEMENTS / RÉSINE",
+    }
+    if naf in naf_map:
+        return naf_map[naf]
 
     return ""
 
@@ -825,12 +878,6 @@ def tg_download_file(file_id: str) -> bytes:
     content = r.content
     TG_FILE_BYTES_CACHE[file_id] = content
     return content
-
-
-def download_bytes(url: str) -> bytes:
-    r = requests.get(url, timeout=60)
-    r.raise_for_status()
-    return r.content
 
 
 # ============================================================
@@ -1692,7 +1739,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
 
     local_postal_code = normalize_cp((vis.get("postal_code") or local_cp_ocr or "").strip())
     local_city = (vis.get("city") or local_city_ocr or "").strip()
-    local_address = (vis.get("address") or local_addr_ocr or "").strip()
+    local_address = clean_address_candidate((vis.get("address") or local_addr_ocr or "").strip())
 
     phones_all = []
     if vis.get("phone"):
@@ -1745,7 +1792,9 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
         place = place or {}
 
     final_name = (company_line or gouv.get("name") or company_guess or "").strip()
-    final_address = (local_address or gouv.get("address") or place.get("address") or "").strip()
+    final_address = clean_address_candidate(
+        (local_address or gouv.get("address") or place.get("address") or "").strip()
+    )
     final_postal_code = normalize_cp(local_postal_code or gouv.get("postal_code") or "")
     final_city = (local_city or gouv.get("city") or "").strip()
     final_website = (local_website or place.get("website") or "").strip()
@@ -1856,7 +1905,7 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     row.update({
         "name": (gouv.get("name") or company_guess).strip(),
         "address": strip_postal_city_from_address(
-            (local_addr_ocr or gouv.get("address") or place.get("address") or "").strip(),
+            clean_address_candidate((local_addr_ocr or gouv.get("address") or place.get("address") or "").strip()),
             local_cp_ocr or (gouv.get("postal_code") or ""),
             local_city_ocr or (gouv.get("city") or city),
         ),
