@@ -42,7 +42,6 @@ def env_int(name: str, default: int) -> int:
 
 
 def paris_ymd_fallback() -> str:
-    # Le workflow doit normalement injecter RUN_DATE en Europe/Paris.
     return dt.date.today().strftime("%Y-%m-%d")
 
 
@@ -490,18 +489,6 @@ def is_probable_person_name(s: str) -> bool:
     return sum(1 for w in words if len(w) >= 2) >= 2
 
 
-def extract_contact_name_from_ocr(text: str) -> str:
-    if not text:
-        return ""
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-
-    for ln in lines[:12]:
-        if is_probable_person_name(ln):
-            return ln
-    return ""
-
-
 def strip_postal_city_from_address(addr: str, postal_code: str, city: str) -> str:
     addr = (addr or "").strip()
     if not addr:
@@ -747,6 +734,17 @@ def detect_person_name_from_lines(lines: List[str], company_line: str = "") -> s
     return ""
 
 
+def looks_like_person_line(line: str) -> bool:
+    ln = clean_ocr_line(line)
+    if not ln:
+        return False
+    return is_probable_person_name(ln)
+
+
+def normalize_company_candidate(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+
 def clean_address_candidate(addr: str) -> str:
     a = re.sub(r"\s+", " ", (addr or "").strip())
     if not a:
@@ -775,20 +773,94 @@ def extract_best_company_hint(lines: List[str], gemini_company: str, website: st
     return deduce_company(company, email, website)
 
 
+def choose_final_company_name(
+    gouv_name: str,
+    gemini_company: str,
+    detected_company_line: str,
+    person_name: str,
+    website: str,
+    email: str
+) -> str:
+    """
+    Priorité :
+    1) nom Gouv si disponible
+    2) nom Gemini/logo
+    3) ligne OCR plausible
+    4) fallback domaine
+    Jamais un nom de personne.
+    """
+    person_n = normalize_company_name(person_name)
+    dom_web = brand_from_domain(domain_from_url(website))
+    dom_mail = brand_from_domain(domain_from_email(email))
+
+    candidates = [
+        normalize_company_candidate(gouv_name),
+        normalize_company_candidate(gemini_company),
+        normalize_company_candidate(detected_company_line),
+    ]
+
+    scored = []
+
+    for cand in candidates:
+        if not cand:
+            continue
+
+        cand_norm = normalize_company_name(cand)
+        if not cand_norm:
+            continue
+
+        if person_n and cand_norm == person_n:
+            continue
+        if looks_like_person_line(cand):
+            continue
+
+        score = 0
+
+        if gouv_name and cand.strip() == gouv_name.strip():
+            score += 100
+
+        if dom_web and normalize_company_name(dom_web) in cand_norm:
+            score += 30
+        if dom_mail and normalize_company_name(dom_mail) in cand_norm:
+            score += 30
+
+        wc = len(cand.split())
+        if wc >= 2:
+            score += 15
+        if wc == 1:
+            score -= 10
+
+        if len(cand) <= 5:
+            score -= 15
+
+        scored.append((score, cand))
+
+    if scored:
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1].strip()
+
+    for cand in [dom_web, dom_mail]:
+        cand = normalize_company_candidate(cand)
+        if len(cand) >= 3:
+            return cand
+
+    return ""
+
+
 def infer_activity_fallback(name: str, website: str = "", naf: str = "") -> str:
     n = normalize_text(name)
     w = normalize_text(domain_from_url(website))
     z = f"{n} {w} {naf}".strip()
 
     rules = [
-        (["menuiserie", "bois", "atelier delaye"], "MENUISERIE"),
+        (["atelier delaye", "menuiserie delaye", "menuiserie", "bois"], "MENUISERIE"),
         (["vert marine", "aqualone", "aquatique", "piscine"], "CENTRE AQUATIQUE"),
-        (["cheval molina", "groupe cheval", "transport", "travaux publics", "benne"], "TRANSPORT / TRAVAUX PUBLICS"),
+        (["groupe cheval", "cheval molina", "transport", "travaux publics", "benne"], "TRANSPORT / TRAVAUX PUBLICS"),
+        (["serrurerie boret", "boret", "serrurerie"], "SERRURERIE / MÉTALLERIE"),
+        (["ad resine", "resine", "revetement"], "RÉSINE / REVÊTEMENTS"),
         (["euromaster", "pneu", "garage"], "PNEUMATIQUES / ENTRETIEN AUTO"),
         (["lely", "environnement", "dechets"], "ENVIRONNEMENT / DECHETS"),
         (["keolis", "transport voyageurs"], "TRANSPORT DE VOYAGEURS"),
-        (["resine"], "RÉSINE / REVÊTEMENTS"),
-        (["serrurerie", "boret"], "SERRURERIE / MÉTALLERIE"),
     ]
 
     for keys, label in rules:
@@ -800,8 +872,9 @@ def infer_activity_fallback(name: str, website: str = "", naf: str = "") -> str:
         "5610C": "RESTAURATION",
         "3811Z": "COLLECTE DE DÉCHETS",
         "4531Z": "PNEUMATIQUES / AUTO",
-        "7010Z": "SERVICES AUX ENTREPRISES",
         "4333Z": "REVÊTEMENTS / RÉSINE",
+        "4399D": "TRAVAUX SPÉCIALISÉS",
+        "2512Z": "SERRURERIE / MÉTALLERIE",
     }
     if naf in naf_map:
         return naf_map[naf]
@@ -1724,7 +1797,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     if local_email and not is_valid_email(local_email):
         local_email = ""
 
-    company_line = detect_company_from_lines(
+    detected_company_line = detect_company_from_lines(
         lines,
         gemini_company=(vis.get("company") or "").strip(),
         website=local_website,
@@ -1733,7 +1806,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
 
     person_name = (vis.get("name") or "").strip()
     if not person_name:
-        person_name = detect_person_name_from_lines(lines, company_line=company_line)
+        person_name = detect_person_name_from_lines(lines, company_line=detected_company_line)
 
     fn, ln = split_human_name(person_name)
 
@@ -1791,7 +1864,15 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
         place = places_enrich(place_query_name, local_city) if local_city else places_enrich(place_query_name, "")
         place = place or {}
 
-    final_name = (company_line or gouv.get("name") or company_guess or "").strip()
+    final_name = choose_final_company_name(
+        gouv_name=(gouv.get("name") or "").strip(),
+        gemini_company=(vis.get("company") or "").strip(),
+        detected_company_line=(detected_company_line or "").strip(),
+        person_name=(person_name or "").strip(),
+        website=local_website or (place.get("website") or ""),
+        email=local_email,
+    )
+
     final_address = clean_address_candidate(
         (local_address or gouv.get("address") or place.get("address") or "").strip()
     )
@@ -1819,7 +1900,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
             name=final_name,
             naf=(gouv.get("naf") or "").strip(),
             website=final_website,
-            company_hint=(company_guess or company_line or "")
+            company_hint=(company_guess or detected_company_line or "")
         ),
         "dirigeant": final_dirigeant,
         "interlocuteur": final_interlocuteur,
@@ -1871,6 +1952,13 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     if not city:
         city = local_city_ocr
 
+    detected_company_line = detect_company_from_lines(
+        lines=lines,
+        gemini_company=company_raw,
+        website=website,
+        email=email_ocr
+    )
+
     company_guess = extract_best_company_hint(
         lines=lines,
         gemini_company=company_raw,
@@ -1901,9 +1989,18 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     if not phone and place.get("phone"):
         phone = normalize_phone(place.get("phone") or "")
 
+    final_name = choose_final_company_name(
+        gouv_name=(gouv.get("name") or "").strip(),
+        gemini_company=(company_raw or "").strip(),
+        detected_company_line=(detected_company_line or "").strip(),
+        person_name="",
+        website=final_website,
+        email=final_email,
+    )
+
     row = dict(base)
     row.update({
-        "name": (gouv.get("name") or company_guess).strip(),
+        "name": final_name,
         "address": strip_postal_city_from_address(
             clean_address_candidate((local_addr_ocr or gouv.get("address") or place.get("address") or "").strip()),
             local_cp_ocr or (gouv.get("postal_code") or ""),
@@ -1914,7 +2011,7 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
         "siret": validate_siret((gouv.get("siret") or "").strip()),
         "naf": (gouv.get("naf") or "").strip(),
         "activity_summary": enrich_activity_summary(
-            name=(gouv.get("name") or company_guess or "").strip(),
+            name=final_name,
             naf=(gouv.get("naf") or "").strip(),
             website=final_website,
             company_hint=company_raw
