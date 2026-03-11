@@ -62,6 +62,20 @@ jobs:
             fi
           fi
 
+      - name: Validate required secrets
+        shell: bash
+        env:
+          WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
+          EXPORT_TOKEN: ${{ secrets.EXPORT_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+        run: |
+          set -e
+          [ -n "$WORKER_BASE_URL" ] || { echo "Missing secret WORKER_BASE_URL"; exit 1; }
+          [ -n "$EXPORT_TOKEN" ] || { echo "Missing secret EXPORT_TOKEN"; exit 1; }
+          [ -n "$TELEGRAM_TOKEN" ] || { echo "Missing secret TELEGRAM_TOKEN"; exit 1; }
+          [ -n "$BREVO_API_KEY" ] || { echo "Missing secret BREVO_API_KEY"; exit 1; }
+
       - name: Install system OCR
         run: |
           sudo apt-get update
@@ -90,3 +104,11 @@ jobs:
 
         run: |
           python scripts/export_and_mail.py
+
+      - name: Upload generated exports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prospection-daily-${{ env.SEND_MODE }}-${{ env.RUN_DATE }}
+          path: out/
+          if-no-files-found: ignore
