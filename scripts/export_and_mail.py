@@ -217,6 +217,7 @@ GEMINI_CARD_CACHE: Dict[str, Dict[str, str]] = {}
 GEMINI_FACADE_CACHE: Dict[str, Dict[str, str]] = {}
 TG_FILE_PATH_CACHE: Dict[str, str] = {}
 TG_FILE_BYTES_CACHE: Dict[str, bytes] = {}
+CARD_PIPELINE_CACHE: Dict[str, Dict[str, str]] = {}
 
 
 # ============================================================
@@ -781,14 +782,6 @@ def choose_final_company_name(
     website: str,
     email: str
 ) -> str:
-    """
-    Priorité :
-    1) nom Gouv si disponible
-    2) nom Gemini/logo
-    3) ligne OCR plausible
-    4) fallback domaine
-    Jamais un nom de personne.
-    """
     person_n = normalize_company_name(person_name)
     dom_web = brand_from_domain(domain_from_url(website))
     dom_mail = brand_from_domain(domain_from_email(email))
@@ -1680,7 +1673,6 @@ def dedupe_key(r: Dict[str, Any]) -> str:
         normalize_text(r.get("email", "")),
         normalize_text(r.get("phone", "")),
         normalize_text(r.get("city", "")),
-        normalize_text(r.get("address", "")),
     ])
 
 
@@ -1724,59 +1716,36 @@ def build_excel_one_sheet(date: str, rows: List[Dict[str, Any]], suffix: str) ->
 
 
 # ============================================================
-# UNIFY
+# CARD PIPELINE / MERGE
 # ============================================================
 
-def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
-    website = p.get("website", "")
-    naf = p.get("naf", "")
-    name = p.get("name", "")
-    activity_summary = p.get("activity_summary", "")
-    if not activity_summary and (name or naf or website):
-        activity_summary = enrich_activity_summary(name=name, naf=naf, website=website, company_hint=name)
+def is_linked_prospect_card(card: Dict[str, Any]) -> bool:
+    if not isinstance(card, dict):
+        return False
+    source = (card.get("source") or "").strip().lower()
+    source_mode = (card.get("source_mode") or "").strip().lower()
+    comment = (card.get("comment") or "").strip().lower()
 
-    d = {
-        "date": p.get("date", ""),
-        "agency": (p.get("agency") or "").upper(),
-        "initials": (p.get("initials") or "").upper(),
-        "name": name,
-        "address": p.get("address", ""),
-        "postal_code": p.get("postal_code", ""),
-        "city": p.get("city", ""),
-        "siret": validate_siret(p.get("siret", "")),
-        "naf": naf,
-        "activity_summary": activity_summary,
-        "dirigeant": p.get("dirigeant", ""),
-        "interlocuteur": p.get("interlocuteur", ""),
-        "contact_firstname": p.get("contact_firstname", ""),
-        "contact_lastname": p.get("contact_lastname", ""),
-        "phone": normalize_phone(p.get("phone", "")),
-        "phone2": normalize_phone(p.get("phone2", "")),
-        "email": clean_email(p.get("email", "")) if is_valid_email(p.get("email", "")) else "",
-        "website": website,
-        "resume": p.get("resume", ""),
-        "commande": p.get("commande", ""),
-    }
-    if d["phone"] and d["phone2"] and d["phone"] == d["phone2"]:
-        d["phone2"] = ""
-    d = ensure_contact_fallback(d)
-    d = normalize_row_address(d)
-    d = uppercase_business_fields(d)
-    return d
+    if source == "prospect_mode":
+        return True
+    if source_mode == "company_form":
+        return True
+    if comment == "card_from_prospect_mode":
+        return True
+    if card.get("linked_prospect_key"):
+        return True
+    if card.get("linked_prospect_name"):
+        return True
+    return False
 
 
-def unify_from_card(date: str, agency: str, initials: str, comment: str, img_bytes: bytes) -> Dict[str, Any]:
-    base = {
-        "date": date, "agency": agency, "initials": initials,
-        "name": "", "address": "", "postal_code": "", "city": "",
-        "siret": "", "naf": "", "activity_summary": "", "dirigeant": "",
-        "interlocuteur": "", "contact_firstname": "", "contact_lastname": "",
-        "phone": "", "phone2": "", "email": "", "website": "",
-        "resume": (comment or "").strip(),
-        "commande": "",
-    }
+def extract_card_pipeline_fields(img_bytes: bytes) -> Dict[str, str]:
     if not img_bytes:
-        return base
+        return {}
+
+    cache_key = image_hash_bytes(img_bytes)
+    if cache_key in CARD_PIPELINE_CACHE:
+        return dict(CARD_PIPELINE_CACHE[cache_key])
 
     vis = gemini_extract_business_card(img_bytes) if GEMINI_API_KEY else {
         "name": "", "company": "", "title": "", "email": "", "phone": "",
@@ -1885,11 +1854,7 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
     if not phone and place.get("phone"):
         phone = normalize_phone(place.get("phone") or "")
 
-    final_dirigeant = (gouv.get("dirigeant") or "").strip()
-    final_interlocuteur = person_name.strip()
-
-    row = dict(base)
-    row.update({
+    out = {
         "name": final_name,
         "address": final_address,
         "postal_code": final_postal_code,
@@ -1902,14 +1867,196 @@ def unify_from_card(date: str, agency: str, initials: str, comment: str, img_byt
             website=final_website,
             company_hint=(company_guess or detected_company_line or "")
         ),
-        "dirigeant": final_dirigeant,
-        "interlocuteur": final_interlocuteur,
+        "dirigeant": (gouv.get("dirigeant") or "").strip(),
+        "interlocuteur": (person_name or "").strip(),
         "contact_firstname": fn,
         "contact_lastname": ln,
         "phone": phone,
         "phone2": phone2,
         "email": final_email,
         "website": final_website,
+    }
+
+    if out["phone"] and out["phone2"] and out["phone"] == out["phone2"]:
+        out["phone2"] = ""
+
+    out = ensure_contact_fallback(out)
+    out = normalize_row_address(out)
+    CARD_PIPELINE_CACHE[cache_key] = dict(out)
+    return dict(out)
+
+
+def merge_card_into_prospect_row(row: Dict[str, Any], img_bytes: bytes) -> Dict[str, Any]:
+    if not img_bytes:
+        return row
+
+    card = extract_card_pipeline_fields(img_bytes)
+    if not card:
+        return row
+
+    merged = dict(row)
+
+    # Carte prioritaire sur API / Places / scraping pour les infos de contact visibles.
+    for fld in [
+        "interlocuteur",
+        "contact_firstname",
+        "contact_lastname",
+        "email",
+        "website",
+        "address",
+        "postal_code",
+        "city",
+    ]:
+        if str(card.get(fld, "") or "").strip():
+            merged[fld] = card.get(fld, "")
+
+    # Nom société : on complète seulement si vide côté prospect.
+    if not str(merged.get("name", "") or "").strip() and str(card.get("name", "") or "").strip():
+        merged["name"] = card.get("name", "")
+
+    # SIRET / NAF : on complète si absents.
+    if not str(merged.get("siret", "") or "").strip() and str(card.get("siret", "") or "").strip():
+        merged["siret"] = card.get("siret", "")
+    if not str(merged.get("naf", "") or "").strip() and str(card.get("naf", "") or "").strip():
+        merged["naf"] = card.get("naf", "")
+
+    # Dirigeant : on ne remplace pas un dirigeant déjà présent par une donnée carte.
+    if not str(merged.get("dirigeant", "") or "").strip() and str(card.get("dirigeant", "") or "").strip():
+        merged["dirigeant"] = card.get("dirigeant", "")
+
+    # Téléphones : priorité carte.
+    card_phones = []
+    for fld in ["phone", "phone2"]:
+        p = normalize_phone(card.get(fld, "") or "")
+        if p and p not in card_phones:
+            card_phones.append(p)
+
+    existing_phones = []
+    for fld in ["phone", "phone2"]:
+        p = normalize_phone(merged.get(fld, "") or "")
+        if p and p not in existing_phones:
+            existing_phones.append(p)
+
+    final_phone = merged.get("phone", "")
+    final_phone2 = merged.get("phone2", "")
+
+    if card_phones:
+        phone, phone2 = split_phones_by_priority(card_phones + existing_phones)
+        final_phone, final_phone2 = phone, phone2
+
+    merged["phone"] = normalize_phone(final_phone)
+    merged["phone2"] = normalize_phone(final_phone2)
+    if merged["phone"] and merged["phone2"] and merged["phone"] == merged["phone2"]:
+        merged["phone2"] = ""
+
+    # activity_summary : recalcul si absent et qu'on a enrichi nom/site
+    if not str(merged.get("activity_summary", "") or "").strip():
+        merged["activity_summary"] = enrich_activity_summary(
+            name=merged.get("name", ""),
+            naf=merged.get("naf", ""),
+            website=merged.get("website", ""),
+            company_hint=card.get("name", "") or merged.get("name", "")
+        )
+
+    merged = ensure_contact_fallback(merged)
+    merged = normalize_row_address(merged)
+    merged = uppercase_business_fields(merged)
+    return merged
+
+
+def unify_from_prospect_with_card(p: Dict[str, Any]) -> Dict[str, Any]:
+    row = unify_from_prospect(p)
+    card_file_id = (p.get("card_photo_file_id") or "").strip()
+    if not card_file_id:
+        return row
+
+    try:
+        img = tg_download_file(card_file_id)
+    except Exception:
+        img = b""
+
+    if not img:
+        return row
+
+    return merge_card_into_prospect_row(row, img)
+
+
+# ============================================================
+# UNIFY
+# ============================================================
+
+def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
+    website = p.get("website", "")
+    naf = p.get("naf", "")
+    name = p.get("name", "")
+    activity_summary = p.get("activity_summary", "")
+    if not activity_summary and (name or naf or website):
+        activity_summary = enrich_activity_summary(name=name, naf=naf, website=website, company_hint=name)
+
+    d = {
+        "date": p.get("date", ""),
+        "agency": (p.get("agency") or "").upper(),
+        "initials": (p.get("initials") or "").upper(),
+        "name": name,
+        "address": p.get("address", ""),
+        "postal_code": p.get("postal_code", ""),
+        "city": p.get("city", ""),
+        "siret": validate_siret(p.get("siret", "")),
+        "naf": naf,
+        "activity_summary": activity_summary,
+        "dirigeant": p.get("dirigeant", ""),
+        "interlocuteur": p.get("interlocuteur", ""),
+        "contact_firstname": p.get("contact_firstname", ""),
+        "contact_lastname": p.get("contact_lastname", ""),
+        "phone": normalize_phone(p.get("phone", "")),
+        "phone2": normalize_phone(p.get("phone2", "")),
+        "email": clean_email(p.get("email", "")) if is_valid_email(p.get("email", "")) else "",
+        "website": website,
+        "resume": p.get("resume", ""),
+        "commande": p.get("commande", ""),
+    }
+    if d["phone"] and d["phone2"] and d["phone"] == d["phone2"]:
+        d["phone2"] = ""
+    d = ensure_contact_fallback(d)
+    d = normalize_row_address(d)
+    d = uppercase_business_fields(d)
+    return d
+
+
+def unify_from_card(date: str, agency: str, initials: str, comment: str, img_bytes: bytes) -> Dict[str, Any]:
+    base = {
+        "date": date, "agency": agency, "initials": initials,
+        "name": "", "address": "", "postal_code": "", "city": "",
+        "siret": "", "naf": "", "activity_summary": "", "dirigeant": "",
+        "interlocuteur": "", "contact_firstname": "", "contact_lastname": "",
+        "phone": "", "phone2": "", "email": "", "website": "",
+        "resume": (comment or "").strip(),
+        "commande": "",
+    }
+    if not img_bytes:
+        return base
+
+    fields = extract_card_pipeline_fields(img_bytes)
+    if not fields:
+        return base
+
+    row = dict(base)
+    row.update({
+        "name": fields.get("name", ""),
+        "address": fields.get("address", ""),
+        "postal_code": fields.get("postal_code", ""),
+        "city": fields.get("city", ""),
+        "siret": validate_siret(fields.get("siret", "")),
+        "naf": fields.get("naf", ""),
+        "activity_summary": fields.get("activity_summary", ""),
+        "dirigeant": fields.get("dirigeant", ""),
+        "interlocuteur": fields.get("interlocuteur", ""),
+        "contact_firstname": fields.get("contact_firstname", ""),
+        "contact_lastname": fields.get("contact_lastname", ""),
+        "phone": normalize_phone(fields.get("phone", "")),
+        "phone2": normalize_phone(fields.get("phone2", "")),
+        "email": clean_email(fields.get("email", "")) if is_valid_email(fields.get("email", "")) else "",
+        "website": fields.get("website", ""),
     })
 
     if row["phone"] and row["phone2"] and row["phone"] == row["phone2"]:
@@ -2144,10 +2291,11 @@ def send_individual_pack(date: str, agency: str, initials: str,
 
     p_u = [p for p in prospects if (p.get("agency") == agency and (p.get("initials") or "").upper() == initials)]
     ph_u = [ph for ph in photos if (ph.get("agency") == agency and (ph.get("user") or "").upper() == initials)]
-    ca_u = [ca for ca in cards if (ca.get("agency") == agency and (ca.get("user") or "").upper() == initials)]
+    ca_u_all = [ca for ca in cards if (ca.get("agency") == agency and (ca.get("user") or "").upper() == initials)]
+    ca_u_standalone = [ca for ca in ca_u_all if not is_linked_prospect_card(ca)]
 
     rows: List[Dict[str, Any]] = []
-    rows.extend([unify_from_prospect(p) for p in p_u])
+    rows.extend([unify_from_prospect_with_card(p) for p in p_u])
 
     for ph in ph_u[:MAX_PHOTO_IMAGES]:
         fid = ph.get("file_id") or ""
@@ -2159,7 +2307,7 @@ def send_individual_pack(date: str, agency: str, initials: str,
             img = b""
         rows.append(unify_from_photo(date, agency, initials, city_hint, comment, img))
 
-    for ca in ca_u[:MAX_OCR_IMAGES]:
+    for ca in ca_u_standalone[:MAX_OCR_IMAGES]:
         fid = ca.get("file_id") or ""
         comment = ca.get("comment") or ""
         try:
@@ -2211,10 +2359,11 @@ def send_agency_manager_pack(date: str, agency: str,
 
     rows: List[Dict[str, Any]] = []
     p_ag = [p for p in prospects if (p.get("agency") == agency)]
-    rows.extend([unify_from_prospect(p) for p in p_ag])
+    rows.extend([unify_from_prospect_with_card(p) for p in p_ag])
 
     ph_ag = [ph for ph in photos if (ph.get("agency") == agency)]
-    ca_ag = [ca for ca in cards if (ca.get("agency") == agency)]
+    ca_ag_all = [ca for ca in cards if (ca.get("agency") == agency)]
+    ca_ag_standalone = [ca for ca in ca_ag_all if not is_linked_prospect_card(ca)]
 
     for ph in ph_ag[:200]:
         fid = ph.get("file_id") or ""
@@ -2226,7 +2375,7 @@ def send_agency_manager_pack(date: str, agency: str,
             img = b""
         rows.append(unify_from_photo(date, agency, (ph.get("user") or "").upper(), city_hint, comment, img))
 
-    for ca in ca_ag[:300]:
+    for ca in ca_ag_standalone[:300]:
         fid = ca.get("file_id") or ""
         comment = ca.get("comment") or ""
         try:
@@ -2267,7 +2416,7 @@ def send_admin_pack(date: str,
         return
 
     rows: List[Dict[str, Any]] = []
-    rows.extend([unify_from_prospect(p) for p in prospects])
+    rows.extend([unify_from_prospect_with_card(p) for p in prospects])
 
     for ph in photos[:400]:
         fid = ph.get("file_id") or ""
@@ -2281,7 +2430,8 @@ def send_admin_pack(date: str,
             img = b""
         rows.append(unify_from_photo(date, agency, initials, city_hint, comment, img))
 
-    for ca in cards[:600]:
+    standalone_cards = [ca for ca in cards if not is_linked_prospect_card(ca)]
+    for ca in standalone_cards[:600]:
         fid = ca.get("file_id") or ""
         comment = ca.get("comment") or ""
         agency = (ca.get("agency") or "").upper()
@@ -2355,4 +2505,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
