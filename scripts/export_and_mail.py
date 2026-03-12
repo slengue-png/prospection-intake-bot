@@ -1397,7 +1397,11 @@ def finalize_row_for_export(row: Dict[str, Any]) -> Dict[str, Any]:
     return row
     # ============================================================
 # BLOC 3 / 6 — OCR HYBRIDE / GEMINI / DOUBLE PASSE CARTES
+# VERSION OPTIMISÉE SANS PERTE DE FONCTIONNALITÉS
 # ============================================================
+
+USE_EASYOCR = env_str("USE_EASYOCR", "1").strip() == "1"
+
 
 def pil_to_cv(img: Image.Image) -> np.ndarray:
     arr = np.array(img)
@@ -1502,6 +1506,21 @@ def rotate_image_variants(img: Image.Image) -> List[Image.Image]:
     return out
 
 
+def get_easyocr_reader():
+    global EASYOCR_READER
+
+    if not USE_EASYOCR:
+        return False
+
+    if EASYOCR_READER is None:
+        try:
+            EASYOCR_READER = easyocr.Reader(["fr", "en"], gpu=False)
+        except Exception as e:
+            print(f"[WARN] EasyOCR unavailable: {e}")
+            EASYOCR_READER = False
+    return EASYOCR_READER
+
+
 def ocr_easyocr_on_pil(img: Image.Image) -> str:
     try:
         reader = get_easyocr_reader()
@@ -1540,32 +1559,103 @@ def merge_text_blocks(texts: List[str]) -> str:
     return "\n".join(lines)
 
 
-def ocr_image_bytes(img_bytes: bytes, light: bool = False) -> str:
+def extract_structured_from_text_fast(text: str) -> Dict[str, Any]:
+    lines = clean_ocr_lines(text)
+    joined = "\n".join(lines)
+
+    emails = extract_all_emails(joined)
+    urls = extract_urls(joined)
+    phones = extract_all_phones(joined)
+    phone, phone2 = split_phones_by_priority(phones)
+    addr, cp, city = extract_local_address_from_text(joined)
+    company = detect_company_from_lines(
+        lines,
+        website=(urls[0] if urls else ""),
+        email=(emails[0] if emails else "")
+    )
+    person = detect_person_name_from_lines(lines, company_line=company)
+    fn, ln = split_human_name(person)
+
+    return {
+        "lines": lines,
+        "raw_text": joined,
+        "emails": emails,
+        "urls": urls,
+        "phones": phones,
+        "phone": phone,
+        "phone2": phone2,
+        "postal_code": cp,
+        "city": city,
+        "address": clean_address_candidate(addr),
+        "company": normalize_spaces_inline(company),
+        "person_name": normalize_spaces_inline(person),
+        "contact_firstname": normalize_spaces_inline(fn),
+        "contact_lastname": normalize_spaces_inline(ln),
+    }
+
+
+def enough_business_card_info(d: Dict[str, Any]) -> bool:
+    filled = sum(
+        1 for v in [
+            safe_strip(d.get("name", "")),
+            safe_strip(d.get("company", "")),
+            clean_email(d.get("email", "")),
+            normalize_phone(d.get("phone", "")),
+            safe_strip(d.get("website", "")),
+            safe_strip(d.get("city", "")),
+            safe_strip(d.get("address", "")),
+        ] if v
+    )
+    return filled >= 3
+
+
+def enough_contact_info_for_skip_easyocr(d: Dict[str, Any], ocr_struct: Dict[str, Any]) -> bool:
+    score = 0
+    if safe_strip(d.get("company", "")) or safe_strip(ocr_struct.get("company", "")):
+        score += 1
+    if clean_email(d.get("email", "")) or (ocr_struct.get("emails") or []):
+        score += 1
+    if normalize_phone(d.get("phone", "")) or normalize_phone(ocr_struct.get("phone", "")):
+        score += 1
+    if safe_strip(d.get("website", "")) or (ocr_struct.get("urls") or []):
+        score += 1
+    if safe_strip(d.get("city", "")) or safe_strip(ocr_struct.get("city", "")):
+        score += 1
+    return score >= 3
+
+
+def ocr_image_bytes(img_bytes: bytes, light: bool = False, allow_easyocr: bool = True) -> str:
     if not img_bytes:
         return ""
 
-    h = image_hash_bytes(img_bytes) + ("|light" if light else "|full")
+    h = image_hash_bytes(img_bytes) + ("|light" if light else "|full") + ("|easy" if allow_easyocr else "|noeasy")
     if h in OCR_TEXT_CACHE:
         return OCR_TEXT_CACHE[h]
 
     variants = preprocess_image_variants(img_bytes)
     all_texts = []
 
-    base_variants = variants[:2] if light else variants
+    base_variants = variants[:2] if light else variants[:4]
 
     for base_img in base_variants:
         rotated = rotate_image_variants(base_img)
-        rotated = rotated[:2] if light else rotated
+        rotated = rotated[:2] if light else rotated[:4]
+
         for rot in rotated:
             zones = crop_image_zones(rot)
-            zones = zones[:3] if light else zones
+            zones = zones[:3] if light else zones[:5]
+
             for zone in zones:
-                t1 = ocr_easyocr_on_pil(zone)
-                if t1:
-                    all_texts.append(t1)
+                # Tesseract d'abord : plus léger
                 t2 = ocr_tesseract_on_pil(zone)
                 if t2:
                     all_texts.append(t2)
+
+                # EasyOCR seulement si autorisé
+                if allow_easyocr:
+                    t1 = ocr_easyocr_on_pil(zone)
+                    if t1:
+                        all_texts.append(t1)
 
     merged = merge_text_blocks(all_texts)
     OCR_TEXT_CACHE[h] = merged
@@ -1733,10 +1823,14 @@ def extract_structured_from_ocr_text(ocr_text: str) -> Dict[str, Any]:
     phones = extract_all_phones(text)
     phone, phone2 = split_phones_by_priority(phones)
 
-    addr, cp, city = extract_local_address_from_text(text)
-    company = detect_company_from_lines(lines, website=(urls[0] if urls else ""), email=(emails[0] if emails else ""))
-    person = detect_person_name_from_lines(lines, company_line=company)
+    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text(text)
 
+    company = detect_company_from_lines(
+        lines,
+        website=(urls[0] if urls else ""),
+        email=(emails[0] if emails else "")
+    )
+    person = detect_person_name_from_lines(lines, company_line=company)
     fn, ln = split_human_name(person)
 
     return {
@@ -1747,9 +1841,9 @@ def extract_structured_from_ocr_text(ocr_text: str) -> Dict[str, Any]:
         "phones": phones,
         "phone": phone,
         "phone2": phone2,
-        "postal_code": cp,
-        "city": city,
-        "address": clean_address_candidate(addr),
+        "postal_code": local_cp_ocr,
+        "city": local_city_ocr,
+        "address": clean_address_candidate(local_addr_ocr),
         "company": normalize_spaces_inline(company),
         "person_name": normalize_spaces_inline(person),
         "contact_firstname": normalize_spaces_inline(fn),
@@ -1831,30 +1925,46 @@ def analyze_business_card_bytes(img_bytes: bytes) -> Dict[str, Any]:
     if key in PROSPECT_CARD_ANALYSIS_CACHE:
         return dict(PROSPECT_CARD_ANALYSIS_CACHE[key])
 
+    # 1) Gemini passe 1
     pass1 = gemini_extract_business_card(img_bytes) if GEMINI_API_KEY else {}
-    light_ocr = bool(
-        safe_strip(pass1.get("name", "")) or
-        safe_strip(pass1.get("company", "")) or
-        safe_strip(pass1.get("email", "")) or
-        safe_strip(pass1.get("phone", "")) or
-        safe_strip(pass1.get("website", ""))
-    )
 
-    ocr_txt = ocr_image_bytes(img_bytes, light=light_ocr)
-    ocr_struct = extract_structured_from_ocr_text(ocr_txt)
+    # 2) OCR léger sans EasyOCR d’abord
+    light_ocr = enough_business_card_info(pass1)
+    ocr_txt_fast = ocr_image_bytes(img_bytes, light=light_ocr, allow_easyocr=False)
+    ocr_struct_fast = extract_structured_from_ocr_text(ocr_txt_fast)
 
+    # 3) décider si on a besoin d’une passe 2 Gemini
     need_second_pass = (
         not safe_strip(pass1.get("name", "")) or
         not safe_strip(pass1.get("company", "")) or
         (
             not safe_strip(pass1.get("email", "")) and
-            not safe_strip((ocr_struct.get("emails") or [""])[0])
+            not safe_strip((ocr_struct_fast.get("emails") or [""])[0])
         )
     )
 
     pass2 = gemini_extract_business_card_second_pass(img_bytes) if GEMINI_API_KEY and need_second_pass else {}
 
-    merged = merge_card_passes(pass1, pass2, ocr_struct)
+    # 4) si Gemini + Tesseract suffisent, on n’appelle pas EasyOCR
+    if enough_contact_info_for_skip_easyocr(
+        {
+            "company": pass1.get("company", "") or pass2.get("company", ""),
+            "email": pass1.get("email", "") or pass2.get("email", ""),
+            "phone": pass1.get("phone", "") or pass2.get("phone", ""),
+            "website": pass1.get("website", "") or pass2.get("website", ""),
+            "city": pass1.get("city", "") or pass2.get("city", ""),
+        },
+        ocr_struct_fast,
+    ):
+        merged = merge_card_passes(pass1, pass2, ocr_struct_fast)
+        PROSPECT_CARD_ANALYSIS_CACHE[key] = dict(merged)
+        return merged
+
+    # 5) seulement ici, OCR complet avec EasyOCR
+    ocr_txt_full = ocr_image_bytes(img_bytes, light=False, allow_easyocr=True)
+    ocr_struct_full = extract_structured_from_ocr_text(ocr_txt_full)
+
+    merged = merge_card_passes(pass1, pass2, ocr_struct_full)
     PROSPECT_CARD_ANALYSIS_CACHE[key] = dict(merged)
     return merged
 
@@ -1880,8 +1990,25 @@ def analyze_facade_bytes(img_bytes: bytes) -> Dict[str, Any]:
         return dict(PROSPECT_CARD_ANALYSIS_CACHE[key])
 
     gem = gemini_extract_facade_logo(img_bytes) if GEMINI_API_KEY else {"company": "", "city": ""}
-    ocr_txt = ocr_image_bytes(img_bytes, light=not bool(gem.get("company")))
-    ocr_struct = extract_structured_from_ocr_text(ocr_txt)
+
+    # OCR léger sans EasyOCR d’abord
+    ocr_txt_fast = ocr_image_bytes(img_bytes, light=not bool(gem.get("company")), allow_easyocr=False)
+    ocr_struct_fast = extract_structured_from_ocr_text(ocr_txt_fast)
+
+    enough = sum(
+        1 for v in [
+            safe_strip(gem.get("company", "") or ocr_struct_fast.get("company", "")),
+            safe_strip(gem.get("city", "") or ocr_struct_fast.get("city", "")),
+            (ocr_struct_fast.get("urls") or [""])[0] if ocr_struct_fast.get("urls") else "",
+            (ocr_struct_fast.get("emails") or [""])[0] if ocr_struct_fast.get("emails") else "",
+        ] if safe_strip(v)
+    ) >= 2
+
+    if enough:
+        ocr_struct = ocr_struct_fast
+    else:
+        ocr_txt_full = ocr_image_bytes(img_bytes, light=False, allow_easyocr=True)
+        ocr_struct = extract_structured_from_ocr_text(ocr_txt_full)
 
     company = choose_final_company_name(
         gouv_name="",
@@ -2683,159 +2810,8 @@ def enrich_company_from_worker_choice(choice: Dict[str, Any]) -> Dict[str, str]:
     out["address"] = strip_postal_city_from_address(out["address"], out["postal_code"], out["city"])
     return out
     # ============================================================
-# BLOC 5 OPTIMISÉ / 6 — FUSION MÉTIER / CARTES / FAÇADES / HISTORIQUES
+# BLOC 5 / 6 — FUSION MÉTIER / CARTES / FAÇADES / HISTORIQUES
 # ============================================================
-
-MAX_TOTAL_CARD_ANALYSIS = max(6, MAX_OCR_IMAGES)
-MAX_TOTAL_PHOTO_ANALYSIS = max(4, MAX_PHOTO_IMAGES)
-MIN_PROMOTION_SCORE_CARD = 3
-MIN_PROMOTION_SCORE_PHOTO = 2
-
-
-# ------------------------------------------------------------
-# HELPERS PERFORMANCE
-# ------------------------------------------------------------
-
-def row_has_strong_contact_data(row: Dict[str, Any]) -> bool:
-    return any([
-        safe_strip(row.get("interlocuteur", "")),
-        safe_strip(row.get("email", "")),
-        safe_strip(row.get("phone", "")),
-        safe_strip(row.get("phone2", "")),
-    ])
-
-
-def row_has_strong_company_data(row: Dict[str, Any]) -> bool:
-    return any([
-        safe_strip(row.get("name", "")),
-        validate_siret(row.get("siret", "")),
-        safe_strip(row.get("address", "")),
-        safe_strip(row.get("city", "")),
-    ])
-
-
-def is_prospect_already_rich(row: Dict[str, Any]) -> bool:
-    score = 0
-    if safe_strip(row.get("name", "")):
-        score += 1
-    if safe_strip(row.get("city", "")):
-        score += 1
-    if safe_strip(row.get("interlocuteur", "")):
-        score += 1
-    if safe_strip(row.get("phone", "")) or safe_strip(row.get("phone2", "")):
-        score += 1
-    if safe_strip(row.get("email", "")):
-        score += 1
-    if safe_strip(row.get("website", "")):
-        score += 1
-    if validate_siret(row.get("siret", "")):
-        score += 1
-    return score >= 5
-
-
-def card_entry_has_usable_gemini(card: Dict[str, Any]) -> bool:
-    g = card.get("gemini") or {}
-    if not isinstance(g, dict):
-        return False
-    filled = sum(
-        1 for k in ["company", "name", "email", "phone", "website", "city", "address"]
-        if safe_strip(g.get(k, ""))
-    )
-    return filled >= 2
-
-
-def photo_entry_has_usable_gemini(photo: Dict[str, Any]) -> bool:
-    company = safe_strip(photo.get("gemini_company", ""))
-    city = safe_strip(photo.get("gemini_city", ""))
-    return bool(company or city)
-
-
-def minimal_card_from_kv(card: Dict[str, Any]) -> Dict[str, Any]:
-    g = card.get("gemini") or {}
-    out = {
-        "company": safe_strip(g.get("company", "")),
-        "name": safe_strip(g.get("name", "")),
-        "email": clean_email(g.get("email", "")) if is_valid_email(g.get("email", "")) else "",
-        "phone": normalize_phone(g.get("phone", "")),
-        "phone2": "",
-        "website": safe_strip(g.get("website", "")),
-        "address": safe_strip(g.get("address", "")),
-        "postal_code": normalize_cp(g.get("postal_code", "")),
-        "city": safe_strip(g.get("city", "")),
-        "ocr_text": "",
-    }
-
-    if not out["website"] and out["email"]:
-        dom = domain_from_email(out["email"])
-        if dom and dom not in FREE_MAIL_DOMAINS:
-            out["website"] = f"https://{dom}"
-
-    if not out["phone"] and safe_strip(card.get("phone", "")):
-        out["phone"] = normalize_phone(card.get("phone", ""))
-
-    return out
-
-
-def minimal_photo_from_kv(photo: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "company": safe_strip(photo.get("gemini_company", "")),
-        "city": safe_strip(photo.get("gemini_city", "") or photo.get("city", "")),
-        "phone": "",
-        "phone2": "",
-        "email": "",
-        "website": "",
-        "address": "",
-        "postal_code": "",
-        "ocr_text": "",
-    }
-
-
-def promotion_score_card(d: Dict[str, Any]) -> int:
-    score = 0
-    if safe_strip(d.get("company", "")):
-        score += 2
-    if safe_strip(d.get("city", "")):
-        score += 1
-    if safe_strip(d.get("email", "")):
-        score += 1
-    if safe_strip(d.get("phone", "")) or safe_strip(d.get("phone2", "")):
-        score += 1
-    if safe_strip(d.get("website", "")):
-        score += 1
-    if safe_strip(d.get("address", "")):
-        score += 1
-    return score
-
-
-def promotion_score_photo(d: Dict[str, Any]) -> int:
-    score = 0
-    if safe_strip(d.get("company", "")):
-        score += 2
-    if safe_strip(d.get("city", "")):
-        score += 1
-    if safe_strip(d.get("website", "")):
-        score += 1
-    if safe_strip(d.get("phone", "")) or safe_strip(d.get("email", "")):
-        score += 1
-    return score
-
-
-def best_card_key_for_link(card: Dict[str, Any]) -> str:
-    raw = safe_strip(card.get("linked_prospect_name", ""))
-    if raw:
-        return normalize_company_name(raw)
-
-    source = safe_strip(card.get("source", ""))
-    if source == "prospect_mode":
-        return normalize_company_name(card.get("linked_prospect_name", ""))
-
-    g = card.get("gemini") or {}
-    comp = safe_strip(g.get("company", ""))
-    if comp:
-        return normalize_company_name(comp)
-
-    return ""
-
 
 # ------------------------------------------------------------
 # LECTURE DES CARTES KV
@@ -2848,56 +2824,44 @@ def load_cards_for_day(date: str) -> List[Dict[str, Any]]:
         return []
 
 
-def group_cards_by_prospect(cards: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    groups: Dict[str, List[Dict[str, Any]]] = {}
+def group_cards_by_prospect(cards: List[Dict[str, Any]]) -> Dict[str, List[Dict]]:
+    groups: Dict[str, List[Dict]] = {}
 
     for c in cards:
-        key = best_card_key_for_link(c)
+        linked = safe_strip(c.get("linked_prospect_name", ""))
+        key = normalize_company_name(linked)
+
         if not key:
-            continue
+            key = f"__unlinked__|{c.get('chatId','')}|{c.get('ts','')}"
+
         groups.setdefault(key, []).append(c)
 
     return groups
 
 
 # ------------------------------------------------------------
-# ANALYSE CARTE KV — VERSION OPTIMISÉE
+# ANALYSE CARTE KV
 # ------------------------------------------------------------
 
-_CARD_ANALYSIS_COUNTER = {"count": 0}
-_PHOTO_ANALYSIS_COUNTER = {"count": 0}
-
-
-def analyze_card_entry(card: Dict[str, Any], force_full: bool = False) -> Dict[str, Any]:
-    if not card:
-        return {}
-
-    # 1) priorité absolue : données déjà présentes dans KV
-    if not force_full and card_entry_has_usable_gemini(card):
-        return minimal_card_from_kv(card)
-
-    # 2) limite globale de traitements lourds
-    if _CARD_ANALYSIS_COUNTER["count"] >= MAX_TOTAL_CARD_ANALYSIS and not force_full:
-        return minimal_card_from_kv(card)
+def analyze_card_entry(card: Dict[str, Any]) -> Dict[str, Any]:
 
     file_id = card.get("file_id") or ""
     if not file_id:
-        return minimal_card_from_kv(card)
+        return {}
 
     img = tg_download_file(file_id)
     if not img:
-        return minimal_card_from_kv(card)
+        return {}
 
-    _CARD_ANALYSIS_COUNTER["count"] += 1
     analysis = analyze_business_card_bytes(img)
 
     if not analysis:
-        return minimal_card_from_kv(card)
+        return {}
 
-    out = {
+    return {
         "company": safe_strip(analysis.get("company", "")),
         "name": safe_strip(analysis.get("name", "")),
-        "email": clean_email(analysis.get("email", "")) if is_valid_email(analysis.get("email", "")) else "",
+        "email": clean_email(analysis.get("email", "")),
         "phone": normalize_phone(analysis.get("phone", "")),
         "phone2": normalize_phone(analysis.get("phone2", "")),
         "website": safe_strip(analysis.get("website", "")),
@@ -2907,41 +2871,22 @@ def analyze_card_entry(card: Dict[str, Any], force_full: bool = False) -> Dict[s
         "ocr_text": analysis.get("ocr_text", ""),
     }
 
-    if not out["website"] and out["email"]:
-        dom = domain_from_email(out["email"])
-        if dom and dom not in FREE_MAIL_DOMAINS:
-            out["website"] = f"https://{dom}"
-
-    return out
-
 
 # ------------------------------------------------------------
-# ANALYSE PHOTO FACADE — VERSION OPTIMISÉE
+# ANALYSE PHOTO FACADE
 # ------------------------------------------------------------
 
-def analyze_photo_entry(photo: Dict[str, Any], force_full: bool = False) -> Dict[str, Any]:
-    if not photo:
-        return {}
-
-    if not force_full and photo_entry_has_usable_gemini(photo):
-        return minimal_photo_from_kv(photo)
-
-    if _PHOTO_ANALYSIS_COUNTER["count"] >= MAX_TOTAL_PHOTO_ANALYSIS and not force_full:
-        return minimal_photo_from_kv(photo)
+def analyze_photo_entry(photo: Dict[str, Any]) -> Dict[str, Any]:
 
     file_id = photo.get("file_id") or ""
     if not file_id:
-        return minimal_photo_from_kv(photo)
+        return {}
 
     img = tg_download_file(file_id)
     if not img:
-        return minimal_photo_from_kv(photo)
+        return {}
 
-    _PHOTO_ANALYSIS_COUNTER["count"] += 1
     analysis = analyze_facade_bytes(img)
-
-    if not analysis:
-        return minimal_photo_from_kv(photo)
 
     return {
         "company": safe_strip(analysis.get("company", "")),
@@ -2961,6 +2906,7 @@ def analyze_photo_entry(photo: Dict[str, Any], force_full: bool = False) -> Dict
 # ------------------------------------------------------------
 
 def merge_card_into_prospect(prospect: Dict[str, Any], card_data: Dict[str, Any]) -> Dict[str, Any]:
+
     p = dict(prospect)
 
     if not safe_strip(p.get("name")) and safe_strip(card_data.get("company")):
@@ -3001,51 +2947,41 @@ def merge_card_into_prospect(prospect: Dict[str, Any], card_data: Dict[str, Any]
 
 
 # ------------------------------------------------------------
-# PROSPECT FINAL — VERSION OPTIMISÉE
+# PROSPECT FINAL
 # ------------------------------------------------------------
 
 def unify_from_prospect(prospect: Dict[str, Any], cards: List[Dict[str, Any]]) -> Dict[str, Any]:
+
     base = dict(prospect)
-    merged = dict(base)
 
-    # 1) si la fiche est déjà riche, n'utiliser que les cartes KV minimales
-    rich = is_prospect_already_rich(merged)
+    card_data = {}
 
-    # 2) fusion cartes liées
     if cards:
         for c in cards:
-            analysis = analyze_card_entry(c, force_full=not rich)
+            analysis = analyze_card_entry(c)
             if analysis:
-                merged = merge_card_into_prospect(merged, analysis)
+                card_data = merge_card_into_prospect(card_data, analysis)
 
-    # 3) enrichissement entreprise seulement si utile
-    need_company_enrich = not (
-        validate_siret(merged.get("siret", "")) and
-        safe_strip(merged.get("name", "")) and
-        safe_strip(merged.get("city", ""))
+    merged = merge_card_into_prospect(base, card_data)
+
+    enriched = enrich_company_from_identifiers(
+        company_raw=merged.get("name", ""),
+        city=merged.get("city", ""),
+        email=merged.get("email", ""),
+        website=merged.get("website", ""),
+        phone=merged.get("phone", ""),
+        address_hint=merged.get("address", ""),
+        postal_code_hint=merged.get("postal_code", ""),
     )
 
-    if need_company_enrich or not row_has_strong_contact_data(merged):
-        enriched = enrich_company_from_identifiers(
-            company_raw=merged.get("name", ""),
-            city=merged.get("city", ""),
-            email=merged.get("email", ""),
-            website=merged.get("website", ""),
-            phone=merged.get("phone", ""),
-            address_hint=merged.get("address", ""),
-            postal_code_hint=merged.get("postal_code", ""),
-        )
-        merged = merge_rows_keep_best(merged, enriched)
+    merged = merge_rows_keep_best(merged, enriched)
 
-    # 4) résumé activité si nécessaire
-    if not safe_strip(merged.get("activity_summary", "")):
-        merged["activity_summary"] = enrich_activity_summary(
-            merged.get("name", ""),
-            merged.get("naf", ""),
-            merged.get("website", ""),
-        )
+    merged["activity_summary"] = enrich_activity_summary(
+        merged.get("name", ""),
+        merged.get("naf", ""),
+        merged.get("website", ""),
+    )
 
-    # 5) ne jamais écraser les champs terrain
     merged["resume"] = safe_strip(prospect.get("resume", ""))
     merged["commande"] = safe_strip(prospect.get("commande", ""))
 
@@ -3053,29 +2989,21 @@ def unify_from_prospect(prospect: Dict[str, Any], cards: List[Dict[str, Any]]) -
 
 
 # ------------------------------------------------------------
-# LOT CARTES → PROSPECTS — VERSION OPTIMISÉE
+# LOT CARTES → PROSPECTS
 # ------------------------------------------------------------
 
 def promote_cards_to_prospects(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+
     prospects = []
 
-    # seulement les cartes non liées ou insuffisamment liées
-    candidate_cards = []
     for c in cards:
-        if safe_strip(c.get("linked_prospect_name", "")):
+
+        analysis = analyze_card_entry(c)
+
+        if not analysis:
             continue
-        candidate_cards.append(c)
 
-    candidate_cards = candidate_cards[:MAX_TOTAL_CARD_ANALYSIS]
-
-    for c in candidate_cards:
-        # rapide d'abord
-        analysis = analyze_card_entry(c, force_full=False)
-        if promotion_score_card(analysis) < MIN_PROMOTION_SCORE_CARD:
-            # si trop faible, on tente une passe complète seulement si on a encore du budget
-            analysis = analyze_card_entry(c, force_full=True)
-
-        if promotion_score_card(analysis) < MIN_PROMOTION_SCORE_CARD:
+        if not analysis.get("company"):
             continue
 
         p = {
@@ -3097,42 +3025,39 @@ def promote_cards_to_prospects(cards: List[Dict[str, Any]]) -> List[Dict[str, An
             city=p["city"],
             email=p["email"],
             website=p["website"],
-            phone=p["phone"],
-            address_hint=p["address"],
-            postal_code_hint=p["postal_code"],
         )
 
         p = merge_rows_keep_best(p, enriched)
 
-        if not safe_strip(p.get("activity_summary", "")):
-            p["activity_summary"] = enrich_activity_summary(
-                p.get("name", ""),
-                p.get("naf", ""),
-                p.get("website", ""),
-            )
+        p["activity_summary"] = enrich_activity_summary(
+            p.get("name", ""),
+            p.get("naf", ""),
+            p.get("website", ""),
+        )
 
         prospects.append(p)
+
         STATS["lot_cards_promoted"] += 1
 
     return prospects
 
 
 # ------------------------------------------------------------
-# LOT FACADE → PROSPECTS — VERSION OPTIMISÉE
+# LOT FACADE → PROSPECTS
 # ------------------------------------------------------------
 
 def promote_photos_to_prospects(photos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+
     prospects = []
 
-    candidate_photos = photos[:MAX_TOTAL_PHOTO_ANALYSIS]
+    for ph in photos:
 
-    for ph in candidate_photos:
-        analysis = analyze_photo_entry(ph, force_full=False)
+        analysis = analyze_photo_entry(ph)
 
-        if promotion_score_photo(analysis) < MIN_PROMOTION_SCORE_PHOTO:
-            analysis = analyze_photo_entry(ph, force_full=True)
+        if not analysis:
+            continue
 
-        if promotion_score_photo(analysis) < MIN_PROMOTION_SCORE_PHOTO:
+        if not analysis.get("company"):
             continue
 
         p = {
@@ -3144,8 +3069,6 @@ def promote_photos_to_prospects(photos: List[Dict[str, Any]]) -> List[Dict[str, 
             "website": analysis.get("website"),
             "address": analysis.get("address"),
             "postal_code": analysis.get("postal_code"),
-            "resume": "",
-            "commande": "",
         }
 
         enriched = enrich_company_from_identifiers(
@@ -3153,76 +3076,53 @@ def promote_photos_to_prospects(photos: List[Dict[str, Any]]) -> List[Dict[str, 
             city=p["city"],
             email=p["email"],
             website=p["website"],
-            phone=p["phone"],
-            address_hint=p["address"],
-            postal_code_hint=p["postal_code"],
         )
 
         p = merge_rows_keep_best(p, enriched)
 
-        if not safe_strip(p.get("activity_summary", "")):
-            p["activity_summary"] = enrich_activity_summary(
-                p.get("name", ""),
-                p.get("naf", ""),
-                p.get("website", ""),
-            )
+        p["activity_summary"] = enrich_activity_summary(
+            p.get("name", ""),
+            p.get("naf", ""),
+            p.get("website", ""),
+        )
 
         prospects.append(p)
+
         STATS["lot_photos_promoted"] += 1
 
     return prospects
 
 
 # ------------------------------------------------------------
-# PIPELINE GLOBAL CONSOLIDATION — VERSION OPTIMISÉE
+# PIPELINE GLOBAL CONSOLIDATION
 # ------------------------------------------------------------
 
 def consolidate_all_data(date: str) -> List[Dict[str, Any]]:
-    # reset compteurs par run
-    _CARD_ANALYSIS_COUNTER["count"] = 0
-    _PHOTO_ANALYSIS_COUNTER["count"] = 0
 
     prospects = worker_dump("prospects", date)
     photos = worker_dump("photos", date)
+
     cards = load_cards_for_day(date)
 
     card_groups = group_cards_by_prospect(cards)
+
     rows = []
 
     for p in prospects:
-        # compat historique : plusieurs façons de retrouver la carte liée
-        keys_to_try = []
 
-        if safe_strip(p.get("name", "")):
-            keys_to_try.append(normalize_company_name(p.get("name", "")))
+        key = normalize_company_name(p.get("name", ""))
 
-        if safe_strip(p.get("card_kv_key", "")):
-            # on recharge la carte si besoin
-            pass
+        related_cards = card_groups.get(key, [])
 
-        related_cards = []
-        for k in keys_to_try:
-            related_cards.extend(card_groups.get(k, []))
+        row = unify_from_prospect(p, related_cards)
 
-        # dédoublonnage des cartes liées
-        unique_related = []
-        seen = set()
-        for c in related_cards:
-            ck = f"{c.get('file_id','')}|{c.get('ts','')}"
-            if ck in seen:
-                continue
-            seen.add(ck)
-            unique_related.append(c)
-
-        row = unify_from_prospect(p, unique_related)
         rows.append(row)
 
-        if unique_related:
+        if related_cards:
             STATS["prospect_card_links_found"] += 1
         else:
             STATS["prospect_card_links_missing"] += 1
 
-    # promotion lot seulement en complément
     promoted_cards = promote_cards_to_prospects(cards)
     promoted_photos = promote_photos_to_prospects(photos)
 
@@ -3232,10 +3132,13 @@ def consolidate_all_data(date: str) -> List[Dict[str, Any]]:
     rows = dedupe_rows(rows)
 
     final_rows = []
+
     for r in rows:
+
         r["date"] = date
         r["agency"] = r.get("agency") or AGENCY
         r["initials"] = r.get("initials") or INITIALS
+
         final_rows.append(finalize_row_for_export(r))
 
     return final_rows
