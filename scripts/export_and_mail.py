@@ -1397,11 +1397,7 @@ def finalize_row_for_export(row: Dict[str, Any]) -> Dict[str, Any]:
     return row
     # ============================================================
 # BLOC 3 / 6 — OCR HYBRIDE / GEMINI / DOUBLE PASSE CARTES
-# VERSION OPTIMISÉE SANS PERTE DE FONCTIONNALITÉS
 # ============================================================
-
-USE_EASYOCR = env_str("USE_EASYOCR", "1").strip() == "1"
-
 
 def pil_to_cv(img: Image.Image) -> np.ndarray:
     arr = np.array(img)
@@ -1506,21 +1502,6 @@ def rotate_image_variants(img: Image.Image) -> List[Image.Image]:
     return out
 
 
-def get_easyocr_reader():
-    global EASYOCR_READER
-
-    if not USE_EASYOCR:
-        return False
-
-    if EASYOCR_READER is None:
-        try:
-            EASYOCR_READER = easyocr.Reader(["fr", "en"], gpu=False)
-        except Exception as e:
-            print(f"[WARN] EasyOCR unavailable: {e}")
-            EASYOCR_READER = False
-    return EASYOCR_READER
-
-
 def ocr_easyocr_on_pil(img: Image.Image) -> str:
     try:
         reader = get_easyocr_reader()
@@ -1559,103 +1540,32 @@ def merge_text_blocks(texts: List[str]) -> str:
     return "\n".join(lines)
 
 
-def extract_structured_from_text_fast(text: str) -> Dict[str, Any]:
-    lines = clean_ocr_lines(text)
-    joined = "\n".join(lines)
-
-    emails = extract_all_emails(joined)
-    urls = extract_urls(joined)
-    phones = extract_all_phones(joined)
-    phone, phone2 = split_phones_by_priority(phones)
-    addr, cp, city = extract_local_address_from_text(joined)
-    company = detect_company_from_lines(
-        lines,
-        website=(urls[0] if urls else ""),
-        email=(emails[0] if emails else "")
-    )
-    person = detect_person_name_from_lines(lines, company_line=company)
-    fn, ln = split_human_name(person)
-
-    return {
-        "lines": lines,
-        "raw_text": joined,
-        "emails": emails,
-        "urls": urls,
-        "phones": phones,
-        "phone": phone,
-        "phone2": phone2,
-        "postal_code": cp,
-        "city": city,
-        "address": clean_address_candidate(addr),
-        "company": normalize_spaces_inline(company),
-        "person_name": normalize_spaces_inline(person),
-        "contact_firstname": normalize_spaces_inline(fn),
-        "contact_lastname": normalize_spaces_inline(ln),
-    }
-
-
-def enough_business_card_info(d: Dict[str, Any]) -> bool:
-    filled = sum(
-        1 for v in [
-            safe_strip(d.get("name", "")),
-            safe_strip(d.get("company", "")),
-            clean_email(d.get("email", "")),
-            normalize_phone(d.get("phone", "")),
-            safe_strip(d.get("website", "")),
-            safe_strip(d.get("city", "")),
-            safe_strip(d.get("address", "")),
-        ] if v
-    )
-    return filled >= 3
-
-
-def enough_contact_info_for_skip_easyocr(d: Dict[str, Any], ocr_struct: Dict[str, Any]) -> bool:
-    score = 0
-    if safe_strip(d.get("company", "")) or safe_strip(ocr_struct.get("company", "")):
-        score += 1
-    if clean_email(d.get("email", "")) or (ocr_struct.get("emails") or []):
-        score += 1
-    if normalize_phone(d.get("phone", "")) or normalize_phone(ocr_struct.get("phone", "")):
-        score += 1
-    if safe_strip(d.get("website", "")) or (ocr_struct.get("urls") or []):
-        score += 1
-    if safe_strip(d.get("city", "")) or safe_strip(ocr_struct.get("city", "")):
-        score += 1
-    return score >= 3
-
-
-def ocr_image_bytes(img_bytes: bytes, light: bool = False, allow_easyocr: bool = True) -> str:
+def ocr_image_bytes(img_bytes: bytes, light: bool = False) -> str:
     if not img_bytes:
         return ""
 
-    h = image_hash_bytes(img_bytes) + ("|light" if light else "|full") + ("|easy" if allow_easyocr else "|noeasy")
+    h = image_hash_bytes(img_bytes) + ("|light" if light else "|full")
     if h in OCR_TEXT_CACHE:
         return OCR_TEXT_CACHE[h]
 
     variants = preprocess_image_variants(img_bytes)
     all_texts = []
 
-    base_variants = variants[:2] if light else variants[:4]
+    base_variants = variants[:2] if light else variants
 
     for base_img in base_variants:
         rotated = rotate_image_variants(base_img)
-        rotated = rotated[:2] if light else rotated[:4]
-
+        rotated = rotated[:2] if light else rotated
         for rot in rotated:
             zones = crop_image_zones(rot)
-            zones = zones[:3] if light else zones[:5]
-
+            zones = zones[:3] if light else zones
             for zone in zones:
-                # Tesseract d'abord : plus léger
+                t1 = ocr_easyocr_on_pil(zone)
+                if t1:
+                    all_texts.append(t1)
                 t2 = ocr_tesseract_on_pil(zone)
                 if t2:
                     all_texts.append(t2)
-
-                # EasyOCR seulement si autorisé
-                if allow_easyocr:
-                    t1 = ocr_easyocr_on_pil(zone)
-                    if t1:
-                        all_texts.append(t1)
 
     merged = merge_text_blocks(all_texts)
     OCR_TEXT_CACHE[h] = merged
@@ -1823,14 +1733,10 @@ def extract_structured_from_ocr_text(ocr_text: str) -> Dict[str, Any]:
     phones = extract_all_phones(text)
     phone, phone2 = split_phones_by_priority(phones)
 
-    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text(text)
-
-    company = detect_company_from_lines(
-        lines,
-        website=(urls[0] if urls else ""),
-        email=(emails[0] if emails else "")
-    )
+    addr, cp, city = extract_local_address_from_text(text)
+    company = detect_company_from_lines(lines, website=(urls[0] if urls else ""), email=(emails[0] if emails else ""))
     person = detect_person_name_from_lines(lines, company_line=company)
+
     fn, ln = split_human_name(person)
 
     return {
@@ -1841,9 +1747,9 @@ def extract_structured_from_ocr_text(ocr_text: str) -> Dict[str, Any]:
         "phones": phones,
         "phone": phone,
         "phone2": phone2,
-        "postal_code": local_cp_ocr,
-        "city": local_city_ocr,
-        "address": clean_address_candidate(local_addr_ocr),
+        "postal_code": cp,
+        "city": city,
+        "address": clean_address_candidate(addr),
         "company": normalize_spaces_inline(company),
         "person_name": normalize_spaces_inline(person),
         "contact_firstname": normalize_spaces_inline(fn),
@@ -1925,46 +1831,30 @@ def analyze_business_card_bytes(img_bytes: bytes) -> Dict[str, Any]:
     if key in PROSPECT_CARD_ANALYSIS_CACHE:
         return dict(PROSPECT_CARD_ANALYSIS_CACHE[key])
 
-    # 1) Gemini passe 1
     pass1 = gemini_extract_business_card(img_bytes) if GEMINI_API_KEY else {}
+    light_ocr = bool(
+        safe_strip(pass1.get("name", "")) or
+        safe_strip(pass1.get("company", "")) or
+        safe_strip(pass1.get("email", "")) or
+        safe_strip(pass1.get("phone", "")) or
+        safe_strip(pass1.get("website", ""))
+    )
 
-    # 2) OCR léger sans EasyOCR d’abord
-    light_ocr = enough_business_card_info(pass1)
-    ocr_txt_fast = ocr_image_bytes(img_bytes, light=light_ocr, allow_easyocr=False)
-    ocr_struct_fast = extract_structured_from_ocr_text(ocr_txt_fast)
+    ocr_txt = ocr_image_bytes(img_bytes, light=light_ocr)
+    ocr_struct = extract_structured_from_ocr_text(ocr_txt)
 
-    # 3) décider si on a besoin d’une passe 2 Gemini
     need_second_pass = (
         not safe_strip(pass1.get("name", "")) or
         not safe_strip(pass1.get("company", "")) or
         (
             not safe_strip(pass1.get("email", "")) and
-            not safe_strip((ocr_struct_fast.get("emails") or [""])[0])
+            not safe_strip((ocr_struct.get("emails") or [""])[0])
         )
     )
 
     pass2 = gemini_extract_business_card_second_pass(img_bytes) if GEMINI_API_KEY and need_second_pass else {}
 
-    # 4) si Gemini + Tesseract suffisent, on n’appelle pas EasyOCR
-    if enough_contact_info_for_skip_easyocr(
-        {
-            "company": pass1.get("company", "") or pass2.get("company", ""),
-            "email": pass1.get("email", "") or pass2.get("email", ""),
-            "phone": pass1.get("phone", "") or pass2.get("phone", ""),
-            "website": pass1.get("website", "") or pass2.get("website", ""),
-            "city": pass1.get("city", "") or pass2.get("city", ""),
-        },
-        ocr_struct_fast,
-    ):
-        merged = merge_card_passes(pass1, pass2, ocr_struct_fast)
-        PROSPECT_CARD_ANALYSIS_CACHE[key] = dict(merged)
-        return merged
-
-    # 5) seulement ici, OCR complet avec EasyOCR
-    ocr_txt_full = ocr_image_bytes(img_bytes, light=False, allow_easyocr=True)
-    ocr_struct_full = extract_structured_from_ocr_text(ocr_txt_full)
-
-    merged = merge_card_passes(pass1, pass2, ocr_struct_full)
+    merged = merge_card_passes(pass1, pass2, ocr_struct)
     PROSPECT_CARD_ANALYSIS_CACHE[key] = dict(merged)
     return merged
 
@@ -1990,25 +1880,8 @@ def analyze_facade_bytes(img_bytes: bytes) -> Dict[str, Any]:
         return dict(PROSPECT_CARD_ANALYSIS_CACHE[key])
 
     gem = gemini_extract_facade_logo(img_bytes) if GEMINI_API_KEY else {"company": "", "city": ""}
-
-    # OCR léger sans EasyOCR d’abord
-    ocr_txt_fast = ocr_image_bytes(img_bytes, light=not bool(gem.get("company")), allow_easyocr=False)
-    ocr_struct_fast = extract_structured_from_ocr_text(ocr_txt_fast)
-
-    enough = sum(
-        1 for v in [
-            safe_strip(gem.get("company", "") or ocr_struct_fast.get("company", "")),
-            safe_strip(gem.get("city", "") or ocr_struct_fast.get("city", "")),
-            (ocr_struct_fast.get("urls") or [""])[0] if ocr_struct_fast.get("urls") else "",
-            (ocr_struct_fast.get("emails") or [""])[0] if ocr_struct_fast.get("emails") else "",
-        ] if safe_strip(v)
-    ) >= 2
-
-    if enough:
-        ocr_struct = ocr_struct_fast
-    else:
-        ocr_txt_full = ocr_image_bytes(img_bytes, light=False, allow_easyocr=True)
-        ocr_struct = extract_structured_from_ocr_text(ocr_txt_full)
+    ocr_txt = ocr_image_bytes(img_bytes, light=not bool(gem.get("company")))
+    ocr_struct = extract_structured_from_ocr_text(ocr_txt)
 
     company = choose_final_company_name(
         gouv_name="",
