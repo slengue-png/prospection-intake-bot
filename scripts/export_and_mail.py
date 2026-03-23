@@ -578,7 +578,9 @@ def autosize(ws):
             max_len = max(max_len, len(s))
             max_len = min(max_len, 60)
         ws.column_dimensions[get_column_letter(col)].width = max_len
-        # ============================================================
+
+
+# ============================================================
 # HTTP HELPERS
 # ============================================================
 
@@ -1289,7 +1291,9 @@ def enrich_activity_summary(name: str, naf: str, website: str, company_hint: str
     if val:
         return val
     return infer_activity_fallback(name=name, website=website, naf=naf)
-    # ============================================================
+
+
+# ============================================================
 # ENRICHISSEMENT ENTREPRISE
 # ============================================================
 
@@ -1649,10 +1653,13 @@ def scrape_email_from_site(url: str) -> str:
         cached = EMAIL_SCRAPE_CACHE[domain]
         return "" if cached == "none" else cached
 
-    candidates = [url]
+    candidates = []
     base = url.rstrip("/")
-    for suffix in ["/contact", "/nous-contacter", "/mentions-legales", "/legal"]:
-        candidates.append(base + suffix)
+    if base:
+        candidates.append(base + "/contact")
+        candidates.append(base)
+    else:
+        candidates.append(url)
 
     for attempt_url in candidates:
         try:
@@ -1876,7 +1883,12 @@ def merge_card_into_prospect_row(row: Dict[str, Any], img_bytes: bytes) -> Dict[
 
     merged = dict(row)
 
-    # Carte prioritaire sur API / Places pour les infos visibles
+    row_score = record_score(row)
+    card_score = record_score(card)
+    card_is_globally_better = card_score > row_score
+
+    # Carte prioritaire sur API / Places pour les infos visibles,
+    # mais sans écraser brutalement un prospect déjà meilleur.
     for fld in [
         "interlocuteur",
         "contact_firstname",
@@ -1887,11 +1899,31 @@ def merge_card_into_prospect_row(row: Dict[str, Any], img_bytes: bytes) -> Dict[
         "postal_code",
         "city",
     ]:
-        if str(card.get(fld, "") or "").strip():
+        card_val = str(card.get(fld, "") or "").strip()
+        row_val = str(merged.get(fld, "") or "").strip()
+        if not card_val:
+            continue
+
+        should_replace = False
+        if not row_val:
+            should_replace = True
+        elif fld == "email" and is_valid_email(card_val) and not is_valid_email(row_val):
+            should_replace = True
+        elif fld == "website" and len(card_val) > len(row_val):
+            should_replace = True
+        elif fld in ("address", "interlocuteur", "contact_firstname", "contact_lastname") and len(card_val) > len(row_val):
+            should_replace = True
+        elif fld in ("postal_code", "city") and not merged.get("address") and card_is_globally_better:
+            should_replace = True
+
+        if should_replace:
             merged[fld] = card.get(fld, "")
 
-    if not str(merged.get("name", "") or "").strip() and str(card.get("name", "") or "").strip():
-        merged["name"] = card.get("name", "")
+    if str(card.get("name", "") or "").strip():
+        current_name = str(merged.get("name", "") or "").strip()
+        card_name = str(card.get("name", "") or "").strip()
+        if (not current_name) or (len(card_name) > len(current_name) and card_is_globally_better):
+            merged["name"] = card.get("name", "")
 
     if not str(merged.get("siret", "") or "").strip() and str(card.get("siret", "") or "").strip():
         merged["siret"] = card.get("siret", "")
@@ -1921,7 +1953,7 @@ def merge_card_into_prospect_row(row: Dict[str, Any], img_bytes: bytes) -> Dict[
     if merged.get("phone") and merged.get("phone2") and merged["phone"] == merged["phone2"]:
         merged["phone2"] = ""
 
-    if not str(merged.get("activity_summary", "") or "").strip():
+    if not merged.get("activity_summary"):
         merged["activity_summary"] = enrich_activity_summary(
             name=merged.get("name", ""),
             naf=merged.get("naf", ""),
@@ -1962,7 +1994,9 @@ def unify_from_prospect_with_card(p: Dict[str, Any]) -> Dict[str, Any]:
 
     STATS["linked_cards_processed"] += 1
     return merge_card_into_prospect_row(row, img)
-    # ============================================================
+
+
+# ============================================================
 # DÉDUPLICATION AVANCÉE
 # ============================================================
 
@@ -1982,6 +2016,7 @@ def row_identity_signals(row: Dict[str, Any]) -> Dict[str, str]:
         "phone2": normalize_phone(row.get("phone2", "") or ""),
         "email": clean_email(row.get("email", "") or ""),
         "domain": domain_match_value(row),
+        "website_domain": domain_from_url(row.get("website", "") or ""),
         "interlocuteur": normalize_text(row.get("interlocuteur", "") or ""),
         "address": normalize_text(row.get("address", "") or ""),
         "agency": normalize_text(row.get("agency", "") or ""),
@@ -2078,6 +2113,9 @@ def row_similarity_score(a: Dict[str, Any], b: Dict[str, Any]) -> int:
 
     if sa["domain"] and sb["domain"] and sa["domain"] == sb["domain"]:
         score += 12
+
+    if sa["website_domain"] and sb["website_domain"] and sa["website_domain"] == sb["website_domain"]:
+        score += 10
 
     if sa["interlocuteur"] and sb["interlocuteur"]:
         if sa["interlocuteur"] == sb["interlocuteur"]:
@@ -2273,34 +2311,45 @@ def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # ============================================================
 
 def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
-    website = p.get("website", "")
-    naf = p.get("naf", "")
-    name = p.get("name", "")
-    activity_summary = p.get("activity_summary", "")
+    website = get_first_valid(p, "website", "site_web", "websiteUri")
+    naf = get_first_valid(p, "naf", "code_naf", "activite_principale")
+    name = get_first_valid(p, "name", "company", "nom", "denomination")
+    activity_summary = get_first_valid(p, "activity_summary", "activity", "activity_label")
+
     if not activity_summary and (name or naf or website):
         activity_summary = enrich_activity_summary(name=name, naf=naf, website=website, company_hint=name)
 
+    raw_email = get_first_valid(p, "email", "contact_email", "mail")
+    email = clean_email(raw_email) if is_valid_email(raw_email) else ""
+
+    phones = []
+    for k in ["phone", "phone2", "mobile", "telephone", "tel"]:
+        v = normalize_phone(p.get(k, "") or "")
+        if v and v not in phones:
+            phones.append(v)
+    phone, phone2 = split_phones_by_priority(phones)
+
     d = {
-        "date": p.get("date", ""),
-        "agency": (p.get("agency") or "").upper(),
-        "initials": (p.get("initials") or "").upper(),
+        "date": get_first_valid(p, "date") or "",
+        "agency": (get_first_valid(p, "agency") or "").upper(),
+        "initials": (get_first_valid(p, "initials", "user_initials") or "").upper(),
         "name": name,
-        "address": p.get("address", ""),
-        "postal_code": p.get("postal_code", ""),
-        "city": p.get("city", ""),
-        "siret": validate_siret(p.get("siret", "")),
+        "address": get_first_valid(p, "address", "adresse", "formattedAddress"),
+        "postal_code": get_first_valid(p, "postal_code", "code_postal", "postalCode"),
+        "city": get_first_valid(p, "city", "ville", "commune"),
+        "siret": validate_siret(get_first_valid(p, "siret", "siretSiege", "siret_siege")),
         "naf": naf,
         "activity_summary": activity_summary,
-        "dirigeant": p.get("dirigeant", ""),
-        "interlocuteur": p.get("interlocuteur", ""),
-        "contact_firstname": p.get("contact_firstname", ""),
-        "contact_lastname": p.get("contact_lastname", ""),
-        "phone": normalize_phone(p.get("phone", "")),
-        "phone2": normalize_phone(p.get("phone2", "")),
-        "email": clean_email(p.get("email", "")) if is_valid_email(p.get("email", "")) else "",
+        "dirigeant": get_first_valid(p, "dirigeant", "representant_legal", "nom_dirigeant"),
+        "interlocuteur": get_first_valid(p, "interlocuteur", "contact_name", "person_name"),
+        "contact_firstname": get_first_valid(p, "contact_firstname", "firstname", "first_name"),
+        "contact_lastname": get_first_valid(p, "contact_lastname", "lastname", "last_name"),
+        "phone": phone,
+        "phone2": phone2,
+        "email": email,
         "website": website,
-        "resume": p.get("resume", ""),
-        "commande": p.get("commande", ""),
+        "resume": get_first_valid(p, "resume", "meeting", "comment"),
+        "commande": get_first_valid(p, "commande", "order"),
     }
 
     if d["phone"] and d["phone2"] and d["phone"] == d["phone2"]:
@@ -2482,7 +2531,9 @@ def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comm
     row = normalize_row_address(row)
     row = uppercase_business_fields(row)
     return row
-    # ============================================================
+
+
+# ============================================================
 # CARTES LIÉES / COMPAT HISTORIQUE / LOT -> PROSPECT
 # ============================================================
 
@@ -2490,6 +2541,20 @@ def safe_get(d: Dict[str, Any], *keys: str) -> Any:
     for k in keys:
         if k in d and d.get(k) not in (None, ""):
             return d.get(k)
+    return ""
+
+
+def get_first_valid(d: Dict[str, Any], *keys: str) -> str:
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        if isinstance(v, str):
+            if v.strip():
+                return v.strip()
+            continue
+        if isinstance(v, (int, float)):
+            return str(v).strip()
     return ""
 
 
@@ -2887,7 +2952,9 @@ def consolidate_rows_for_send_mode(
 
     out = dedupe_rows(out)
     return out
-    # ============================================================
+
+
+# ============================================================
 # EXCEL
 # ============================================================
 
