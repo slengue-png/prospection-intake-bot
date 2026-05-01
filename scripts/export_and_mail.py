@@ -1,12 +1,41 @@
+"""
+export_and_mail.py — v2.0
+==========================
+Script GitHub Actions : export et envoi mail des fiches de prospection.
+
+Flux :
+  1. Dump KV via /dump (NDJSON) → prospects, closes, photos, cards
+  2. OCR hybride sur images (Gemini + EasyOCR + Tesseract)
+  3. Enrichissement (API Gouv + Google Places + scraping email)
+  4. Déduplication avancée multi-critères
+  5. Construction Excel via excel_export.py (xlsx consultation + xls CRM)
+  6. Envoi email via Brevo selon le mode :
+       individual       → commercial reçoit ses fiches
+       agency_manager   → responsable reçoit toutes les fiches de l'agence
+       admin            → manager général reçoit toutes les agences
+
+Variables d'environnement requises :
+  WORKER_BASE_URL, EXPORT_TOKEN, TELEGRAM_TOKEN
+  BREVO_API_KEY, BREVO_SENDER_EMAIL, BREVO_SENDER_NAME
+  MAIL_ROUTING_JSON (optionnel, sinon routing par défaut)
+  GOOGLE_PLACES_API_KEY (optionnel)
+  GEMINI_API_KEY (optionnel)
+  SEND_MODE   : individual | agency_manager | admin
+  RUN_DATE    : YYYY-MM-DD (optionnel, défaut = aujourd'hui Paris)
+  AGENCY      : GR|VR|GRS|SLS (requis si mode=individual ou agency_manager)
+  INITIALS    : ex CZ (requis si mode=individual)
+"""
+
 import os
 import re
 import json
 import io
 import base64
-import zipfile
 import hashlib
-import datetime as dt
-from typing import Dict, List, Any, Optional, Tuple
+import datetime
+import zoneinfo
+import logging
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from PIL import Image
@@ -14,10 +43,26 @@ import pytesseract
 import numpy as np
 import cv2
 import easyocr
-
 from openpyxl import Workbook
-from openpyxl.utils import get_column_letter
-from openpyxl.styles import Font, Alignment
+
+# Import module Excel (même répertoire)
+from excel_export import (
+    export_commercial,
+    export_agency_manager,
+    export_admin,
+    build_email_attachments,
+)
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -25,79 +70,68 @@ from openpyxl.styles import Font, Alignment
 # ============================================================
 
 def env_str(name: str, default: str = "") -> str:
-    v = os.environ.get(name, default)
-    if v is None:
-        return default
-    return str(v).strip()
+    return str(os.environ.get(name, default) or default).strip()
 
 
 def env_int(name: str, default: int) -> int:
-    s = env_str(name, "")
-    if s == "":
-        return default
     try:
-        return int(s)
-    except Exception:
+        return int(env_str(name, str(default)))
+    except (ValueError, TypeError):
         return default
 
 
-def paris_ymd_fallback() -> str:
-    return dt.date.today().strftime("%Y-%m-%d")
+def paris_today() -> str:
+    """Date du jour en timezone Europe/Paris — corrige le bug UTC de l'ébauche."""
+    try:
+        tz = zoneinfo.ZoneInfo("Europe/Paris")
+        return datetime.datetime.now(tz).strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.date.today().strftime("%Y-%m-%d")
 
 
-WORKER_BASE_URL = env_str("WORKER_BASE_URL")
-EXPORT_TOKEN = env_str("EXPORT_TOKEN")
-TELEGRAM_TOKEN = env_str("TELEGRAM_TOKEN")
+WORKER_BASE_URL   = env_str("WORKER_BASE_URL")
+EXPORT_TOKEN      = env_str("EXPORT_TOKEN")
+TELEGRAM_TOKEN    = env_str("TELEGRAM_TOKEN")
 
-BREVO_API_KEY = env_str("BREVO_API_KEY")
+BREVO_API_KEY     = env_str("BREVO_API_KEY")
 BREVO_SENDER_EMAIL = env_str("BREVO_SENDER_EMAIL", "no-reply@example.com")
-BREVO_SENDER_NAME = env_str("BREVO_SENDER_NAME", "Prospection Bot")
+BREVO_SENDER_NAME  = env_str("BREVO_SENDER_NAME", "Prospection Bot")
 
 MAIL_ROUTING_JSON = env_str("MAIL_ROUTING_JSON", "")
-
 GOOGLE_PLACES_API_KEY = env_str("GOOGLE_PLACES_API_KEY", "")
-GEMINI_API_KEY = env_str("GEMINI_API_KEY", "")
+GEMINI_API_KEY    = env_str("GEMINI_API_KEY", "")
 
-SEND_MODE = env_str("SEND_MODE", "individual").lower()
-RUN_DATE = env_str("RUN_DATE", paris_ymd_fallback())
-AGENCY = env_str("AGENCY", "").upper()
-INITIALS = env_str("INITIALS", "").upper()
+SEND_MODE  = env_str("SEND_MODE", "individual").lower()
+RUN_DATE   = env_str("RUN_DATE", paris_today())
+AGENCY     = env_str("AGENCY", "").upper()
+INITIALS   = env_str("INITIALS", "").upper()
 
-MAX_OCR_IMAGES = env_int("MAX_OCR_IMAGES", 50)
+MAX_OCR_IMAGES   = env_int("MAX_OCR_IMAGES", 50)
 MAX_PHOTO_IMAGES = env_int("MAX_PHOTO_IMAGES", 15)
 
-OUT_DIR = env_str("OUT_DIR", "out").strip() or "out"
+OUT_DIR = env_str("OUT_DIR", "out") or "out"
 if os.path.exists(OUT_DIR) and not os.path.isdir(OUT_DIR):
-    print(f"[WARN] OUT_DIR='{OUT_DIR}' existe mais n'est pas un dossier. Fallback -> 'exports'")
+    logger.warning("OUT_DIR='%s' existe mais n'est pas un dossier → fallback 'exports'", OUT_DIR)
     OUT_DIR = "exports"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 VALID_AGENCIES = {"GR", "VR", "GRS", "SLS"}
 
-EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+# Regex
+EMAIL_RE         = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 EMAIL_IN_TEXT_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
-PHONE_RE = re.compile(r"(?:(?:\+33|0)[\s\.-]*[1-9](?:[\s\.-]*\d{2}){4})")
-URL_RE = re.compile(r"(https?://[^\s)]+|www\.[^\s)]+)", re.I)
-CP_RE = re.compile(r"\b((?:0[1-9]|[1-8]\d|9[0-5])\s?\d{3}|97\d{3}|98\d{3})\b")
+PHONE_RE         = re.compile(r"(?:(?:\+33|0)[\s\.\-]*[1-9](?:[\s\.\-]*\d{2}){4})")
+URL_RE           = re.compile(r"(https?://[^\s)]+|www\.[^\s)]+)", re.I)
+CP_RE            = re.compile(r"\b((?:0[1-9]|[1-8]\d|9[0-5])\s?\d{3}|97\d{3}|98\d{3})\b")
 
-DISPOSABLE_DOMAINS = {
-    "tempmail.com",
-    "guerrillamail.com",
-    "yopmail.com",
-    "10minutemail.com",
-}
-
+DISPOSABLE_DOMAINS = {"tempmail.com", "guerrillamail.com", "yopmail.com", "10minutemail.com"}
 FREE_EMAIL_DOMAINS = {
     "gmail.com", "outlook.com", "hotmail.com", "yahoo.com", "yahoo.fr",
-    "icloud.com", "free.fr", "orange.fr", "laposte.net", "live.fr"
+    "icloud.com", "free.fr", "orange.fr", "laposte.net", "live.fr",
 }
 
-HEADERS = [
-    "date", "agency", "initials", "name", "address", "postal_code", "city",
-    "siret", "naf", "activity_summary", "dirigeant", "interlocuteur",
-    "contact_firstname", "contact_lastname", "phone", "phone2", "email",
-    "website", "resume", "commande"
-]
+# Qualification
+QUALIF_LABELS = {"chaud": "🔥 Chaud", "tiede": "📅 Tiède", "froid": "❄️ Froid"}
 
 
 # ============================================================
@@ -106,22 +140,14 @@ HEADERS = [
 
 DEFAULT_ROUTING = {
     "agencies": {
-        "GR": {
-            "manager": {"initials": "JL", "email": "jennifer.laurens@ras-interim.fr"},
-            "commercial": {"initials": "CZ", "email": "celine.zunarelli@ras-interim.fr"},
-        },
-        "VR": {
-            "manager": {"initials": "JB", "email": "jelena.carrasso@ras-interim.fr"},
-            "commercial": {"initials": "LB", "email": "laura.berthet@ras-interim.fr"},
-        },
-        "GRS": {
-            "manager": {"initials": "PV", "email": "pauline.vieira@ras-interim.fr"},
-            "commercial": {"initials": "ST", "email": "severine.thevenin@ras-interim.fr"},
-        },
-        "SLS": {
-            "manager": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"},
-            "commercial": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"},
-        },
+        "GR":  {"manager": {"initials": "JL", "email": "jennifer.laurens@ras-interim.fr"},
+                "commercial": {"initials": "CZ", "email": "celine.zunarelli@ras-interim.fr"}},
+        "VR":  {"manager": {"initials": "JB", "email": "jelena.carrasso@ras-interim.fr"},
+                "commercial": {"initials": "LB", "email": "laura.berthet@ras-interim.fr"}},
+        "GRS": {"manager": {"initials": "PV", "email": "pauline.vieira@ras-interim.fr"},
+                "commercial": {"initials": "ST", "email": "severine.thevenin@ras-interim.fr"}},
+        "SLS": {"manager": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"},
+                "commercial": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"}},
     },
     "users": {
         "JL": "jennifer.laurens@ras-interim.fr",
@@ -144,112 +170,46 @@ def load_routing() -> Dict[str, Any]:
             if isinstance(data, dict) and data:
                 return data
         except Exception as e:
-            print(f"[WARN] MAIL_ROUTING_JSON invalid JSON, fallback default. err={e}")
+            logger.warning("MAIL_ROUTING_JSON invalide, fallback routing par défaut : %s", e)
     return DEFAULT_ROUTING
 
 
 ROUTING = load_routing()
 
 
-def clean_email(v) -> str:
-    if v is None:
-        return ""
-    if isinstance(v, dict):
-        v = v.get("email") or ""
-    if not isinstance(v, str):
-        v = str(v)
-    v = v.strip().lower()
-    v = re.sub(r"\s+", "", v)
-    return v
-
-
-def is_valid_email(s: str) -> bool:
-    s = clean_email(s)
-    if not s or len(s) > 254:
-        return False
-    if not EMAIL_RE.match(s):
-        return False
-    domain = s.split("@", 1)[1]
-    if domain in DISPOSABLE_DOMAINS:
-        return False
-    return True
-
-
-def email_for_initials(initials: str) -> Optional[str]:
-    initials = (initials or "").upper().strip()
-    if not initials:
-        return None
-
-    users = ROUTING.get("users") or {}
-    if initials in users:
-        em = clean_email(users.get(initials))
-        if is_valid_email(em):
-            return em
-
-    agencies = ROUTING.get("agencies") or {}
-    for _, cfg in agencies.items():
-        for role in ("manager", "commercial"):
-            r = (cfg or {}).get(role) or {}
-            if (r.get("initials") or "").upper() == initials:
-                em2 = clean_email(r.get("email") or "")
-                return em2 if is_valid_email(em2) else None
-    return None
-
-
 # ============================================================
-# RUNTIME STATS / CACHE
+# STATS
 # ============================================================
 
-STATS = {
+STATS: Dict[str, int] = {
     "worker_dump_calls": 0,
-    "telegram_getfile_calls": 0,
-    "telegram_file_downloads": 0,
-    "gemini_vision_calls": 0,
-    "gemini_activity_calls": 0,
+    "telegram_downloads": 0,
+    "gemini_calls": 0,
     "gouv_calls": 0,
     "places_calls": 0,
     "scrape_calls": 0,
     "emails_sent": 0,
-    "ocr_easyocr_calls": 0,
-    "ocr_tesseract_calls": 0,
-    "dedupe_groups": 0,
-    "dedupe_rows_merged": 0,
-    "linked_cards_processed": 0,
-    "linked_cards_missing": 0,
-    "lot_cards_promoted": 0,
-    "lot_photos_promoted": 0,
-    "fusion_logs": 0,
+    "ocr_easyocr": 0,
+    "ocr_tesseract": 0,
+    "dedupe_merged": 0,
+    "cards_processed": 0,
+    "photos_processed": 0,
+    "rows_exported": 0,
 }
 
-GOUV_CACHE: Dict[str, Dict[str, Any]] = {}
-PLACES_CACHE: Dict[str, Dict[str, str]] = {}
-EMAIL_SCRAPE_CACHE: Dict[str, str] = {}
-GEMINI_ACTIVITY_CACHE: Dict[str, str] = {}
-GEMINI_CARD_CACHE: Dict[str, Dict[str, str]] = {}
-GEMINI_FACADE_CACHE: Dict[str, Dict[str, str]] = {}
-TG_FILE_PATH_CACHE: Dict[str, str] = {}
-TG_FILE_BYTES_CACHE: Dict[str, bytes] = {}
-CARD_PIPELINE_CACHE: Dict[str, Dict[str, Any]] = {}
-PHOTO_PIPELINE_CACHE: Dict[str, Dict[str, Any]] = {}
-OCR_TEXT_CACHE: Dict[str, str] = {}
-
 
 # ============================================================
-# EASYOCR READER
+# CACHES
 # ============================================================
 
-EASYOCR_READER = None
-
-
-def get_easyocr_reader():
-    global EASYOCR_READER
-    if EASYOCR_READER is None:
-        try:
-            EASYOCR_READER = easyocr.Reader(["fr", "en"], gpu=False)
-        except Exception as e:
-            print(f"[WARN] EasyOCR unavailable: {e}")
-            EASYOCR_READER = False
-    return EASYOCR_READER
+GOUV_CACHE:        Dict[str, Any]   = {}
+PLACES_CACHE:      Dict[str, Any]   = {}
+EMAIL_CACHE:       Dict[str, str]   = {}
+GEMINI_CARD_CACHE: Dict[str, Any]   = {}
+GEMINI_FAC_CACHE:  Dict[str, Any]   = {}
+TG_PATH_CACHE:     Dict[str, str]   = {}
+TG_BYTES_CACHE:    Dict[str, bytes] = {}
+OCR_TEXT_CACHE:    Dict[str, str]   = {}
 
 
 # ============================================================
@@ -261,223 +221,116 @@ def safe_strip(v: Any) -> str:
 
 
 def normalize_spaces(v: str) -> str:
-    return re.sub(r"\s+", " ", (v or "").strip())
-
-
-def normalize_upper(v: str) -> str:
-    return normalize_spaces(v).upper()
+    return re.sub(r"\s+", " ", str(v or "").strip())
 
 
 def normalize_cp(cp: str) -> str:
-    return re.sub(r"\s+", "", (cp or "").strip())
+    return re.sub(r"\s+", "", str(cp or "").strip())
 
 
-def sha1_text(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8", errors="ignore")).hexdigest()
+def sha1_hex(s: str) -> str:
+    return hashlib.sha1(str(s or "").encode("utf-8", errors="ignore")).hexdigest()
 
 
-def image_hash_bytes(img_bytes: bytes) -> str:
+def image_hash(img_bytes: bytes) -> str:
     return hashlib.sha1(img_bytes or b"").hexdigest()
 
 
-def domain_from_email(email: str) -> str:
-    email = (email or "").strip().lower()
-    if "@" not in email:
-        return ""
-    dom = email.split("@", 1)[1].strip()
-    dom = re.sub(r"[^a-z0-9.\-]", "", dom)
-    if dom in FREE_EMAIL_DOMAINS:
-        return ""
-    return dom
+def clean_email(v: Any) -> str:
+    if isinstance(v, dict):
+        v = v.get("email", "")
+    v = re.sub(r"\s+", "", str(v or "").strip().lower())
+    return v
 
 
-def domain_from_url(url: str) -> str:
-    if not url:
-        return ""
-    u = url.lower().strip()
-    u = re.sub(r"^https?://", "", u)
-    u = u.split("/", 1)[0]
-    u = u.split(":", 1)[0]
-    u = re.sub(r"[^a-z0-9.\-]", "", u)
-    if u.startswith("www."):
-        u = u[4:]
-    return u
+def is_valid_email(s: str) -> bool:
+    s = clean_email(s)
+    if not s or len(s) > 254:
+        return False
+    if not EMAIL_RE.match(s):
+        return False
+    domain = (s.split("@", 1)[1] or "").lower()
+    return domain not in DISPOSABLE_DOMAINS
 
 
-def brand_from_domain(dom: str) -> str:
-    dom = (dom or "").strip().lower()
-    if not dom:
-        return ""
-    dom = dom.split(".", 1)[0]
-    dom = dom.replace("-", " ").replace("_", " ")
-    dom = re.sub(r"\s+", " ", dom).strip()
-    return dom
-
-
-def normalize_text(s: str) -> str:
-    s = (s or "").lower().strip()
-    s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("ë", "e")
-    s = s.replace("à", "a").replace("â", "a")
-    s = s.replace("î", "i").replace("ï", "i")
-    s = s.replace("ô", "o")
-    s = s.replace("ù", "u").replace("û", "u").replace("ü", "u")
-    s = s.replace("ç", "c")
-    s = re.sub(r"[^a-z0-9]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def normalize_company_name(s: str) -> str:
-    s = normalize_text(s)
-    stop = {
-        "sas", "sasu", "sa", "sarl", "eurl", "scop", "scp", "snc", "sci",
-        "societe", "compagnie", "groupe", "generale", "france", "holding", "services"
-    }
-    parts = [p for p in s.split() if p not in stop]
-    return " ".join(parts).strip()
-
-
-def validate_siret(raw: str) -> str:
-    siret = re.sub(r"\D", "", (raw or "").strip())
-    if len(siret) != 14 or not siret.isdigit():
-        if siret:
-            print(f"[WARN] SIRET invalid length/non-digit: {raw}")
-        return ""
-
-    total = 0
-    for i in range(14):
-        digit = int(siret[13 - i])
-        if i % 2 == 1:
-            digit *= 2
-        if digit > 9:
-            digit -= 9
-        total += digit
-
-    if total % 10 == 0:
-        return siret
-
-    print(f"[WARN] SIRET invalid Luhn: {raw}")
-    return ""
+def normalize_email(email: str) -> str:
+    e = clean_email(email)
+    return e if is_valid_email(e) else ""
 
 
 def normalize_phone(s: str) -> str:
-    s = (s or "").strip()
+    s = str(s or "").strip()
     if not s:
         return ""
     s = re.sub(r"[^\d+]", "", s)
     if s.startswith("+33"):
         s = "0" + s[3:]
-    if not re.fullmatch(r"0\d{9}", s or ""):
+    if not re.fullmatch(r"0\d{9}", s):
         return ""
     return s
 
 
-def extract_all_phones(text: str) -> List[str]:
-    if not text:
-        return []
-    out = []
-    seen = set()
-    for m in PHONE_RE.finditer(text):
+def extract_phones(text: str) -> List[str]:
+    out, seen = [], set()
+    for m in PHONE_RE.finditer(str(text or "")):
         p = normalize_phone(m.group(0))
-        if not p:
-            continue
-        if p not in seen:
+        if p and p not in seen:
             seen.add(p)
             out.append(p)
     return out
 
 
-def split_phones_by_priority(phones: List[str]) -> Tuple[str, str]:
-    fixed = []
-    mobile = []
-    other = []
-
+def split_phones(phones: List[str]) -> Tuple[str, str]:
+    fixed, mobile, other = [], [], []
+    seen = set()
     for p in phones:
         pn = normalize_phone(p)
-        if not pn:
+        if not pn or pn in seen:
             continue
+        seen.add(pn)
         if pn.startswith(("01", "02", "03", "04", "05")):
-            if pn not in fixed:
-                fixed.append(pn)
+            fixed.append(pn)
         elif pn.startswith(("06", "07")):
-            if pn not in mobile:
-                mobile.append(pn)
+            mobile.append(pn)
         else:
-            if pn not in other:
-                other.append(pn)
-
-    phone = ""
+            other.append(pn)
+    phone = fixed[0] if fixed else (mobile[0] if mobile else (other[0] if other else ""))
     phone2 = ""
-
-    if fixed:
-        phone = fixed[0]
-        if mobile:
-            phone2 = mobile[0]
-        elif len(fixed) > 1:
-            phone2 = fixed[1]
-        elif other:
-            phone2 = other[0]
-    elif mobile:
-        phone = mobile[0]
-        if len(mobile) > 1:
-            phone2 = mobile[1]
-        elif other:
-            phone2 = other[0]
-    elif other:
-        phone = other[0]
-        if len(other) > 1:
-            phone2 = other[1]
-
+    if phone:
+        candidates = (fixed + mobile + other)
+        remaining = [x for x in candidates if x != phone]
+        phone2 = remaining[0] if remaining else ""
     if phone and phone2 and phone == phone2:
         phone2 = ""
-
     return phone, phone2
 
 
-def best_email(text: str) -> str:
-    if not text:
+def validate_siret(raw: str) -> str:
+    s = re.sub(r"\D", "", str(raw or "").strip())
+    if len(s) != 14:
         return ""
-    candidates = [clean_email(m.group(0)) for m in EMAIL_IN_TEXT_RE.finditer(text)]
-    for em in candidates:
-        if is_valid_email(em):
-            return em
-    return ""
+    total = 0
+    for i in range(14):
+        d = int(s[13 - i])
+        if i % 2 == 1:
+            d *= 2
+        if d > 9:
+            d -= 9
+        total += d
+    return s if total % 10 == 0 else ""
 
 
-def extract_all_emails(text: str) -> List[str]:
-    if not text:
-        return []
-    out = []
-    seen = set()
-    for m in EMAIL_IN_TEXT_RE.finditer(text):
-        em = clean_email(m.group(0))
-        if is_valid_email(em) and em not in seen:
-            seen.add(em)
-            out.append(em)
-    return out
+def normalize_naf(naf: str) -> str:
+    return str(naf or "").strip().upper().replace(".", "").replace(" ", "")
 
 
-def extract_urls(text: str) -> List[str]:
-    if not text:
-        return []
-    out, seen = [], set()
-    for m in URL_RE.finditer(text):
-        u = m.group(0).strip()
-        if u.lower().startswith("www."):
-            u = "https://" + u
-        u = u.rstrip(".,;:")
-        k = u.lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(u)
-    return out
-
-
-def extract_postal_code(text: str) -> str:
-    if not text:
-        return ""
-    cps = CP_RE.findall(text)
-    return normalize_cp(cps[0]) if cps else ""
+def normalize_for_match(s: str) -> str:
+    s = str(s or "").lower()
+    s = s.replace("é", "e").replace("è", "e").replace("ê", "e").replace("à", "a")
+    s = s.replace("â", "a").replace("î", "i").replace("ô", "o").replace("ù", "u")
+    s = s.replace("û", "u").replace("ç", "c")
+    s = re.sub(r"\b(sas|sasu|sarl|eurl|sa|sci|snc|societe|groupe|compagnie|cie)\b", " ", s)
+    return re.sub(r"[^a-z0-9]", "", s).strip()
 
 
 def split_human_name(full: str) -> Tuple[str, str]:
@@ -491,155 +344,163 @@ def split_human_name(full: str) -> Tuple[str, str]:
 
 
 def ensure_contact_fallback(d: Dict[str, Any]) -> Dict[str, Any]:
-    fn = (d.get("contact_firstname") or "").strip()
-    ln = (d.get("contact_lastname") or "").strip()
-    interlocuteur = (d.get("interlocuteur") or "").strip()
-    dirigeant = (d.get("dirigeant") or "").strip()
-
+    fn = str(d.get("contact_firstname") or "").strip()
+    ln = str(d.get("contact_lastname") or "").strip()
+    interlocuteur = str(d.get("interlocuteur") or "").strip()
+    dirigeant = str(d.get("dirigeant") or "").strip()
     if interlocuteur:
         f, l = split_human_name(interlocuteur)
         if not fn and f:
             d["contact_firstname"] = f
         if not ln and l:
             d["contact_lastname"] = l
-
-    fn = (d.get("contact_firstname") or "").strip()
-    ln = (d.get("contact_lastname") or "").strip()
-
-    if (not fn and not ln) and dirigeant:
+    fn = str(d.get("contact_firstname") or "").strip()
+    ln = str(d.get("contact_lastname") or "").strip()
+    if not fn and not ln and dirigeant:
         f, l = split_human_name(dirigeant)
         d["contact_firstname"] = f or ""
-        d["contact_lastname"] = l or (dirigeant or "")
-
-    if not (d.get("interlocuteur") or "").strip():
-        combo = f"{(d.get('contact_firstname') or '').strip()} {(d.get('contact_lastname') or '').strip()}".strip()
+        d["contact_lastname"] = l or dirigeant
+    if not str(d.get("interlocuteur") or "").strip():
+        combo = f"{str(d.get('contact_firstname') or '').strip()} {str(d.get('contact_lastname') or '').strip()}".strip()
         if combo:
             d["interlocuteur"] = combo
         elif dirigeant:
             d["interlocuteur"] = dirigeant
-
     return d
 
 
-def strip_postal_city_from_address(addr: str, postal_code: str, city: str) -> str:
-    addr = (addr or "").strip()
-    if not addr:
+def strip_postal_city(addr: str, postal: str, city: str) -> str:
+    a = normalize_spaces(addr)
+    if not a:
         return ""
-
-    pc = (postal_code or "").strip()
-    ct = (city or "").strip()
-
-    addr = re.sub(r"\s+", " ", addr)
-
-    if pc and ct:
-        tail = f"{pc} {ct}".strip()
-        addr = re.sub(rf"(?:\s|-)?{re.escape(tail)}\s*$", "", addr, flags=re.IGNORECASE).strip()
-
-    if pc:
-        addr = re.sub(rf"(?:\s|-)?{re.escape(pc)}\s*$", "", addr).strip()
-
-    addr = re.sub(r"\s+", " ", addr).strip()
-    return addr
+    cp = normalize_spaces(postal)
+    ct = normalize_spaces(city)
+    if cp and ct:
+        tail = f"{cp} {ct}".strip()
+        a = re.sub(rf"(?:\s|-)?{re.escape(tail)}\s*$", "", a, flags=re.IGNORECASE).strip()
+    if cp:
+        a = re.sub(rf"(?:\s|-)?{re.escape(cp)}\s*$", "", a).strip()
+    return normalize_spaces(a)
 
 
-def normalize_row_address(row: Dict[str, Any]) -> Dict[str, Any]:
-    row["address"] = strip_postal_city_from_address(
-        row.get("address", ""),
-        row.get("postal_code", ""),
-        row.get("city", ""),
-    )
-    return row
-
-
-def uppercase_business_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+def uppercase_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     for k in ["name", "address", "city", "dirigeant", "interlocuteur"]:
-        row[k] = normalize_upper(row.get(k, ""))
+        row[k] = normalize_spaces(str(row.get(k, "") or "")).upper()
     return row
 
 
-def log_fusion(reason: str, payload: Dict[str, Any]) -> None:
-    STATS["fusion_logs"] += 1
-    try:
-        print(json.dumps({"fusion_reason": reason, **payload}, ensure_ascii=False))
-    except Exception:
-        print(f"[FUSION] {reason} | {payload}")
-
-
-def autosize(ws):
-    for col in range(1, ws.max_column + 1):
-        max_len = 10
-        for row in range(1, ws.max_row + 1):
-            v = ws.cell(row=row, column=col).value
-            if v is None:
-                continue
-            s = str(v)
-            if len(s) > 80:
-                s = s[:80]
-            max_len = max(max_len, len(s))
-            max_len = min(max_len, 60)
-        ws.column_dimensions[get_column_letter(col)].width = max_len
+def email_for_initials(initials: str) -> Optional[str]:
+    ini = (initials or "").upper().strip()
+    if not ini:
+        return None
+    users = ROUTING.get("users") or {}
+    if ini in users:
+        em = clean_email(users[ini])
+        return em if is_valid_email(em) else None
+    agencies = ROUTING.get("agencies") or {}
+    for cfg in agencies.values():
+        for role in ("manager", "commercial"):
+            r = (cfg or {}).get(role) or {}
+            if (r.get("initials") or "").upper() == ini:
+                em = clean_email(r.get("email") or "")
+                return em if is_valid_email(em) else None
+    return None
 
 
 # ============================================================
-# HTTP HELPERS
+# EASYOCR
+# ============================================================
+
+_EASYOCR_READER = None
+
+
+def get_easyocr():
+    global _EASYOCR_READER
+    if _EASYOCR_READER is None:
+        try:
+            _EASYOCR_READER = easyocr.Reader(["fr", "en"], gpu=False)
+            logger.info("EasyOCR initialisé")
+        except Exception as e:
+            logger.warning("EasyOCR indisponible : %s", e)
+            _EASYOCR_READER = False
+    return _EASYOCR_READER
+
+
+# ============================================================
+# HTTP — WORKER DUMP
 # ============================================================
 
 def worker_dump(kind: str, date: str) -> List[Dict[str, Any]]:
+    """Récupère les enregistrements KV depuis le Worker (format NDJSON)."""
     if not WORKER_BASE_URL or not EXPORT_TOKEN:
-        raise RuntimeError("Missing WORKER_BASE_URL / EXPORT_TOKEN")
+        raise RuntimeError("WORKER_BASE_URL / EXPORT_TOKEN manquants")
     STATS["worker_dump_calls"] += 1
     url = f"{WORKER_BASE_URL.rstrip('/')}/dump?date={date}&kind={kind}"
-    r = requests.get(url, headers={"X-Export-Token": EXPORT_TOKEN}, timeout=45)
+    r = requests.get(
+        url,
+        headers={"X-Export-Token": EXPORT_TOKEN},
+        timeout=60,
+    )
     if r.status_code != 200:
-        raise RuntimeError(f"/dump failed {kind} {r.status_code}: {r.text[:400]}")
-    lines = [ln.strip() for ln in r.text.splitlines() if ln.strip()]
+        raise RuntimeError(f"/dump {kind} → {r.status_code}: {r.text[:300]}")
     out: List[Dict[str, Any]] = []
-    for ln in lines:
+    for line in r.text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
         try:
-            out.append(json.loads(ln))
+            out.append(json.loads(line))
         except Exception:
             pass
+    logger.info("dump %s : %d enregistrements", kind, len(out))
     return out
 
+
+# ============================================================
+# TELEGRAM — TÉLÉCHARGEMENT IMAGES
+# ============================================================
 
 def tg_get_file_path(file_id: str) -> Optional[str]:
     if not file_id:
         return None
-    if file_id in TG_FILE_PATH_CACHE:
-        return TG_FILE_PATH_CACHE[file_id]
+    if file_id in TG_PATH_CACHE:
+        return TG_PATH_CACHE[file_id]
     if not TELEGRAM_TOKEN:
-        raise RuntimeError("Missing TELEGRAM_TOKEN")
-
-    STATS["telegram_getfile_calls"] += 1
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile"
-    r = requests.post(url, json={"file_id": file_id}, timeout=25)
+        raise RuntimeError("TELEGRAM_TOKEN manquant")
+    r = requests.post(
+        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getFile",
+        json={"file_id": file_id},
+        timeout=20,
+    )
     r.raise_for_status()
     j = r.json()
     if not j.get("ok"):
         return None
     fp = j["result"]["file_path"]
-    TG_FILE_PATH_CACHE[file_id] = fp
+    TG_PATH_CACHE[file_id] = fp
     return fp
 
 
-def tg_download_file(file_id: str) -> bytes:
+def tg_download(file_id: str) -> bytes:
     if not file_id:
         return b""
-    if file_id in TG_FILE_BYTES_CACHE:
-        return TG_FILE_BYTES_CACHE[file_id]
-    file_path = tg_get_file_path(file_id)
-    if not file_path:
+    if file_id in TG_BYTES_CACHE:
+        return TG_BYTES_CACHE[file_id]
+    fp = tg_get_file_path(file_id)
+    if not fp:
         return b""
-    STATS["telegram_file_downloads"] += 1
-    r = requests.get(f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}", timeout=60)
+    STATS["telegram_downloads"] += 1
+    r = requests.get(
+        f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{fp}",
+        timeout=60,
+    )
     r.raise_for_status()
-    content = r.content
-    TG_FILE_BYTES_CACHE[file_id] = content
-    return content
+    TG_BYTES_CACHE[file_id] = r.content
+    return r.content
 
 
 # ============================================================
-# OCR HYBRIDE
+# OCR HYBRIDE — PREPROCESSING + TESSERACT + EASYOCR
 # ============================================================
 
 def pil_to_cv(img: Image.Image) -> np.ndarray:
@@ -649,133 +510,102 @@ def pil_to_cv(img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
-def preprocess_image_variants(img_bytes: bytes) -> List[Image.Image]:
-    variants: List[Image.Image] = []
+def preprocess_variants(img_bytes: bytes) -> List[Image.Image]:
+    variants = []
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except Exception:
         return variants
-
     variants.append(img)
-
     try:
-        big = img.resize((img.width * 2, img.height * 2))
-        variants.append(big)
+        variants.append(img.resize((img.width * 2, img.height * 2)))
     except Exception:
         pass
-
     try:
-        gray = img.convert("L")
-        arr = np.array(gray)
-        arr = cv2.equalizeHist(arr)
-        variants.append(Image.fromarray(arr))
+        gray = np.array(img.convert("L"))
+        variants.append(Image.fromarray(cv2.equalizeHist(gray)))
     except Exception:
         pass
-
     try:
-        gray = img.convert("L")
-        arr = np.array(gray)
-        _, th = cv2.threshold(arr, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        gray = np.array(img.convert("L"))
+        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         variants.append(Image.fromarray(th))
     except Exception:
         pass
-
     try:
         gray = np.array(img.convert("L"))
         ad = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
         variants.append(Image.fromarray(ad))
     except Exception:
         pass
-
     return variants
 
 
-def crop_image_zones(img: Image.Image) -> List[Image.Image]:
-    w, h = img.size
-    zones = [img]
-    zones.append(img.crop((0, 0, w, h // 3)))
-    zones.append(img.crop((0, h // 3, w, 2 * h // 3)))
-    zones.append(img.crop((0, 2 * h // 3, w, h)))
-    zones.append(img.crop((0, 0, w // 2, h)))
-    zones.append(img.crop((w // 2, 0, w, h)))
-    return zones
-
-
-def ocr_easyocr_on_pil(img: Image.Image) -> str:
+def ocr_easyocr(img: Image.Image) -> str:
+    reader = get_easyocr()
+    if not reader:
+        return ""
     try:
-        reader = get_easyocr_reader()
-        if not reader:
-            return ""
-        STATS["ocr_easyocr_calls"] += 1
-        arr = pil_to_cv(img)
-        results = reader.readtext(arr, detail=0, paragraph=False)
-        return "\n".join([str(x).strip() for x in results if str(x).strip()])
+        STATS["ocr_easyocr"] += 1
+        results = reader.readtext(pil_to_cv(img), detail=0, paragraph=False)
+        return "\n".join(str(x).strip() for x in results if str(x).strip())
     except Exception:
         return ""
 
 
-def ocr_tesseract_on_pil(img: Image.Image) -> str:
+def ocr_tesseract(img: Image.Image) -> str:
     try:
-        STATS["ocr_tesseract_calls"] += 1
-        txt1 = pytesseract.image_to_string(img, lang="fra+eng", config="--psm 6") or ""
-        txt2 = pytesseract.image_to_string(img, lang="fra+eng", config="--psm 11") or ""
-        return "\n".join([t for t in [txt1, txt2] if safe_strip(t)])
+        STATS["ocr_tesseract"] += 1
+        t1 = pytesseract.image_to_string(img, lang="fra+eng", config="--psm 6") or ""
+        t2 = pytesseract.image_to_string(img, lang="fra+eng", config="--psm 11") or ""
+        return "\n".join(t for t in [t1, t2] if t.strip())
     except Exception:
         return ""
 
 
 def merge_text_blocks(texts: List[str]) -> str:
-    lines = []
-    seen = set()
+    lines, seen = [], set()
     for txt in texts:
-        for ln in (txt or "").splitlines():
+        for ln in str(txt or "").splitlines():
             ln = re.sub(r"\s+", " ", ln).strip()
             if not ln:
                 continue
-            key = ln.lower()
-            if key not in seen:
-                seen.add(key)
+            k = ln.lower()
+            if k not in seen:
+                seen.add(k)
                 lines.append(ln)
     return "\n".join(lines)
 
 
-def ocr_image_bytes(img_bytes: bytes, light: bool = False) -> str:
+def ocr_image(img_bytes: bytes, light: bool = False) -> str:
     if not img_bytes:
         return ""
-
-    cache_key = f"ocr:{image_hash_bytes(img_bytes)}:{'light' if light else 'full'}"
-    if cache_key in OCR_TEXT_CACHE:
-        return OCR_TEXT_CACHE[cache_key]
-
-    variants = preprocess_image_variants(img_bytes)
-    all_texts = []
-
-    base_variants = variants[: (2 if light else len(variants))]
-
-    for base_img in base_variants:
-        zones = crop_image_zones(base_img)
-        for zone in zones[: (2 if light else len(zones))]:
-            # EasyOCR + Tesseract, les deux restent présents
-            t1 = ocr_easyocr_on_pil(zone)
-            if t1:
-                all_texts.append(t1)
-            t2 = ocr_tesseract_on_pil(zone)
-            if t2:
-                all_texts.append(t2)
-
-    merged = merge_text_blocks(all_texts)
-    OCR_TEXT_CACHE[cache_key] = merged
+    key = f"ocr:{image_hash(img_bytes)}:{'light' if light else 'full'}"
+    if key in OCR_TEXT_CACHE:
+        return OCR_TEXT_CACHE[key]
+    variants = preprocess_variants(img_bytes)
+    base = variants[:2] if light else variants
+    texts = []
+    for img in base:
+        t1 = ocr_easyocr(img)
+        if t1:
+            texts.append(t1)
+        t2 = ocr_tesseract(img)
+        if t2:
+            texts.append(t2)
+    merged = merge_text_blocks(texts)
+    OCR_TEXT_CACHE[key] = merged
     return merged
 
 
 # ============================================================
-# GEMINI
+# GEMINI OCR
 # ============================================================
 
 def _guess_mime(img_bytes: bytes) -> str:
     try:
-        im = Image.open(io.BytesIO(img_bytes))
-        fmt = (im.format or "").upper()
+        img = Image.open(io.BytesIO(img_bytes))
+        fmt = (img.format or "").upper()
         if fmt == "PNG":
             return "image/png"
         if fmt in ("JPG", "JPEG"):
@@ -785,820 +615,291 @@ def _guess_mime(img_bytes: bytes) -> str:
     return "image/jpeg"
 
 
-def gemini_vision_json(img_bytes: bytes, prompt: str, max_tokens: int = 650) -> Dict[str, Any]:
+def gemini_vision_json(img_bytes: bytes, prompt: str, max_tokens: int = 700) -> Dict[str, Any]:
     if not GEMINI_API_KEY or not img_bytes:
         return {}
-
     endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
     mime = _guess_mime(img_bytes)
-    b64 = base64.b64encode(img_bytes).decode("ascii")
-
+    b64  = base64.b64encode(img_bytes).decode("ascii")
     payload = {
-        "contents": [{
-            "parts": [
-                {"text": prompt},
-                {"inlineData": {"mimeType": mime, "data": b64}}
-            ]
-        }],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": max_tokens}
+        "contents": [{"parts": [{"text": prompt}, {"inlineData": {"mimeType": mime, "data": b64}}]}],
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": max_tokens},
     }
-
     try:
-        STATS["gemini_vision_calls"] += 1
-        r = requests.post(endpoint, params={"key": GEMINI_API_KEY}, json=payload, timeout=60)
+        STATS["gemini_calls"] += 1
+        r = requests.post(
+            endpoint,
+            params={"key": GEMINI_API_KEY},
+            json=payload,
+            timeout=60,
+        )
         if r.status_code >= 300:
+            logger.warning("Gemini HTTP %d", r.status_code)
             return {}
         j = r.json()
-        parts = (((j.get("candidates") or [None])[0] or {}).get("content") or {}).get("parts") or []
-        raw = ""
-        for p in parts:
-            if isinstance(p, dict) and p.get("text"):
-                raw += p["text"]
-        raw = (raw or "").strip()
+        parts = ((j.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        raw = "".join(p.get("text", "") for p in parts).strip()
         raw = re.sub(r"^```json", "", raw, flags=re.I).strip()
         raw = re.sub(r"```$", "", raw).strip()
         m = re.search(r"\{.*\}", raw, re.S)
         if not m:
             return {}
         return json.loads(m.group(0))
-    except Exception:
+    except Exception as e:
+        logger.warning("Gemini vision error : %s", e)
         return {}
 
 
-def gemini_extract_business_card(img_bytes: bytes) -> Dict[str, str]:
-    if not img_bytes:
-        return {}
-    key = image_hash_bytes(img_bytes)
+# Liste noire réponses Gemini invalides
+_GEMINI_FAILURES = {"je ne peux pas", "impossible", "illisible", "inconnu", "n/a",
+                    "not available", "cannot", "unable", "sorry", "désolé"}
+
+
+def sanitize_gemini(d: Dict[str, Any]) -> Dict[str, Any]:
+    out = {}
+    for k, v in (d or {}).items():
+        s = str(v or "").lower().strip()
+        out[k] = "" if any(f in s for f in _GEMINI_FAILURES) else v
+    return out
+
+
+def gemini_extract_card(img_bytes: bytes) -> Dict[str, Any]:
+    key = image_hash(img_bytes)
     if key in GEMINI_CARD_CACHE:
         return GEMINI_CARD_CACHE[key]
-
     prompt = (
-        "Tu es un extracteur de carte de visite. "
-        "Lis l'IMAGE et retourne STRICTEMENT un JSON avec les clés : "
-        "name, company, title, email, phone, website, postal_code, city, address. "
-        "Règles : si inconnu mettre chaîne vide ; email en minuscules ; "
-        "postal_code = 5 chiffres si visible ; "
-        "name = prénom + nom si visibles ; "
-        "address = adresse la plus propre possible."
+        "Tu es un extracteur de carte de visite. Lis l'IMAGE et retourne STRICTEMENT un JSON : "
+        "name, company, title, contact_civility (M. ou Mme sinon vide), email, phone, phone2, "
+        "website, postal_code, city, address, confidence (low/medium/high). "
+        "Vide si inconnu. Ne pas inventer."
     )
-    d = gemini_vision_json(img_bytes, prompt, max_tokens=700) or {}
-    out = {
-        "name": safe_strip(d.get("name", "")),
-        "company": safe_strip(d.get("company", "")),
-        "title": safe_strip(d.get("title", "")),
-        "email": clean_email(d.get("email", "")),
-        "phone": normalize_phone(d.get("phone", "")),
-        "website": safe_strip(d.get("website", "")),
-        "postal_code": normalize_cp(d.get("postal_code", "")),
-        "city": safe_strip(d.get("city", "")),
-        "address": safe_strip(d.get("address", "")),
-    }
-    GEMINI_CARD_CACHE[key] = out
-    return out
+    d = sanitize_gemini(gemini_vision_json(img_bytes, prompt, 700))
+    GEMINI_CARD_CACHE[key] = d
+    return d
 
 
-def gemini_extract_facade_logo(img_bytes: bytes) -> Dict[str, str]:
-    if not img_bytes:
+def gemini_extract_facade(img_bytes: bytes) -> Dict[str, Any]:
+    key = image_hash(img_bytes)
+    if key in GEMINI_FAC_CACHE:
+        return GEMINI_FAC_CACHE[key]
+    prompt = (
+        "Tu analyses une photo de façade/enseigne. Retourne STRICTEMENT un JSON : "
+        "company (nom exact sur l'enseigne), activity (secteur max 60 car.), "
+        "phone, website, city, confidence (low/medium/high). "
+        "Si plusieurs enseignes, prendre la plus grande. Ne pas inventer."
+    )
+    d = sanitize_gemini(gemini_vision_json(img_bytes, prompt, 400))
+    GEMINI_FAC_CACHE[key] = d
+    return d
+
+
+def gemini_structure_text(raw_text: str, mode: str = "card") -> Dict[str, Any]:
+    """Structuration par Gemini sur texte brut (pas image = 10x moins cher)."""
+    if not GEMINI_API_KEY or not raw_text:
         return {}
-    key = image_hash_bytes(img_bytes)
-    if key in GEMINI_FACADE_CACHE:
-        return GEMINI_FACADE_CACHE[key]
-
-    prompt = (
-        "Tu analyses une photo de prospection (façade, enseigne, logo). "
-        "Retourne STRICTEMENT un JSON avec les clés : company, city. "
-        "Règles : si inconnu mettre chaîne vide."
-    )
-    d = gemini_vision_json(img_bytes, prompt, max_tokens=350) or {}
-    out = {
-        "company": safe_strip(d.get("company", "")),
-        "city": safe_strip(d.get("city", "")),
-    }
-    GEMINI_FACADE_CACHE[key] = out
-    return out
-
-
-def gemini_activity_summary(name: str, naf: str, website: str, company_hint: str = "") -> str:
-    if not GEMINI_API_KEY:
-        return ""
-
-    cache_key = f"{name}|{naf}|{website}|{company_hint}"
-    if cache_key in GEMINI_ACTIVITY_CACHE:
-        return GEMINI_ACTIVITY_CACHE[cache_key]
-
-    if not (name or naf or website):
-        return ""
-
+    if mode == "card":
+        prompt = (
+            f"Texte OCR d'une carte de visite:\n\n{raw_text}\n\n"
+            "Retourne STRICTEMENT un JSON: name, company, title, contact_civility, "
+            "email, phone, phone2, website, postal_code, city, address, confidence (low/medium/high). "
+            "Vide si inconnu. Ne pas inventer."
+        )
+    else:
+        prompt = (
+            f"Texte OCR d'une enseigne/façade:\n\n{raw_text}\n\n"
+            "Retourne STRICTEMENT un JSON: company, activity, phone, website, city, "
+            "confidence (low/medium/high). Vide si inconnu."
+        )
     endpoint = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    prompt = (
-        "Tu es un normaliseur d'activité d'entreprise. "
-        "Retourne STRICTEMENT un JSON avec la clé EXACTE: activity_summary. "
-        "Règles : activité très courte, factuelle, maximum 60 caractères, pas de marketing, si inconnu vide. "
-        f"Nom entreprise: {name}\n"
-        f"Code NAF: {naf}\n"
-        f"Site web: {website}\n"
-        f"Indice complémentaire: {company_hint}\n"
-    )
-
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 120}
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": 500},
     }
-
     try:
-        STATS["gemini_activity_calls"] += 1
+        STATS["gemini_calls"] += 1
         r = requests.post(endpoint, params={"key": GEMINI_API_KEY}, json=payload, timeout=30)
         if r.status_code >= 300:
-            return ""
+            return {}
         j = r.json()
-        parts = (((j.get("candidates") or [None])[0] or {}).get("content") or {}).get("parts") or []
-        raw = ""
-        for p in parts:
-            if isinstance(p, dict) and p.get("text"):
-                raw += p["text"]
-        raw = (raw or "").strip()
-        raw = re.sub(r"^```json", "", raw, flags=re.I).strip()
-        raw = re.sub(r"```$", "", raw).strip()
+        parts = ((j.get("candidates") or [{}])[0].get("content") or {}).get("parts") or []
+        raw = "".join(p.get("text", "") for p in parts).strip()
+        raw = re.sub(r"^```json", "", raw, flags=re.I).replace("```", "").strip()
         m = re.search(r"\{.*\}", raw, re.S)
         if not m:
-            return ""
-        d = json.loads(m.group(0))
-        out = safe_strip(d.get("activity_summary", ""))[:60]
-        GEMINI_ACTIVITY_CACHE[cache_key] = out
-        return out
+            return {}
+        return sanitize_gemini(json.loads(m.group(0)))
     except Exception:
-        return ""
+        return {}
+
+
+def merge_ocr_results(gemini: Dict, vision_structured: Dict, fallbacks: Dict) -> Dict[str, Any]:
+    """Fusionne résultats Gemini image + Gemini texte (Vision) avec score confiance."""
+    fields = ["name", "company", "title", "contact_civility",
+              "email", "phone", "phone2", "website", "city", "address", "postal_code", "activity"]
+    result: Dict[str, Any] = {}
+    conf:   Dict[str, str] = {}
+    for f in fields:
+        g = str((gemini or {}).get(f, "") or "").strip()
+        v = str((vision_structured or {}).get(f, "") or "").strip()
+        if g and v and g.lower() == v.lower():
+            result[f] = g
+            conf[f] = "high"
+        elif g and v:
+            result[f] = g if len(g) >= len(v) else v
+            conf[f] = "medium"
+        else:
+            result[f] = g or v or ""
+            conf[f] = "medium" if (g or v) else "low"
+    if not result.get("phone") and fallbacks.get("phone"):
+        result["phone"] = fallbacks["phone"]
+        conf["phone"] = "medium"
+    if not result.get("email") and fallbacks.get("email"):
+        result["email"] = fallbacks["email"]
+        conf["email"] = "medium"
+    high = sum(1 for c in conf.values() if c == "high")
+    filled = sum(1 for v in result.values() if v)
+    result["_confidence"] = "high" if high >= 3 else ("medium" if filled >= 3 else "low")
+    return result
 
 
 # ============================================================
-# HEURISTIQUES OCR / ENTREPRISE / PERSONNE / ADRESSE
+# PIPELINE CARTE DE VISITE — DOUBLE PASSE
 # ============================================================
 
-def is_probable_person_name(s: str) -> bool:
-    s = re.sub(r"\s+", " ", (s or "").strip())
-    if not s:
-        return False
-    low = normalize_text(s)
-    if "@" in s or "www" in low:
-        return False
-    if re.search(r"\d", s):
-        return False
+def extract_card_fields(img_bytes: bytes) -> Dict[str, Any]:
+    """OCR hybride : Gemini image + Tesseract/EasyOCR + Gemini texte."""
+    if not img_bytes:
+        return {}
 
-    bad_exact = {"alt gr", "ait gr", "alt qr", "ait qr", "cs", "sas", "sarl", "sa"}
-    if low in bad_exact:
-        return False
+    # Passe 1 : Gemini sur l'image
+    gemini = gemini_extract_card(img_bytes) if GEMINI_API_KEY else {}
+    STATS["cards_processed"] += 1
 
-    bad_tokens = {
-        "restaurant", "responsable", "commerce", "collectivite", "territoire",
-        "recyclage", "valorisation", "dechets", "drh", "developpement", "rh",
-        "onyx", "auvergne", "rhone", "alpes", "sas", "sarl", "eurl", "sa",
-        "service", "environnement", "gestion", "cedex", "centr", "alp", "cs",
-        "experience", "luxe", "scannez", "scanner", "savoir", "plus", "aqualone"
-    }
-    words = low.split()
-    if len(words) < 2 or len(words) > 4:
-        return False
-    if any(w in bad_tokens for w in words):
-        return False
+    # Passe 2 : OCR local (allégé si Gemini a bien fonctionné)
+    light = bool(gemini.get("name") or gemini.get("company") or gemini.get("email"))
+    ocr_text = ocr_image(img_bytes, light=light)
 
-    return sum(1 for w in words if len(w) >= 2) >= 2
+    # Structuration du texte brut par Gemini (sans image)
+    vision_structured = gemini_structure_text(ocr_text, "card") if ocr_text else {}
 
-
-def clean_ocr_line(line: str) -> str:
-    s = re.sub(r"\s+", " ", (line or "").strip())
-    s = s.replace("|", " ").replace("•", " ").replace("—", " ").replace("–", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-
-def clean_ocr_lines(text: str) -> List[str]:
-    bad_contains = [
-        "scannez-moi",
-        "scannez moi",
-        "en savoir plus",
-        "qr code",
-    ]
-    out = []
-    seen = set()
-
-    for raw in (text or "").splitlines():
-        ln = clean_ocr_line(raw)
-        if not ln:
-            continue
-
-        low = normalize_text(ln)
-        if any(x in low for x in bad_contains):
-            continue
-
-        key = low
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(ln)
-
-    return out
-
-
-def looks_like_company_line(line: str) -> bool:
-    ln = clean_ocr_line(line)
-    if not ln:
-        return False
-
-    low = normalize_text(ln)
-
-    if "@" in ln:
-        return False
-    if URL_RE.search(ln):
-        return False
-    if PHONE_RE.search(ln):
-        return False
-    if CP_RE.search(ln):
-        return False
-
-    bad_words = {
-        "directeur", "responsable", "rh", "site", "manager",
-        "portable", "port", "tel", "telephone", "mail", "email",
-        "scannez", "scanner", "savoir", "experience", "luxe"
-    }
-    words = set(low.split())
-    if words & bad_words:
-        return False
-
-    if len(ln) < 3:
-        return False
-    if len(ln) > 50:
-        return False
-
-    return True
-
-
-def detect_company_from_lines(lines: List[str], gemini_company: str = "", website: str = "", email: str = "") -> str:
-    if gemini_company and len(gemini_company.strip()) >= 3:
-        return re.sub(r"\s+", " ", gemini_company).strip()
-
-    dom_web = brand_from_domain(domain_from_url(website))
-    dom_email = brand_from_domain(domain_from_email(email))
-
-    candidates = []
-    for i, ln in enumerate(lines[:8]):
-        if not looks_like_company_line(ln):
-            continue
-
-        low = normalize_company_name(ln)
-        score = 0
-
-        if i <= 1:
-            score += 25
-        if ln == ln.upper():
-            score += 20
-        if len(ln.split()) <= 3:
-            score += 15
-        if len(ln) <= 20:
-            score += 10
-        if dom_web and normalize_company_name(dom_web) in low:
-            score += 30
-        if dom_email and normalize_company_name(dom_email) in low:
-            score += 30
-        if len(ln.split()) in [2, 3]:
-            score += 10
-
-        candidates.append((score, ln))
-
-    if candidates:
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        return candidates[0][1].strip()
-
-    for cand in [dom_web, dom_email]:
-        cand = re.sub(r"\s+", " ", (cand or "").strip())
-        if len(cand) >= 3:
-            return cand
-
-    return ""
-
-
-def detect_person_name_from_lines(lines: List[str], company_line: str = "") -> str:
-    company_n = normalize_company_name(company_line)
-
-    bad_person_phrases = {
-        "le bois essence",
-        "de l experience du luxe",
-        "scannez moi pour en savoir plus",
-        "centre aquatique aqualone",
+    # Extraction regex directe (plus fiable que Gemini sur email/tel)
+    phones  = extract_phones(ocr_text)
+    emails  = [clean_email(m.group(0)) for m in EMAIL_IN_TEXT_RE.finditer(ocr_text)
+                if is_valid_email(clean_email(m.group(0)))]
+    cps     = CP_RE.findall(ocr_text)
+    fallbacks = {
+        "phone": phones[0] if phones else "",
+        "email": emails[0] if emails else "",
+        "postal_code": normalize_cp(cps[0]) if cps else "",
     }
 
-    for ln in lines[:12]:
-        low = normalize_text(ln)
-
-        if low in bad_person_phrases:
-            continue
-
-        if any(x in low for x in ["experience", "luxe", "scannez", "savoir plus"]):
-            continue
-
-        if not is_probable_person_name(ln):
-            continue
-
-        if company_n and normalize_company_name(ln) == company_n:
-            continue
-
-        return ln.strip()
-
-    return ""
+    return merge_ocr_results(gemini, vision_structured, fallbacks)
 
 
-def clean_address_candidate(addr: str) -> str:
-    a = re.sub(r"\s+", " ", (addr or "").strip())
-    if not a:
-        return ""
+# ============================================================
+# PIPELINE FAÇADE
+# ============================================================
 
-    low = normalize_text(a)
+def extract_facade_fields(img_bytes: bytes, city_hint: str = "") -> Dict[str, Any]:
+    if not img_bytes:
+        return {}
+    gemini = gemini_extract_facade(img_bytes) if GEMINI_API_KEY else {}
+    STATS["photos_processed"] += 1
 
-    if "@" in a:
-        return ""
-    if URL_RE.search(a):
-        return ""
-    if PHONE_RE.search(a):
-        return ""
-    if low.startswith("port"):
-        return ""
-    if low.startswith("tel"):
-        return ""
-    if "portable" in low:
-        return ""
+    light = bool(gemini.get("company"))
+    ocr_text = ocr_image(img_bytes, light=light)
+    vision_structured = gemini_structure_text(ocr_text, "facade") if ocr_text and not gemini.get("company") else {}
 
-    return a
-
-
-def extract_local_address_from_text(text: str) -> Tuple[str, str, str]:
-    if not text:
-        return "", "", ""
-
-    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]
-
-    best_addr = ""
-    best_cp = ""
-    best_city = ""
-
-    for i, ln in enumerate(lines):
-        m = CP_RE.search(ln)
-        if not m:
-            continue
-
-        cp = normalize_cp(m.group(1))
-        before = ln[:m.start()].strip(" -,:;")
-        after = ln[m.end():].strip(" -,:;")
-
-        addr_line = ln
-        if len(before) < 4 and i > 0:
-            prev = lines[i - 1]
-            if not CP_RE.search(prev):
-                addr_line = f"{prev} {ln}".strip()
-
-        city = after[:60].strip()
-
-        addr_line = re.sub(r"\s+", " ", addr_line).strip()
-        city = re.sub(r"\s+", " ", city).strip()
-
-        if cp:
-            best_addr, best_cp, best_city = addr_line, cp, city
-            break
-
-    return best_addr, best_cp, best_city
-
-
-def extract_best_company_hint(lines: List[str], gemini_company: str, website: str, email: str) -> str:
-    company = detect_company_from_lines(lines, gemini_company=gemini_company, website=website, email=email)
-    return deduce_company(company, email, website)
-
-
-def deduce_company(company_raw: str, email: str, website: str) -> str:
-    company_raw = (company_raw or "").strip()
-    dom_email = brand_from_domain(domain_from_email(email))
-    dom_web = brand_from_domain(domain_from_url(website))
-
-    for cand in [company_raw, dom_web, dom_email]:
-        cand = re.sub(r"\s+", " ", (cand or "").strip())
-        if len(cand) >= 4:
-            return cand
-
-    return company_raw
-
-
-def choose_final_company_name(
-    gouv_name: str,
-    gemini_company: str,
-    detected_company_line: str,
-    person_name: str,
-    website: str,
-    email: str
-) -> str:
-    person_n = normalize_company_name(person_name)
-    dom_web = brand_from_domain(domain_from_url(website))
-    dom_mail = brand_from_domain(domain_from_email(email))
-
-    candidates = [
-        re.sub(r"\s+", " ", (gouv_name or "").strip()),
-        re.sub(r"\s+", " ", (gemini_company or "").strip()),
-        re.sub(r"\s+", " ", (detected_company_line or "").strip()),
-    ]
-
-    scored = []
-
-    for cand in candidates:
-        if not cand:
-            continue
-
-        cand_norm = normalize_company_name(cand)
-        if not cand_norm:
-            continue
-
-        if person_n and cand_norm == person_n:
-            continue
-        if is_probable_person_name(cand):
-            continue
-
-        score = 0
-
-        if gouv_name and cand.strip() == gouv_name.strip():
-            score += 100
-
-        if dom_web and normalize_company_name(dom_web) in cand_norm:
-            score += 30
-        if dom_mail and normalize_company_name(dom_mail) in cand_norm:
-            score += 30
-
-        wc = len(cand.split())
-        if wc >= 2:
-            score += 15
-        if wc == 1:
-            score -= 10
-
-        if len(cand) <= 5:
-            score -= 15
-
-        scored.append((score, cand))
-
-    if scored:
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[0][1].strip()
-
-    for cand in [dom_web, dom_mail]:
-        cand = re.sub(r"\s+", " ", (cand or "").strip())
-        if len(cand) >= 3:
-            return cand
-
-    return ""
-
-
-def infer_activity_fallback(name: str, website: str = "", naf: str = "") -> str:
-    n = normalize_text(name)
-    w = normalize_text(domain_from_url(website))
-    z = f"{n} {w} {naf}".strip()
-
-    rules = [
-        (["atelier delaye", "menuiserie delaye", "menuiserie", "bois"], "MENUISERIE"),
-        (["vert marine", "aqualone", "aquatique", "piscine"], "CENTRE AQUATIQUE"),
-        (["groupe cheval", "cheval molina", "transport", "travaux publics", "benne"], "TRANSPORT / TRAVAUX PUBLICS"),
-        (["serrurerie boret", "boret", "serrurerie"], "SERRURERIE / MÉTALLERIE"),
-        (["ad resine", "resine", "revetement"], "RÉSINE / REVÊTEMENTS"),
-        (["euromaster", "pneu", "garage"], "PNEUMATIQUES / ENTRETIEN AUTO"),
-        (["lely", "environnement", "dechets"], "ENVIRONNEMENT / DECHETS"),
-        (["keolis", "transport voyageurs"], "TRANSPORT DE VOYAGEURS"),
-    ]
-
-    for keys, label in rules:
-        if any(k in z for k in keys):
-            return label
-
-    naf_map = {
-        "4332B": "MENUISERIE",
-        "5610C": "RESTAURATION",
-        "3811Z": "COLLECTE DE DÉCHETS",
-        "4531Z": "PNEUMATIQUES / AUTO",
-        "4333Z": "REVÊTEMENTS / RÉSINE",
-        "4399D": "TRAVAUX SPÉCIALISÉS",
-        "2512Z": "SERRURERIE / MÉTALLERIE",
+    phones = extract_phones(ocr_text)
+    urls   = URL_RE.findall(ocr_text)
+    fallbacks = {
+        "phone":   phones[0] if phones else "",
+        "website": urls[0] if urls else "",
     }
-    if naf in naf_map:
-        return naf_map[naf]
 
-    return ""
-
-
-def enrich_activity_summary(name: str, naf: str, website: str, company_hint: str = "") -> str:
-    val = gemini_activity_summary(name=name, naf=naf, website=website, company_hint=company_hint)
-    if val:
-        return val
-    return infer_activity_fallback(name=name, website=website, naf=naf)
+    merged = merge_ocr_results(gemini, vision_structured, fallbacks)
+    if not merged.get("city") and city_hint:
+        merged["city"] = city_hint
+    return merged
 
 
 # ============================================================
 # ENRICHISSEMENT ENTREPRISE
 # ============================================================
 
-def search_gouv_company(name: str, city: str = "") -> Dict[str, str]:
-    name = (name or "").strip()
-    if not name:
-        return {}
-
-    cache_key = f"search_gouv_company|{name}|{city}"
-    if cache_key in GOUV_CACHE:
-        return dict(GOUV_CACHE[cache_key])
-
-    try:
-        STATS["gouv_calls"] += 1
-        q = name if not city else f"{name} {city}".strip()
-        url = f"https://recherche-entreprises.api.gouv.fr/search?q={requests.utils.quote(q)}&page=1&per_page=1"
-        r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
-        r.raise_for_status()
-        j = r.json()
-        res = (j.get("results") or [])
-        if not res:
-            GOUV_CACHE[cache_key] = {}
-            return {}
-        e = res[0]
-        siege = e.get("siege") or {}
-
-        dirigeant = ""
-        arr = e.get("dirigeants") or e.get("representants") or []
-        if arr:
-            first = arr[0]
-            if isinstance(first, str):
-                dirigeant = first
-            elif isinstance(first, dict):
-                p = first.get("personne") or first
-                prenom = p.get("prenom") or p.get("prenoms") or ""
-                nom = p.get("nom") or p.get("nom_usage") or ""
-                dirigeant = f"{prenom} {nom}".strip()
-
-        naf = (e.get("activite_principale") or e.get("naf") or "").replace(".", "").replace(" ", "").upper()
-        out = {
-            "name": e.get("nom_raison_sociale") or e.get("denomination") or name,
-            "siret": validate_siret(siege.get("siret") or ""),
-            "naf": naf,
-            "address": (siege.get("adresse") or siege.get("libelle_voie") or ""),
-            "postal_code": normalize_cp(siege.get("code_postal") or ""),
-            "city": (siege.get("libelle_commune") or city),
-            "dirigeant": dirigeant,
-        }
-        GOUV_CACHE[cache_key] = out
-        return dict(out)
-    except Exception:
-        return {}
-
-
-def build_company_candidates(company_raw: str, email: str, website: str, city: str, ocr_text: str) -> List[str]:
-    cands = []
-    raw = (company_raw or "").strip()
-    dom_email = brand_from_domain(domain_from_email(email))
-    dom_web = brand_from_domain(domain_from_url(website))
-
-    for x in [raw, dom_email, dom_web]:
-        x = re.sub(r"\s+", " ", (x or "").strip())
-        if x and x not in cands:
-            cands.append(x)
-
-    base = cands[:]
-    for x in base:
-        if city:
-            y = f"{x} {city}".strip()
-            if y not in cands:
-                cands.append(y)
-
-    if ocr_text:
-        lines = [re.sub(r"\s+", " ", ln).strip() for ln in ocr_text.splitlines()]
-        normalized_existing = {normalize_company_name(c) for c in cands}
-        for ln in lines[:8]:
-            if len(ln) < 4 or len(ln) > 50:
-                continue
-            if "@" in ln or "www" in ln.lower():
-                continue
-            if re.search(r"\d", ln):
-                continue
-            norm = normalize_company_name(ln)
-            if len(norm) >= 4 and norm not in normalized_existing:
-                cands.append(ln)
-                break
-
-    out = []
-    seen = set()
-    for c in cands:
-        key = normalize_company_name(c)
-        if key and key not in seen:
-            seen.add(key)
-            out.append(c)
-    return out[:8]
-
-
-def search_gouv_company_ranked(
-    company_raw: str,
-    email: str,
-    website: str,
-    city: str,
-    ocr_text: str,
-    address_hint: str = "",
-    postal_code_hint: str = "",
-) -> Dict[str, str]:
-    candidates = build_company_candidates(company_raw, email, website, city, ocr_text)
-    if not candidates:
-        return {}
-
-    brand_email = normalize_company_name(brand_from_domain(domain_from_email(email)))
-    brand_web = normalize_company_name(brand_from_domain(domain_from_url(website)))
-    city_n = normalize_text(city)
-    addr_n = normalize_text(address_hint)
-    cp_n = normalize_cp(postal_code_hint)
-
-    best_score = -999
-    best = {}
-
-    for q in candidates:
-        try:
-            cache_key = f"search_gouv_company_ranked|{q}|{city}"
-            if cache_key in GOUV_CACHE:
-                results = GOUV_CACHE[cache_key].get("_results") or []
-            else:
-                STATS["gouv_calls"] += 1
-                url = f"https://recherche-entreprises.api.gouv.fr/search?q={requests.utils.quote(q)}&page=1&per_page=8"
-                r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
-                r.raise_for_status()
-                j = r.json()
-                results = j.get("results") or []
-                GOUV_CACHE[cache_key] = {"_results": results}
-        except Exception:
-            continue
-
-        for e in results:
-            siege = e.get("siege") or {}
-            denom = (e.get("nom_raison_sociale") or e.get("denomination") or "").strip()
-            denom_n = normalize_company_name(denom)
-            result_city = (siege.get("libelle_commune") or "").strip()
-            result_city_n = normalize_text(result_city)
-            result_addr = (siege.get("adresse") or siege.get("libelle_voie") or "").strip()
-            result_addr_n = normalize_text(result_addr)
-            result_cp = normalize_cp(siege.get("code_postal") or "")
-
-            score = 0
-
-            for token in [brand_email, brand_web, normalize_company_name(company_raw), normalize_company_name(q)]:
-                if token and token in denom_n:
-                    score += 20
-
-            if city_n and result_city_n:
-                if city_n == result_city_n:
-                    score += 30
-                elif city_n in result_city_n or result_city_n in city_n:
-                    score += 15
-
-            if cp_n and result_cp and cp_n == result_cp:
-                score += 20
-
-            if addr_n and result_addr_n:
-                common = 0
-                for tok in addr_n.split():
-                    if len(tok) >= 3 and tok in result_addr_n:
-                        common += 1
-                score += min(common * 5, 20)
-
-            if brand_email and brand_email in denom_n:
-                score += 20
-            if brand_web and brand_web in denom_n:
-                score += 20
-
-            if score > best_score:
-                best_score = score
-
-                dirigeant = ""
-                arr = e.get("dirigeants") or e.get("representants") or []
-                if arr:
-                    first = arr[0]
-                    if isinstance(first, str):
-                        dirigeant = first
-                    elif isinstance(first, dict):
-                        p = first.get("personne") or first
-                        prenom = p.get("prenom") or p.get("prenoms") or ""
-                        nom = p.get("nom") or p.get("nom_usage") or ""
-                        dirigeant = f"{prenom} {nom}".strip()
-
-                naf = (e.get("activite_principale") or e.get("naf") or "").replace(".", "").replace(" ", "").upper()
-
-                best = {
-                    "name": denom,
-                    "siret": validate_siret(siege.get("siret") or ""),
-                    "naf": naf,
-                    "address": result_addr,
-                    "postal_code": result_cp,
-                    "city": result_city,
-                    "dirigeant": dirigeant,
-                }
-
-    return best
-
-
-def search_gouv_by_address_hint(address: str, postal_code: str, city: str, website: str, email: str) -> Dict[str, str]:
-    parts = []
-
-    if address:
-        parts.append(address)
-    if postal_code:
-        parts.append(postal_code)
-    if city:
-        parts.append(city)
-
-    dom_web = brand_from_domain(domain_from_url(website))
-    dom_email = brand_from_domain(domain_from_email(email))
-
-    if dom_web:
-        parts.append(dom_web)
-    elif dom_email:
-        parts.append(dom_email)
-
-    q = " ".join([p for p in parts if p]).strip()
+def search_gouv(query: str, per_page: int = 5) -> List[Dict[str, Any]]:
+    q = normalize_spaces(query)
     if not q:
-        return {}
-
-    cache_key = f"search_gouv_by_address_hint|{q}"
-    if cache_key in GOUV_CACHE:
-        return dict(GOUV_CACHE[cache_key])
-
+        return []
+    key = sha1_hex(f"gouv:{q}:{per_page}")
+    if key in GOUV_CACHE:
+        return GOUV_CACHE[key]
     try:
         STATS["gouv_calls"] += 1
-        url = f"https://recherche-entreprises.api.gouv.fr/search?q={requests.utils.quote(q)}&page=1&per_page=6"
-        r = requests.get(url, headers={"accept": "application/json"}, timeout=20)
+        r = requests.get(
+            "https://recherche-entreprises.api.gouv.fr/search",
+            params={"q": q, "page": 1, "per_page": per_page},
+            headers={"accept": "application/json"},
+            timeout=15,
+        )
         r.raise_for_status()
-        j = r.json()
-        results = j.get("results") or []
-        if not results:
-            GOUV_CACHE[cache_key] = {}
-            return {}
+        results = r.json().get("results") or []
+        GOUV_CACHE[key] = results
+        return results
+    except Exception as e:
+        logger.warning("API Gouv error [%s] : %s", q, e)
+        return []
 
-        city_n = normalize_text(city)
-        best_score = -999
-        best = {}
 
-        for e in results:
-            siege = e.get("siege") or {}
-            result_city = (siege.get("libelle_commune") or "").strip()
-            result_city_n = normalize_text(result_city)
-            denom = (e.get("nom_raison_sociale") or e.get("denomination") or "").strip()
-            denom_n = normalize_company_name(denom)
+def gouv_to_flat(e: Dict) -> Dict[str, Any]:
+    siege = e.get("siege") or {}
+    dirs_ = e.get("dirigeants") or e.get("representants") or []
+    dirigeant = ""
+    if dirs_:
+        first = dirs_[0]
+        if isinstance(first, str):
+            dirigeant = first
+        elif isinstance(first, dict):
+            p = first.get("personne") or first
+            dirigeant = normalize_spaces(
+                f"{p.get('prenom', '')} {p.get('nom', '') or p.get('nom_usage', '')}".strip()
+            )
+    naf = normalize_naf(e.get("activite_principale") or e.get("naf") or "")
+    tranche = e.get("tranche_effectif_salarie") or siege.get("tranche_effectif_salarie") or ""
+    return {
+        "name":          normalize_spaces(e.get("nom_raison_sociale") or e.get("denomination") or ""),
+        "siret":         validate_siret(siege.get("siret") or ""),
+        "naf":           naf,
+        "address":       normalize_spaces(siege.get("adresse") or siege.get("libelle_voie") or ""),
+        "postal_code":   normalize_cp(siege.get("code_postal") or ""),
+        "city":          normalize_spaces(siege.get("libelle_commune") or ""),
+        "dirigeant":     dirigeant,
+        "effectif":      _effectif_label(tranche),
+        "date_creation": str(e.get("date_creation") or ""),
+        "capital":       str(e.get("capital") or ""),
+    }
 
-            score = 0
-            if city_n and result_city_n:
-                if city_n == result_city_n:
-                    score += 30
-                elif city_n in result_city_n or result_city_n in city_n:
-                    score += 15
 
-            for tok in [dom_web, dom_email]:
-                tok_n = normalize_company_name(tok)
-                if tok_n and tok_n in denom_n:
-                    score += 25
+_EFFECTIF_MAP = {
+    "NN": "Non employeur", "00": "0 salarié", "01": "1-2 salariés", "02": "3-5 salariés",
+    "03": "6-9 salariés", "11": "10-19 salariés", "12": "20-49 salariés",
+    "21": "50-99 salariés", "22": "100-199 salariés", "31": "200-249 salariés",
+    "32": "250-499 salariés", "41": "500-999 salariés",
+}
 
-            dirigeant = ""
-            arr = e.get("dirigeants") or e.get("representants") or []
-            if arr:
-                first = arr[0]
-                if isinstance(first, str):
-                    dirigeant = first
-                elif isinstance(first, dict):
-                    p = first.get("personne") or first
-                    prenom = p.get("prenom") or p.get("prenoms") or ""
-                    nom = p.get("nom") or p.get("nom_usage") or ""
-                    dirigeant = f"{prenom} {nom}".strip()
 
-            naf = (e.get("activite_principale") or e.get("naf") or "").replace(".", "").replace(" ", "").upper()
-
-            if score > best_score:
-                best_score = score
-                best = {
-                    "name": denom,
-                    "siret": validate_siret(siege.get("siret") or ""),
-                    "naf": naf,
-                    "address": (siege.get("adresse") or siege.get("libelle_voie") or ""),
-                    "postal_code": normalize_cp(siege.get("code_postal") or ""),
-                    "city": result_city,
-                    "dirigeant": dirigeant,
-                }
-
-        GOUV_CACHE[cache_key] = best
-        return dict(best)
-    except Exception:
-        return {}
+def _effectif_label(code: str) -> str:
+    return _EFFECTIF_MAP.get(str(code or ""), str(code or ""))
 
 
 def places_enrich(name: str, city: str = "") -> Dict[str, str]:
     if not GOOGLE_PLACES_API_KEY or not name:
-        return {}
-
-    cache_key = f"{name}|{city}"
-    if cache_key in PLACES_CACHE:
-        return dict(PLACES_CACHE[cache_key])
-
+        return {"phone": "", "website": "", "address": ""}
+    key = sha1_hex(f"places:{name}|{city}")
+    if key in PLACES_CACHE:
+        return PLACES_CACHE[key]
     try:
         STATS["places_calls"] += 1
-        query = name if not city else f"{name} {city}".strip()
         r1 = requests.post(
             "https://places.googleapis.com/v1/places:searchText",
             headers={
@@ -1606,1503 +907,649 @@ def places_enrich(name: str, city: str = "") -> Dict[str, str]:
                 "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
                 "X-Goog-FieldMask": "places.id,places.websiteUri",
             },
-            json={
-                "textQuery": query,
-                "maxResultCount": 1,
-                "languageCode": "fr",
-                "regionCode": "FR",
-            },
-            timeout=20
+            json={"textQuery": f"{name} {city}".strip(), "maxResultCount": 1,
+                  "languageCode": "fr", "regionCode": "FR"},
+            timeout=15,
         )
         r1.raise_for_status()
-        j1 = r1.json()
-        p = (j1.get("places") or [None])[0]
-        if not p or not p.get("id"):
-            PLACES_CACHE[cache_key] = {}
-            return {}
-        pid = p["id"]
-        website = p.get("websiteUri") or ""
+        p = (r1.json().get("places") or [None])[0]
+        if not p:
+            PLACES_CACHE[key] = {"phone": "", "website": "", "address": ""}
+            return PLACES_CACHE[key]
+        pid     = p.get("id", "")
+        website = normalize_spaces(p.get("websiteUri", ""))
+        phone = address = ""
+        if pid:
+            r2 = requests.get(
+                f"https://places.googleapis.com/v1/places/{pid}",
+                headers={
+                    "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                    "X-Goog-FieldMask": "nationalPhoneNumber,internationalPhoneNumber,websiteUri,formattedAddress",
+                },
+                timeout=15,
+            )
+            r2.raise_for_status()
+            j2      = r2.json()
+            phone   = normalize_phone(j2.get("nationalPhoneNumber") or j2.get("internationalPhoneNumber") or "")
+            website = normalize_spaces(j2.get("websiteUri") or website)
+            address = normalize_spaces(j2.get("formattedAddress") or "")
+        result = {"phone": phone, "website": website, "address": address}
+        PLACES_CACHE[key] = result
+        return result
+    except Exception as e:
+        logger.warning("Places error [%s] : %s", name, e)
+        return {"phone": "", "website": "", "address": ""}
 
-        r2 = requests.get(
-            f"https://places.googleapis.com/v1/places/{pid}",
-            headers={
-                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-                "X-Goog-FieldMask": "nationalPhoneNumber,internationalPhoneNumber,websiteUri,formattedAddress",
-            },
-            timeout=20
-        )
-        r2.raise_for_status()
-        j2 = r2.json()
-        phone = j2.get("nationalPhoneNumber") or j2.get("internationalPhoneNumber") or ""
-        website2 = j2.get("websiteUri") or website
-        addr = (j2.get("formattedAddress") or "").strip()
 
-        out = {"phone": normalize_phone(phone), "website": (website2 or "").strip(), "address": addr}
-        PLACES_CACHE[cache_key] = out
-        return dict(out)
-    except Exception:
-        return {}
-
-
-def scrape_email_from_site(url: str) -> str:
+def scrape_email(url: str) -> str:
     if not url:
         return ""
-
-    domain = domain_from_url(url)
-    if domain in EMAIL_SCRAPE_CACHE:
-        cached = EMAIL_SCRAPE_CACHE[domain]
+    try:
+        from urllib.parse import urlparse
+        host = urlparse(url).hostname or ""
+        host = host.replace("www.", "")
+    except Exception:
+        return ""
+    if host in EMAIL_CACHE:
+        cached = EMAIL_CACHE[host]
         return "" if cached == "none" else cached
 
-    candidates = []
-    base = url.rstrip("/")
-    if base:
-        candidates.append(base + "/contact")
-        candidates.append(base)
-    else:
-        candidates.append(url)
-
+    candidates = [f"https://{host}/contact", f"https://{host}"]
     for attempt_url in candidates:
         try:
             STATS["scrape_calls"] += 1
-            r = requests.get(attempt_url, headers={"user-agent": "Mozilla/5.0 (ProspectionBot)"}, timeout=10)
+            r = requests.get(
+                attempt_url,
+                headers={"user-agent": "Mozilla/5.0 (ProspectionBot/2.0)"},
+                timeout=8,
+                allow_redirects=True,
+            )
             if r.status_code >= 300:
                 continue
-            html = r.text[:250000]
-            matches = re.findall(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}", html)
+            html = r.text[:150_000]
+            matches = [clean_email(m) for m in EMAIL_IN_TEXT_RE.findall(html) if is_valid_email(clean_email(m))]
+            matches = [m for m in matches if not re.search(r"no-?reply", m, re.I)]
             if not matches:
                 continue
-
-            valid = []
-            for m in matches:
-                em = clean_email(m)
-                if not is_valid_email(em):
-                    continue
-                if re.search(r"no-?reply", em, re.I):
-                    continue
-                valid.append(em)
-
-            if not valid:
-                continue
-
-            if domain:
-                same_domain = [em for em in valid if domain_from_email(em) == domain]
-                if same_domain:
-                    EMAIL_SCRAPE_CACHE[domain] = same_domain[0]
-                    return same_domain[0]
-
-            EMAIL_SCRAPE_CACHE[domain] = valid[0]
-            return valid[0]
+            same = [m for m in matches if host in m]
+            result = same[0] if same else matches[0]
+            EMAIL_CACHE[host] = result
+            return result
         except Exception:
             continue
-
-    if domain:
-        EMAIL_SCRAPE_CACHE[domain] = "none"
+    EMAIL_CACHE[host] = "none"
     return ""
 
 
-# ============================================================
-# DOUBLE PASSE CARTE DE VISITE
-# ============================================================
-
-def extract_card_pipeline_fields(img_bytes: bytes) -> Dict[str, str]:
-    if not img_bytes:
-        return {}
-
-    cache_key = image_hash_bytes(img_bytes)
-    if cache_key in CARD_PIPELINE_CACHE:
-        return dict(CARD_PIPELINE_CACHE[cache_key])
-
-    # PASSE 1 — GEMINI STRUCTURÉ
-    vis = gemini_extract_business_card(img_bytes) if GEMINI_API_KEY else {
-        "name": "", "company": "", "title": "", "email": "", "phone": "",
-        "website": "", "postal_code": "", "city": "", "address": ""
-    }
-
-    # PASSE 2 — EASYOCR + TESSERACT + REGEX
-    light_ocr = bool(vis.get("name") or vis.get("company") or vis.get("email") or vis.get("phone") or vis.get("website"))
-    ocr_txt = ocr_image_bytes(img_bytes, light=light_ocr)
-    lines = clean_ocr_lines(ocr_txt)
-
-    email_ocr = best_email("\n".join(lines))
-    urls_ocr = extract_urls("\n".join(lines))
-    phones_ocr = extract_all_phones("\n".join(lines))
-    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text("\n".join(lines))
-
-    local_website = (vis.get("website") or (urls_ocr[0] if urls_ocr else "") or "").strip()
-    local_email = clean_email(vis.get("email") or email_ocr or "")
-    if local_email and not is_valid_email(local_email):
-        local_email = ""
-
-    detected_company_line = detect_company_from_lines(
-        lines,
-        gemini_company=(vis.get("company") or "").strip(),
-        website=local_website,
-        email=local_email
-    )
-
-    person_name = (vis.get("name") or "").strip()
-    if not person_name:
-        person_name = detect_person_name_from_lines(lines, company_line=detected_company_line)
-
-    fn, ln = split_human_name(person_name)
-
-    local_postal_code = normalize_cp((vis.get("postal_code") or local_cp_ocr or "").strip())
-    local_city = (vis.get("city") or local_city_ocr or "").strip()
-    local_address = clean_address_candidate((vis.get("address") or local_addr_ocr or "").strip())
-
-    phones_all = []
-    if vis.get("phone"):
-        phones_all.append(normalize_phone(vis.get("phone")))
-    phones_all.extend(phones_ocr)
-
-    seen = set()
-    dedup_phones = []
-    for p in phones_all:
-        p = normalize_phone(p)
-        if p and p not in seen:
-            seen.add(p)
-            dedup_phones.append(p)
-
-    phone, phone2 = split_phones_by_priority(dedup_phones)
-
-    company_guess = extract_best_company_hint(
-        lines=lines,
-        gemini_company=(vis.get("company") or "").strip(),
-        website=local_website,
-        email=local_email
-    )
-
-    gouv = search_gouv_company_ranked(
-        company_raw=company_guess,
-        email=local_email,
-        website=local_website,
-        city=local_city,
-        ocr_text="\n".join(lines),
-        address_hint=local_address,
-        postal_code_hint=local_postal_code
-    )
-
-    if not gouv:
-        gouv = search_gouv_by_address_hint(
-            address=local_address,
-            postal_code=local_postal_code,
-            city=local_city,
-            website=local_website,
-            email=local_email
-        )
-
-    if not gouv and company_guess:
-        gouv = search_gouv_company(company_guess, local_city)
-
-    place = {}
-    place_query_name = (gouv.get("name") or company_guess or "").strip()
-    if place_query_name:
-        place = places_enrich(place_query_name, local_city) if local_city else places_enrich(place_query_name, "")
-        place = place or {}
-
-    final_name = choose_final_company_name(
-        gouv_name=(gouv.get("name") or "").strip(),
-        gemini_company=(vis.get("company") or "").strip(),
-        detected_company_line=(detected_company_line or "").strip(),
-        person_name=(person_name or "").strip(),
-        website=local_website or (place.get("website") or ""),
-        email=local_email,
-    )
-
-    final_address = clean_address_candidate(
-        (local_address or gouv.get("address") or place.get("address") or "").strip()
-    )
-    final_postal_code = normalize_cp(local_postal_code or gouv.get("postal_code") or "")
-    final_city = (local_city or gouv.get("city") or "").strip()
-    final_website = (local_website or place.get("website") or "").strip()
-    final_email = local_email or (scrape_email_from_site(final_website) if final_website else "")
-    final_email = clean_email(final_email) if is_valid_email(final_email) else ""
-
-    if not phone and place.get("phone"):
-        phone = normalize_phone(place.get("phone") or "")
-
-    out = {
-        "name": final_name,
-        "address": final_address,
-        "postal_code": final_postal_code,
-        "city": final_city,
-        "siret": validate_siret((gouv.get("siret") or "").strip()),
-        "naf": (gouv.get("naf") or "").strip(),
-        "activity_summary": enrich_activity_summary(
-            name=final_name,
-            naf=(gouv.get("naf") or "").strip(),
-            website=final_website,
-            company_hint=(company_guess or detected_company_line or "")
+def enrich_company(name: str, city: str, flat_gouv: Optional[Dict] = None) -> Dict[str, Any]:
+    """Enrichit une entreprise : Places + email scraping."""
+    place = places_enrich(name, city)
+    website = place.get("website") or (flat_gouv or {}).get("website") or ""
+    email   = scrape_email(website) if website else ""
+    base = dict(flat_gouv or {})
+    base.update({
+        "website": website,
+        "phone":   place.get("phone") or base.get("phone") or "",
+        "email":   email,
+        "address": strip_postal_city(
+            place.get("address") or base.get("address") or "",
+            base.get("postal_code") or "",
+            base.get("city") or city,
         ),
-        "dirigeant": (gouv.get("dirigeant") or "").strip(),
-        "interlocuteur": (person_name or "").strip(),
-        "contact_firstname": fn,
-        "contact_lastname": ln,
-        "phone": phone,
-        "phone2": phone2,
-        "email": final_email,
-        "website": final_website,
-    }
-
-    if out["phone"] and out["phone2"] and out["phone"] == out["phone2"]:
-        out["phone2"] = ""
-
-    out = ensure_contact_fallback(out)
-    out = normalize_row_address(out)
-    CARD_PIPELINE_CACHE[cache_key] = dict(out)
-    return dict(out)
-
-
-def is_linked_prospect_card(card: Dict[str, Any]) -> bool:
-    if not isinstance(card, dict):
-        return False
-    source = (card.get("source") or "").strip().lower()
-    source_mode = (card.get("source_mode") or "").strip().lower()
-    comment = (card.get("comment") or "").strip().lower()
-
-    if source == "prospect_mode":
-        return True
-    if source_mode == "company_form":
-        return True
-    if comment == "card_from_prospect_mode":
-        return True
-    if card.get("linked_prospect_key"):
-        return True
-    if card.get("linked_prospect_name"):
-        return True
-    return False
-
-
-def merge_card_into_prospect_row(row: Dict[str, Any], img_bytes: bytes) -> Dict[str, Any]:
-    if not img_bytes:
-        return row
-
-    card = extract_card_pipeline_fields(img_bytes)
-    if not card:
-        return row
-
-    merged = dict(row)
-
-    row_score = record_score(row)
-    card_score = record_score(card)
-    card_is_globally_better = card_score > row_score
-
-    # Carte prioritaire sur API / Places pour les infos visibles,
-    # mais sans écraser brutalement un prospect déjà meilleur.
-    for fld in [
-        "interlocuteur",
-        "contact_firstname",
-        "contact_lastname",
-        "email",
-        "website",
-        "address",
-        "postal_code",
-        "city",
-    ]:
-        card_val = str(card.get(fld, "") or "").strip()
-        row_val = str(merged.get(fld, "") or "").strip()
-        if not card_val:
-            continue
-
-        should_replace = False
-        if not row_val:
-            should_replace = True
-        elif fld == "email" and is_valid_email(card_val) and not is_valid_email(row_val):
-            should_replace = True
-        elif fld == "website" and len(card_val) > len(row_val):
-            should_replace = True
-        elif fld in ("address", "interlocuteur", "contact_firstname", "contact_lastname") and len(card_val) > len(row_val):
-            should_replace = True
-        elif fld in ("postal_code", "city") and not merged.get("address") and card_is_globally_better:
-            should_replace = True
-
-        if should_replace:
-            merged[fld] = card.get(fld, "")
-
-    if str(card.get("name", "") or "").strip():
-        current_name = str(merged.get("name", "") or "").strip()
-        card_name = str(card.get("name", "") or "").strip()
-        if (not current_name) or (len(card_name) > len(current_name) and card_is_globally_better):
-            merged["name"] = card.get("name", "")
-
-    if not str(merged.get("siret", "") or "").strip() and str(card.get("siret", "") or "").strip():
-        merged["siret"] = card.get("siret", "")
-    if not str(merged.get("naf", "") or "").strip() and str(card.get("naf", "") or "").strip():
-        merged["naf"] = card.get("naf", "")
-
-    if not str(merged.get("dirigeant", "") or "").strip() and str(card.get("dirigeant", "") or "").strip():
-        merged["dirigeant"] = card.get("dirigeant", "")
-
-    card_phones = []
-    for fld in ["phone", "phone2"]:
-        p = normalize_phone(card.get(fld, "") or "")
-        if p and p not in card_phones:
-            card_phones.append(p)
-
-    existing_phones = []
-    for fld in ["phone", "phone2"]:
-        p = normalize_phone(merged.get(fld, "") or "")
-        if p and p not in existing_phones:
-            existing_phones.append(p)
-
-    if card_phones:
-        phone, phone2 = split_phones_by_priority(card_phones + existing_phones)
-        merged["phone"] = normalize_phone(phone)
-        merged["phone2"] = normalize_phone(phone2)
-
-    if merged.get("phone") and merged.get("phone2") and merged["phone"] == merged["phone2"]:
-        merged["phone2"] = ""
-
-    if not merged.get("activity_summary"):
-        merged["activity_summary"] = enrich_activity_summary(
-            name=merged.get("name", ""),
-            naf=merged.get("naf", ""),
-            website=merged.get("website", ""),
-            company_hint=card.get("name", "") or merged.get("name", "")
-        )
-
-    merged = ensure_contact_fallback(merged)
-    merged = normalize_row_address(merged)
-    merged = uppercase_business_fields(merged)
-
-    log_fusion("merge_card_into_prospect_row", {
-        "prospect_name": row.get("name", ""),
-        "card_name": card.get("name", ""),
-        "card_interlocuteur": card.get("interlocuteur", ""),
-        "card_email": card.get("email", ""),
     })
-
-    return merged
-
-
-def unify_from_prospect_with_card(p: Dict[str, Any]) -> Dict[str, Any]:
-    row = unify_from_prospect(p)
-
-    card_file_id = (p.get("card_photo_file_id") or "").strip()
-    if not card_file_id:
-        STATS["linked_cards_missing"] += 1
-        return row
-
-    try:
-        img = tg_download_file(card_file_id)
-    except Exception:
-        img = b""
-
-    if not img:
-        STATS["linked_cards_missing"] += 1
-        return row
-
-    STATS["linked_cards_processed"] += 1
-    return merge_card_into_prospect_row(row, img)
+    return base
 
 
 # ============================================================
-# DÉDUPLICATION AVANCÉE
+# SCORE DE COMPLÉTUDE
 # ============================================================
-
-def domain_match_value(row: Dict[str, Any]) -> str:
-    website_dom = domain_from_url(row.get("website", "") or "")
-    email_dom = domain_from_email(row.get("email", "") or "")
-    return website_dom or email_dom
-
-
-def row_identity_signals(row: Dict[str, Any]) -> Dict[str, str]:
-    return {
-        "siret": validate_siret(row.get("siret", "") or ""),
-        "name": normalize_company_name(row.get("name", "") or ""),
-        "city": normalize_text(row.get("city", "") or ""),
-        "postal_code": normalize_cp(row.get("postal_code", "") or ""),
-        "phone": normalize_phone(row.get("phone", "") or ""),
-        "phone2": normalize_phone(row.get("phone2", "") or ""),
-        "email": clean_email(row.get("email", "") or ""),
-        "domain": domain_match_value(row),
-        "website_domain": domain_from_url(row.get("website", "") or ""),
-        "interlocuteur": normalize_text(row.get("interlocuteur", "") or ""),
-        "address": normalize_text(row.get("address", "") or ""),
-        "agency": normalize_text(row.get("agency", "") or ""),
-        "initials": normalize_text(row.get("initials", "") or ""),
-    }
-
 
 def record_score(d: Dict[str, Any]) -> int:
-    score = 0
-
     weights = {
-        "name": 5,
-        "address": 3,
-        "postal_code": 2,
-        "city": 2,
-        "siret": 8,
-        "naf": 2,
-        "activity_summary": 2,
-        "dirigeant": 2,
-        "interlocuteur": 4,
-        "contact_firstname": 2,
-        "contact_lastname": 2,
-        "phone": 3,
-        "phone2": 2,
-        "email": 4,
-        "website": 2,
-        "resume": 3,
-        "commande": 3,
+        "name": 5, "address": 3, "postal_code": 2, "city": 2,
+        "siret": 8, "naf": 2, "activity_summary": 2,
+        "dirigeant": 2, "interlocuteur": 4,
+        "phone": 3, "phone2": 2, "email": 4, "website": 2,
+        "resume": 3, "commande": 3,
+        "qualification": 2, "effectif": 1, "date_creation": 1,
     }
-
+    score = 0
     for k, w in weights.items():
-        v = str(d.get(k, "") or "").strip()
+        v = str(d.get(k) or "").strip()
         if not v:
             continue
-
         if k == "siret":
-            if validate_siret(v):
-                score += w
-            continue
-
-        if k in ("email",):
-            if is_valid_email(v):
-                score += w
-            continue
-
-        if k in ("phone", "phone2"):
-            if normalize_phone(v):
-                score += w
-            continue
-
-        score += w
-
-    if validate_siret(d.get("siret", "") or ""):
-        score += 4
-
-    if str(d.get("resume", "") or "").strip() and str(d.get("commande", "") or "").strip():
-        score += 2
-
+            score += w if validate_siret(v) else 0
+        elif k == "email":
+            score += w if is_valid_email(v) else 0
+        elif k in ("phone", "phone2"):
+            score += w if normalize_phone(v) else 0
+        else:
+            score += w
     return score
 
 
-def row_similarity_score(a: Dict[str, Any], b: Dict[str, Any]) -> int:
-    sa = row_identity_signals(a)
-    sb = row_identity_signals(b)
-    score = 0
+# ============================================================
+# UNIFY — construction d'une ligne prospect normalisée
+# ============================================================
 
-    if sa["siret"] and sb["siret"] and sa["siret"] == sb["siret"]:
-        score += 100
-
-    if sa["name"] and sb["name"]:
-        if sa["name"] == sb["name"]:
-            score += 30
-        elif sa["name"] in sb["name"] or sb["name"] in sa["name"]:
-            score += 18
-
-    if sa["city"] and sb["city"]:
-        if sa["city"] == sb["city"]:
-            score += 12
-        elif sa["city"] in sb["city"] or sb["city"] in sa["city"]:
-            score += 6
-
-    if sa["postal_code"] and sb["postal_code"] and sa["postal_code"] == sb["postal_code"]:
-        score += 10
-
-    phones_a = {x for x in [sa["phone"], sa["phone2"]] if x}
-    phones_b = {x for x in [sb["phone"], sb["phone2"]] if x}
-    if phones_a and phones_b:
-        inter = phones_a & phones_b
-        if inter:
-            score += 20
-
-    if sa["email"] and sb["email"] and sa["email"] == sb["email"]:
-        score += 24
-
-    if sa["domain"] and sb["domain"] and sa["domain"] == sb["domain"]:
-        score += 12
-
-    if sa["website_domain"] and sb["website_domain"] and sa["website_domain"] == sb["website_domain"]:
-        score += 10
-
-    if sa["interlocuteur"] and sb["interlocuteur"]:
-        if sa["interlocuteur"] == sb["interlocuteur"]:
-            score += 10
-        elif sa["interlocuteur"] in sb["interlocuteur"] or sb["interlocuteur"] in sa["interlocuteur"]:
-            score += 5
-
-    if sa["address"] and sb["address"]:
-        common = 0
-        toks_a = [t for t in sa["address"].split() if len(t) >= 3]
-        for tok in toks_a:
-            if tok in sb["address"]:
-                common += 1
-        score += min(common * 2, 8)
-
-    # proximité carte/prospect / même personne même jour
-    if sa["agency"] and sb["agency"] and sa["agency"] == sb["agency"]:
-        score += 2
-    if sa["initials"] and sb["initials"] and sa["initials"] == sb["initials"]:
-        score += 2
-
-    return score
-
-
-def dedupe_anchor_key(r: Dict[str, Any]) -> str:
-    sig = row_identity_signals(r)
-
-    if sig["siret"]:
-        return f"SIRET|{sig['siret']}"
-
-    if sig["name"] and sig["city"] and sig["postal_code"]:
-        return f"NCP|{sig['name']}|{sig['city']}|{sig['postal_code']}"
-
-    if sig["name"] and sig["city"]:
-        return f"NC|{sig['name']}|{sig['city']}"
-
-    if sig["email"]:
-        return f"EMAIL|{sig['email']}"
-
-    phones = sorted([x for x in [sig["phone"], sig["phone2"]] if x])
-    if sig["name"] and phones:
-        return f"NP|{sig['name']}|{'|'.join(phones)}"
-
-    dom = sig["domain"]
-    if sig["name"] and dom:
-        return f"ND|{sig['name']}|{dom}"
-
+def get_first(d: Dict, *keys: str) -> str:
+    for k in keys:
+        v = d.get(k)
+        if v and str(v).strip():
+            return str(v).strip()
     return ""
 
 
-def merge_rows_keep_best(primary: Dict[str, Any], secondary: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Garde la ligne la plus complète, sans écraser les champs terrain forts.
-    Priorité spéciale :
-    - resume / commande : ne jamais écraser si déjà présents dans primary
-    - dirigeant : ne pas écraser un dirigeant existant par vide
-    """
-    merged = dict(primary)
+def unify_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
+    """Construit une ligne normalisée depuis un enregistrement prospect KV."""
+    name    = get_first(p, "name", "company", "nom")
+    naf     = normalize_naf(get_first(p, "naf", "activite_principale"))
+    website = get_first(p, "website", "site_web")
 
-    protected_if_present = {"resume", "commande"}
-    for k, v2 in secondary.items():
-        v1 = merged.get(k, "")
-        s1 = str(v1 or "").strip()
-        s2 = str(v2 or "").strip()
-
-        if k in protected_if_present and s1:
-            continue
-
-        if not s1 and s2:
-            merged[k] = v2
-            continue
-
-        if s1 and s2:
-            if k == "activity_summary":
-                if len(s2) > len(s1):
-                    merged[k] = v2
-            elif k == "address":
-                if len(s2) > len(s1):
-                    merged[k] = v2
-            elif k in ("phone", "phone2"):
-                # éviter doublons, mais permettre meilleure affectation
-                if not normalize_phone(s1) and normalize_phone(s2):
-                    merged[k] = v2
-            elif k == "website":
-                # préfère URL réelle à vide ou à domaine reconstruit très court
-                if len(s2) > len(s1):
-                    merged[k] = v2
-            elif k == "email":
-                if is_valid_email(s2) and not is_valid_email(s1):
-                    merged[k] = v2
-            elif k == "siret":
-                if validate_siret(s2) and not validate_siret(s1):
-                    merged[k] = v2
-            elif k == "naf":
-                if s2 and not s1:
-                    merged[k] = v2
-            elif k == "interlocuteur":
-                if len(s2) > len(s1):
-                    merged[k] = v2
-            elif k == "contact_firstname":
-                if len(s2) > len(s1):
-                    merged[k] = v2
-            elif k == "contact_lastname":
-                if len(s2) > len(s1):
-                    merged[k] = v2
-
-    merged = ensure_contact_fallback(merged)
-    merged = normalize_row_address(merged)
-
-    p1 = normalize_phone(merged.get("phone", "") or "")
-    p2 = normalize_phone(merged.get("phone2", "") or "")
-    if p1 and p2 and p1 == p2:
-        merged["phone2"] = ""
-
-    return merged
-
-
-def dedupe_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not rows:
-        return []
-
-    buckets: Dict[str, List[Dict[str, Any]]] = {}
-    loose_rows: List[Dict[str, Any]] = []
-
-    for r in rows:
-        key = dedupe_anchor_key(r)
-        if key:
-            buckets.setdefault(key, []).append(r)
-        else:
-            loose_rows.append(r)
-
-    merged_groups: List[Dict[str, Any]] = []
-
-    for anchor, group in buckets.items():
-        STATS["dedupe_groups"] += 1
-        consumed = [False] * len(group)
-
-        for i in range(len(group)):
-            if consumed[i]:
-                continue
-            base = dict(group[i])
-            consumed[i] = True
-
-            for j in range(i + 1, len(group)):
-                if consumed[j]:
-                    continue
-                sim = row_similarity_score(base, group[j])
-                if sim >= 28:
-                    before = record_score(base)
-                    base = merge_rows_keep_best(base, group[j])
-                    after = record_score(base)
-                    consumed[j] = True
-                    STATS["dedupe_rows_merged"] += 1
-                    log_fusion("dedupe_merge", {
-                        "anchor": anchor,
-                        "similarity": sim,
-                        "score_before": before,
-                        "score_after": after,
-                        "name": base.get("name", ""),
-                        "city": base.get("city", ""),
-                    })
-
-            merged_groups.append(base)
-
-    # deuxième passe légère pour les lignes sans clé forte
-    out = list(merged_groups)
-    for r in loose_rows:
-        attached = False
-        for idx, ex in enumerate(out):
-            sim = row_similarity_score(r, ex)
-            if sim >= 34:
-                before = record_score(out[idx])
-                out[idx] = merge_rows_keep_best(ex, r)
-                after = record_score(out[idx])
-                STATS["dedupe_rows_merged"] += 1
-                log_fusion("dedupe_loose_attach", {
-                    "similarity": sim,
-                    "score_before": before,
-                    "score_after": after,
-                    "name": out[idx].get("name", ""),
-                    "city": out[idx].get("city", ""),
-                })
-                attached = True
-                break
-        if not attached:
-            out.append(r)
-
-    return out
-
-
-# ============================================================
-# UNIFY
-# ============================================================
-
-def unify_from_prospect(p: Dict[str, Any]) -> Dict[str, Any]:
-    website = get_first_valid(p, "website", "site_web", "websiteUri")
-    naf = get_first_valid(p, "naf", "code_naf", "activite_principale")
-    name = get_first_valid(p, "name", "company", "nom", "denomination")
-    activity_summary = get_first_valid(p, "activity_summary", "activity", "activity_label")
-
-    if not activity_summary and (name or naf or website):
-        activity_summary = enrich_activity_summary(name=name, naf=naf, website=website, company_hint=name)
-
-    raw_email = get_first_valid(p, "email", "contact_email", "mail")
-    email = clean_email(raw_email) if is_valid_email(raw_email) else ""
+    # Activité : libellé Gouv ou activity_summary du prospect
+    activity = get_first(p, "activity_summary", "secteur_activite", "activite")
 
     phones = []
-    for k in ["phone", "phone2", "mobile", "telephone", "tel"]:
-        v = normalize_phone(p.get(k, "") or "")
-        if v and v not in phones:
-            phones.append(v)
-    phone, phone2 = split_phones_by_priority(phones)
+    for k in ["phone", "phone2", "telephone", "mobile"]:
+        pn = normalize_phone(str(p.get(k) or ""))
+        if pn and pn not in phones:
+            phones.append(pn)
+    phone, phone2 = split_phones(phones)
+
+    raw_email = get_first(p, "email", "mail")
+    email = normalize_email(raw_email)
 
     d = {
-        "date": get_first_valid(p, "date") or "",
-        "agency": (get_first_valid(p, "agency") or "").upper(),
-        "initials": (get_first_valid(p, "initials", "user_initials") or "").upper(),
-        "name": name,
-        "address": get_first_valid(p, "address", "adresse", "formattedAddress"),
-        "postal_code": get_first_valid(p, "postal_code", "code_postal", "postalCode"),
-        "city": get_first_valid(p, "city", "ville", "commune"),
-        "siret": validate_siret(get_first_valid(p, "siret", "siretSiege", "siret_siege")),
-        "naf": naf,
-        "activity_summary": activity_summary,
-        "dirigeant": get_first_valid(p, "dirigeant", "representant_legal", "nom_dirigeant"),
-        "interlocuteur": get_first_valid(p, "interlocuteur", "contact_name", "person_name"),
-        "contact_firstname": get_first_valid(p, "contact_firstname", "firstname", "first_name"),
-        "contact_lastname": get_first_valid(p, "contact_lastname", "lastname", "last_name"),
-        "phone": phone,
-        "phone2": phone2,
-        "email": email,
-        "website": website,
-        "resume": get_first_valid(p, "resume", "meeting", "comment"),
-        "commande": get_first_valid(p, "commande", "order"),
+        "date":              get_first(p, "date"),
+        "agency":            (get_first(p, "agency") or "").upper(),
+        "initials":          (get_first(p, "initials", "user_initials") or "").upper(),
+        "name":              name,
+        "address":           strip_postal_city(
+                                 get_first(p, "address", "adresse"),
+                                 get_first(p, "postal_code", "code_postal"),
+                                 get_first(p, "city", "ville"),
+                             ),
+        "postal_code":       normalize_cp(get_first(p, "postal_code", "code_postal")),
+        "city":              normalize_spaces(get_first(p, "city", "ville")),
+        "siret":             validate_siret(get_first(p, "siret")),
+        "naf":               naf,
+        "activity_summary":  activity,
+        "effectif":          get_first(p, "effectif"),
+        "date_creation":     get_first(p, "date_creation"),
+        "capital":           get_first(p, "capital"),
+        "dirigeant":         normalize_spaces(get_first(p, "dirigeant")),
+        "interlocuteur":     normalize_spaces(get_first(p, "interlocuteur", "contact_name")),
+        "contact_civility":  get_first(p, "contact_civility"),
+        "contact_firstname": normalize_spaces(get_first(p, "contact_firstname", "firstname")),
+        "contact_lastname":  normalize_spaces(get_first(p, "contact_lastname", "lastname")),
+        "phone":             phone,
+        "phone2":            phone2,
+        "email":             email,
+        "website":           website,
+        "resume":            get_first(p, "resume", "meeting", "comment"),
+        "commande":          get_first(p, "commande", "order"),
+        "qualification":     get_first(p, "qualification"),
+        "card_photo_url":    get_first(p, "card_photo_url"),
+        "card_photo_file_id": get_first(p, "card_photo_file_id"),
+        "facade_photo_url":  get_first(p, "facade_photo_url"),
+        "facade_photo_file_id": get_first(p, "facade_photo_file_id"),
+        "_confidence":       int(p.get("_confidence") or record_score(p)),
+        "_source_type":      "prospect",
     }
 
     if d["phone"] and d["phone2"] and d["phone"] == d["phone2"]:
         d["phone2"] = ""
 
     d = ensure_contact_fallback(d)
-    d = normalize_row_address(d)
-    d = uppercase_business_fields(d)
+    return uppercase_fields(d)
+
+
+def unify_from_card(card: Dict[str, Any], date: str, img_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """Construit une ligne depuis un lot carte."""
+    if not img_bytes:
+        return None
+    fields = extract_card_fields(img_bytes)
+    if not fields:
+        return None
+    agency   = (card.get("agency") or "").upper()
+    initials = (card.get("user") or card.get("initials") or "").upper()
+    comment  = str(card.get("comment") or "").strip()
+    company  = normalize_spaces(fields.get("company") or "")
+    city     = normalize_spaces(fields.get("city") or "")
+    # Enrichissement Gouv + Places
+    gouv_results = search_gouv(f"{company} {city}".strip(), 1) if company else []
+    flat_gouv = gouv_to_flat(gouv_results[0]) if gouv_results else {}
+    enriched  = enrich_company(company or flat_gouv.get("name", ""), city or flat_gouv.get("city", ""), flat_gouv)
+    phones = extract_phones(
+        " ".join(filter(None, [fields.get("phone"), fields.get("phone2"), enriched.get("phone")]))
+    )
+    phone, phone2 = split_phones(phones)
+    d = {
+        "date":              date,
+        "agency":            agency,
+        "initials":          initials,
+        "name":              normalize_spaces(company or enriched.get("name") or ""),
+        "address":           strip_postal_city(
+                                 fields.get("address") or enriched.get("address") or "",
+                                 fields.get("postal_code") or enriched.get("postal_code") or "",
+                                 city or enriched.get("city") or "",
+                             ),
+        "postal_code":       normalize_cp(fields.get("postal_code") or enriched.get("postal_code") or ""),
+        "city":              normalize_spaces(city or enriched.get("city") or ""),
+        "siret":             validate_siret(enriched.get("siret") or ""),
+        "naf":               normalize_naf(enriched.get("naf") or ""),
+        "activity_summary":  normalize_spaces(enriched.get("activity_summary") or ""),
+        "effectif":          enriched.get("effectif") or "",
+        "date_creation":     enriched.get("date_creation") or "",
+        "capital":           enriched.get("capital") or "",
+        "dirigeant":         normalize_spaces(enriched.get("dirigeant") or ""),
+        "interlocuteur":     normalize_spaces(fields.get("name") or ""),
+        "contact_civility":  fields.get("contact_civility") or "",
+        "contact_firstname": "",
+        "contact_lastname":  "",
+        "phone":             phone,
+        "phone2":            phone2,
+        "email":             normalize_email(fields.get("email") or enriched.get("email") or ""),
+        "website":           fields.get("website") or enriched.get("website") or "",
+        "resume":            comment,
+        "commande":          "",
+        "qualification":     "",
+        "card_photo_url":    "",
+        "card_photo_file_id": card.get("file_id") or "",
+        "facade_photo_url":  "",
+        "facade_photo_file_id": "",
+        "_confidence":       0,
+        "_source_type":      "lot_card",
+    }
+    d = ensure_contact_fallback(d)
+    d = uppercase_fields(d)
+    d["_confidence"] = record_score(d)
+    if d["_confidence"] < 30:
+        logger.info("Carte ignorée (score %d < 30) : %s", d["_confidence"], d["name"])
+        return None
     return d
 
 
-def unify_from_card(date: str, agency: str, initials: str, comment: str, img_bytes: bytes) -> Dict[str, Any]:
-    base = {
-        "date": date, "agency": agency, "initials": initials,
-        "name": "", "address": "", "postal_code": "", "city": "",
-        "siret": "", "naf": "", "activity_summary": "", "dirigeant": "",
-        "interlocuteur": "", "contact_firstname": "", "contact_lastname": "",
-        "phone": "", "phone2": "", "email": "", "website": "",
-        "resume": (comment or "").strip(),
-        "commande": "",
-    }
+def unify_from_photo(photo: Dict[str, Any], date: str, img_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """Construit une ligne depuis un lot photo façade."""
     if not img_bytes:
-        return base
-
-    fields = extract_card_pipeline_fields(img_bytes)
+        return None
+    city_hint = normalize_spaces(photo.get("city") or "")
+    fields    = extract_facade_fields(img_bytes, city_hint)
     if not fields:
-        return base
-
-    row = dict(base)
-    row.update({
-        "name": fields.get("name", ""),
-        "address": fields.get("address", ""),
-        "postal_code": fields.get("postal_code", ""),
-        "city": fields.get("city", ""),
-        "siret": validate_siret(fields.get("siret", "")),
-        "naf": fields.get("naf", ""),
-        "activity_summary": fields.get("activity_summary", ""),
-        "dirigeant": fields.get("dirigeant", ""),
-        "interlocuteur": fields.get("interlocuteur", ""),
-        "contact_firstname": fields.get("contact_firstname", ""),
-        "contact_lastname": fields.get("contact_lastname", ""),
-        "phone": normalize_phone(fields.get("phone", "")),
-        "phone2": normalize_phone(fields.get("phone2", "")),
-        "email": clean_email(fields.get("email", "")) if is_valid_email(fields.get("email", "")) else "",
-        "website": fields.get("website", ""),
-    })
-
-    if row["phone"] and row["phone2"] and row["phone"] == row["phone2"]:
-        row["phone2"] = ""
-
-    row = ensure_contact_fallback(row)
-    row = normalize_row_address(row)
-    row = uppercase_business_fields(row)
-    return row
-
-
-def unify_from_photo(date: str, agency: str, initials: str, city_hint: str, comment: str, img_bytes: bytes) -> Dict[str, Any]:
-    base = {
-        "date": date, "agency": agency, "initials": initials,
-        "name": "", "address": "", "postal_code": "", "city": (city_hint or "").strip(),
-        "siret": "", "naf": "", "activity_summary": "", "dirigeant": "",
-        "interlocuteur": "", "contact_firstname": "", "contact_lastname": "",
-        "phone": "", "phone2": "", "email": "", "website": "",
-        "resume": (comment or "").strip(),
-        "commande": "",
+        return None
+    agency   = (photo.get("agency") or "").upper()
+    initials = (photo.get("user") or photo.get("initials") or "").upper()
+    comment  = str(photo.get("comment") or photo.get("meeting") or "").strip()
+    company  = normalize_spaces(fields.get("company") or "")
+    city     = normalize_spaces(fields.get("city") or city_hint)
+    if not company:
+        return None
+    gouv_results = search_gouv(f"{company} {city}".strip(), 1) if company else []
+    flat_gouv = gouv_to_flat(gouv_results[0]) if gouv_results else {}
+    enriched  = enrich_company(company or flat_gouv.get("name", ""), city or flat_gouv.get("city", ""), flat_gouv)
+    phone, phone2 = split_phones([
+        fields.get("phone") or "", enriched.get("phone") or "",
+    ])
+    d = {
+        "date":              date,
+        "agency":            agency,
+        "initials":          initials,
+        "name":              normalize_spaces(company or enriched.get("name") or ""),
+        "address":           strip_postal_city(
+                                 enriched.get("address") or "",
+                                 enriched.get("postal_code") or "",
+                                 city or enriched.get("city") or "",
+                             ),
+        "postal_code":       normalize_cp(enriched.get("postal_code") or ""),
+        "city":              normalize_spaces(city or enriched.get("city") or ""),
+        "siret":             validate_siret(enriched.get("siret") or ""),
+        "naf":               normalize_naf(enriched.get("naf") or ""),
+        "activity_summary":  normalize_spaces(fields.get("activity") or enriched.get("activity_summary") or ""),
+        "effectif":          enriched.get("effectif") or "",
+        "date_creation":     enriched.get("date_creation") or "",
+        "capital":           enriched.get("capital") or "",
+        "dirigeant":         normalize_spaces(enriched.get("dirigeant") or ""),
+        "interlocuteur":     "",
+        "contact_civility":  "",
+        "contact_firstname": "",
+        "contact_lastname":  "",
+        "phone":             phone,
+        "phone2":            phone2,
+        "email":             normalize_email(enriched.get("email") or ""),
+        "website":           fields.get("website") or enriched.get("website") or "",
+        "resume":            comment,
+        "commande":          "",
+        "qualification":     "",
+        "card_photo_url":    "",
+        "card_photo_file_id": "",
+        "facade_photo_url":  "",
+        "facade_photo_file_id": photo.get("file_id") or "",
+        "_confidence":       0,
+        "_source_type":      "lot_photo",
     }
-    if not img_bytes:
-        return base
-
-    cache_key = image_hash_bytes(img_bytes)
-    if cache_key in PHOTO_PIPELINE_CACHE:
-        row = dict(base)
-        row.update(dict(PHOTO_PIPELINE_CACHE[cache_key]))
-        row = ensure_contact_fallback(row)
-        row = normalize_row_address(row)
-        row = uppercase_business_fields(row)
-        return row
-
-    vis = gemini_extract_facade_logo(img_bytes) if GEMINI_API_KEY else {"company": "", "city": ""}
-    ocr_txt = ocr_image_bytes(img_bytes, light=not bool(vis.get("company")))
-    lines = clean_ocr_lines(ocr_txt)
-
-    company_raw = (vis.get("company") or "").strip()
-    city = (vis.get("city") or "").strip() or (city_hint or "").strip()
-
-    email_ocr = best_email("\n".join(lines))
-    urls_ocr = extract_urls("\n".join(lines))
-    phones_ocr = extract_all_phones("\n".join(lines))
-    local_addr_ocr, local_cp_ocr, local_city_ocr = extract_local_address_from_text("\n".join(lines))
-
-    website = (urls_ocr[0] if urls_ocr else "").strip()
-    phone, phone2 = split_phones_by_priority(phones_ocr)
-
-    if not city:
-        city = local_city_ocr
-
-    detected_company_line = detect_company_from_lines(
-        lines=lines,
-        gemini_company=company_raw,
-        website=website,
-        email=email_ocr
-    )
-
-    company_guess = extract_best_company_hint(
-        lines=lines,
-        gemini_company=company_raw,
-        website=website,
-        email=email_ocr
-    )
-
-    if not company_guess:
-        return base
-
-    gouv = search_gouv_company_ranked(
-        company_raw=company_guess,
-        email=email_ocr,
-        website=website,
-        city=city,
-        ocr_text="\n".join(lines),
-        address_hint=local_addr_ocr,
-        postal_code_hint=local_cp_ocr
-    )
-    if not gouv:
-        gouv = search_gouv_company(company_guess, city)
-
-    place = places_enrich(gouv.get("name") or company_guess, city) if GOOGLE_PLACES_API_KEY else {}
-    final_website = (website or place.get("website") or "").strip()
-    final_email = (email_ocr or "").strip().lower() or (scrape_email_from_site(final_website) if final_website else "")
-    final_email = clean_email(final_email) if is_valid_email(final_email) else ""
-
-    if not phone and place.get("phone"):
-        phone = normalize_phone(place.get("phone") or "")
-
-    final_name = choose_final_company_name(
-        gouv_name=(gouv.get("name") or "").strip(),
-        gemini_company=(company_raw or "").strip(),
-        detected_company_line=(detected_company_line or "").strip(),
-        person_name="",
-        website=final_website,
-        email=final_email,
-    )
-
-    row = dict(base)
-    row.update({
-        "name": final_name,
-        "address": strip_postal_city_from_address(
-            clean_address_candidate((local_addr_ocr or gouv.get("address") or place.get("address") or "").strip()),
-            local_cp_ocr or (gouv.get("postal_code") or ""),
-            local_city_ocr or (gouv.get("city") or city),
-        ),
-        "postal_code": (local_cp_ocr or gouv.get("postal_code") or "").strip(),
-        "city": (local_city_ocr or gouv.get("city") or city).strip(),
-        "siret": validate_siret((gouv.get("siret") or "").strip()),
-        "naf": (gouv.get("naf") or "").strip(),
-        "activity_summary": enrich_activity_summary(
-            name=final_name,
-            naf=(gouv.get("naf") or "").strip(),
-            website=final_website,
-            company_hint=company_raw
-        ),
-        "dirigeant": (gouv.get("dirigeant") or "").strip(),
-        "phone": phone,
-        "phone2": phone2,
-        "website": final_website,
-        "email": final_email,
-    })
-
-    if row["phone"] and row["phone2"] and row["phone"] == row["phone2"]:
-        row["phone2"] = ""
-
-    PHOTO_PIPELINE_CACHE[cache_key] = {
-        k: row.get(k, "") for k in [
-            "name", "address", "postal_code", "city", "siret", "naf", "activity_summary",
-            "dirigeant", "phone", "phone2", "website", "email"
-        ]
-    }
-
-    row = ensure_contact_fallback(row)
-    row = normalize_row_address(row)
-    row = uppercase_business_fields(row)
-    return row
+    d = ensure_contact_fallback(d)
+    d = uppercase_fields(d)
+    d["_confidence"] = record_score(d)
+    if d["_confidence"] < 32:
+        logger.info("Photo ignorée (score %d < 32) : %s", d["_confidence"], d["name"])
+        return None
+    return d
 
 
 # ============================================================
-# CARTES LIÉES / COMPAT HISTORIQUE / LOT -> PROSPECT
+# DÉDUPLICATION
 # ============================================================
 
-def safe_get(d: Dict[str, Any], *keys: str) -> Any:
-    for k in keys:
-        if k in d and d.get(k) not in (None, ""):
-            return d.get(k)
-    return ""
-
-
-def get_first_valid(d: Dict[str, Any], *keys: str) -> str:
-    for k in keys:
-        v = d.get(k)
-        if v is None:
-            continue
-        if isinstance(v, str):
-            if v.strip():
-                return v.strip()
-            continue
-        if isinstance(v, (int, float)):
-            return str(v).strip()
-    return ""
-
-
-def card_user_initials(card: Dict[str, Any]) -> str:
-    return (safe_get(card, "user", "initials") or "").upper().strip()
-
-
-def prospect_initials(prospect: Dict[str, Any]) -> str:
-    return (prospect.get("initials") or "").upper().strip()
-
-
-def card_link_key_candidates(card: Dict[str, Any]) -> List[str]:
-    out = []
-
-    for v in [
-        card.get("linked_prospect_key", ""),
-        card.get("card_kv_key", ""),
-        card.get("prospect_key", ""),
-    ]:
-        v = safe_strip(v)
-        if v and v not in out:
-            out.append(v)
-
-    linked_name = safe_strip(card.get("linked_prospect_name", ""))
-    if linked_name:
-        key = normalize_company_name(linked_name)
-        if key and key not in out:
-            out.append(key)
-
-    gem = card.get("gemini") or {}
-    g_company = safe_strip(gem.get("company", ""))
-    if g_company:
-        key = normalize_company_name(g_company)
-        if key and key not in out:
-            out.append(key)
-
-    comment = safe_strip(card.get("comment", ""))
-    if comment:
-        low = normalize_company_name(comment)
-        if low and len(low) >= 4 and low not in out:
-            out.append(low)
-
-    return out
-
-
-def prospect_link_key_candidates(p: Dict[str, Any]) -> List[str]:
-    out = []
-
-    for v in [
-        p.get("card_kv_key", ""),
-        p.get("prospect_key", ""),
-        p.get("linked_prospect_key", ""),
-    ]:
-        v = safe_strip(v)
-        if v and v not in out:
-            out.append(v)
-
-    n = normalize_company_name(p.get("name", "") or "")
-    if n and n not in out:
-        out.append(n)
-
-    return out
-
-
-def card_is_same_scope(card: Dict[str, Any], prospect: Dict[str, Any]) -> bool:
-    card_ag = (card.get("agency") or "").upper().strip()
-    pros_ag = (prospect.get("agency") or "").upper().strip()
-
-    card_ini = card_user_initials(card)
-    pros_ini = prospect_initials(prospect)
-
-    if card_ag and pros_ag and card_ag != pros_ag:
-        return False
-
-    if card_ini and pros_ini and card_ini != pros_ini:
-        return False
-
-    return True
-
-
-def card_prospect_proximity_score(card: Dict[str, Any], prospect: Dict[str, Any]) -> int:
+def _dup_score(target: Dict, existing: Dict) -> int:
     score = 0
-
-    if not card_is_same_scope(card, prospect):
-        return -999
-
-    ckeys = set(card_link_key_candidates(card))
-    pkeys = set(prospect_link_key_candidates(prospect))
-    if ckeys and pkeys and (ckeys & pkeys):
-        score += 80
-
-    linked_name = normalize_company_name(card.get("linked_prospect_name", "") or "")
-    pname = normalize_company_name(prospect.get("name", "") or "")
-    if linked_name and pname:
-        if linked_name == pname:
-            score += 35
-        elif linked_name in pname or pname in linked_name:
-            score += 20
-
-    card_g = card.get("gemini") or {}
-    card_company = normalize_company_name(card_g.get("company", "") or "")
-    if card_company and pname:
-        if card_company == pname:
-            score += 24
-        elif card_company in pname or pname in card_company:
-            score += 12
-
-    card_city = normalize_text(card_g.get("city", "") or card.get("city", "") or "")
-    pros_city = normalize_text(prospect.get("city", "") or "")
-    if card_city and pros_city:
-        if card_city == pros_city:
-            score += 8
-        elif card_city in pros_city or pros_city in card_city:
-            score += 4
-
-    return score
-
-
-def find_related_cards_for_prospect(prospect: Dict[str, Any], cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    matches: List[Tuple[int, Dict[str, Any]]] = []
-
-    for c in cards:
-        score = card_prospect_proximity_score(c, prospect)
-        if score >= 18:
-            matches.append((score, c))
-
-    matches.sort(key=lambda x: x[0], reverse=True)
-
-    out = []
-    seen = set()
-    for score, c in matches:
-        key = f"{c.get('file_id','')}|{c.get('ts','')}|{c.get('linked_prospect_key','')}"
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(c)
-
-    return out
-
-
-def confidence_score_card_row(row: Dict[str, Any]) -> int:
-    score = 0
-    if safe_strip(row.get("name", "")):
+    ts = validate_siret(target.get("siret") or "")
+    es = validate_siret(existing.get("siret") or "")
+    if ts and es and ts == es:
+        score += 100
+    tn = normalize_for_match(target.get("name") or "")
+    en = normalize_for_match(existing.get("name") or "")
+    if tn and en and tn == en:
+        score += 40
+    elif tn and en and (tn in en or en in tn):
         score += 25
-    if safe_strip(row.get("city", "")):
-        score += 10
-    if normalize_cp(row.get("postal_code", "")):
-        score += 8
-    if safe_strip(row.get("address", "")):
-        score += 8
-    if validate_siret(row.get("siret", "")):
-        score += 20
-    if safe_strip(row.get("interlocuteur", "")):
-        score += 10
-    if is_valid_email(row.get("email", "")):
-        score += 8
-    if normalize_phone(row.get("phone", "")) or normalize_phone(row.get("phone2", "")):
-        score += 6
-    if safe_strip(row.get("website", "")):
-        score += 5
+    tc = normalize_for_match(target.get("city") or "")
+    ec = normalize_for_match(existing.get("city") or "")
+    if tc and ec and tc == ec:
+        score += 15
+    tp, ep = normalize_phone(target.get("phone") or ""), normalize_phone(existing.get("phone") or "")
+    if tp and ep and tp == ep:
+        score += 16
+    tm, em = normalize_email(target.get("email") or ""), normalize_email(existing.get("email") or "")
+    if tm and em and tm == em:
+        score += 24
     return score
 
 
-def confidence_score_photo_row(row: Dict[str, Any]) -> int:
-    score = 0
-    if safe_strip(row.get("name", "")):
-        score += 30
-    if safe_strip(row.get("city", "")):
-        score += 12
-    if validate_siret(row.get("siret", "")):
-        score += 20
-    if safe_strip(row.get("address", "")):
-        score += 10
-    if is_valid_email(row.get("email", "")):
-        score += 6
-    if normalize_phone(row.get("phone", "")):
-        score += 6
-    if safe_strip(row.get("website", "")):
-        score += 6
-    return score
+def _dedup_key(r: Dict) -> str:
+    siret = validate_siret(r.get("siret") or "")
+    if siret:
+        return f"SIRET|{siret}"
+    name = normalize_for_match(r.get("name") or "")
+    city = normalize_for_match(r.get("city") or "")
+    cp   = normalize_cp(r.get("postal_code") or "")
+    if name and city and cp:
+        return f"NCP|{name}|{city}|{cp}"
+    if name and city:
+        return f"NC|{name}|{city}"
+    email = normalize_email(r.get("email") or "")
+    if email:
+        return f"EMAIL|{email}"
+    return ""
 
 
-def unify_from_prospect_with_linked_cards(p: Dict[str, Any], cards: List[Dict[str, Any]]) -> Dict[str, Any]:
-    row = unify_from_prospect(p)
-
-    # 1. priorité à la carte directement portée par le prospect
-    direct_card_file_id = safe_strip(p.get("card_photo_file_id", ""))
-    if direct_card_file_id:
-        try:
-            img = tg_download_file(direct_card_file_id)
-        except Exception:
-            img = b""
-        if img:
-            STATS["linked_cards_processed"] += 1
-            row = merge_card_into_prospect_row(row, img)
-            log_fusion("prospect_direct_card_photo_file_id", {
-                "prospect_name": p.get("name", ""),
-                "agency": p.get("agency", ""),
-                "initials": p.get("initials", ""),
-            })
-
-    # 2. fallback historique / KV / rapprochement
-    related_cards = find_related_cards_for_prospect(p, cards)
-    if related_cards:
-        for c in related_cards:
-            fid = c.get("file_id") or ""
-            if not fid:
-                continue
-            try:
-                img = tg_download_file(fid)
-            except Exception:
-                img = b""
-            if not img:
-                continue
-            STATS["linked_cards_processed"] += 1
-            row = merge_card_into_prospect_row(row, img)
-
-        log_fusion("prospect_related_cards", {
-            "prospect_name": p.get("name", ""),
-            "cards_count": len(related_cards),
-            "agency": p.get("agency", ""),
-            "initials": p.get("initials", ""),
-        })
-    else:
-        STATS["linked_cards_missing"] += 1
-
-    # ne jamais écraser les champs terrain
-    row["resume"] = p.get("resume", "") or row.get("resume", "")
-    row["commande"] = p.get("commande", "") or row.get("commande", "")
-
-    row = ensure_contact_fallback(row)
-    row = normalize_row_address(row)
-    row = uppercase_business_fields(row)
-    return row
-
-
-def standalone_cards(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out = []
-    for c in cards:
-        if is_linked_prospect_card(c):
+def _merge_rows(primary: Dict, secondary: Dict) -> Dict:
+    merged = dict(primary)
+    protected = {"resume", "commande", "qualification"}
+    for k, v2 in secondary.items():
+        if k.startswith("_"):
             continue
-        out.append(c)
+        v1 = str(merged.get(k) or "").strip()
+        v2s = str(v2 or "").strip()
+        if k in protected and v1:
+            continue
+        if not v1 and v2s:
+            merged[k] = v2
+        elif v1 and v2s:
+            if k == "email" and is_valid_email(v2s) and not is_valid_email(v1):
+                merged[k] = v2
+            elif k == "siret" and validate_siret(v2s) and not validate_siret(v1):
+                merged[k] = v2
+            elif k in ("address", "interlocuteur") and len(v2s) > len(v1):
+                merged[k] = v2
+    merged["_confidence"] = record_score(merged)
+    return ensure_contact_fallback(merged)
+
+
+def deduplicate(rows: List[Dict]) -> List[Dict]:
+    if not rows:
+        return []
+    buckets: Dict[str, List[Dict]] = {}
+    loose:   List[Dict] = []
+    for r in rows:
+        key = _dedup_key(r)
+        if key:
+            buckets.setdefault(key, []).append(r)
+        else:
+            loose.append(r)
+    merged_groups: List[Dict] = []
+    for group in buckets.values():
+        consumed = [False] * len(group)
+        for i in range(len(group)):
+            if consumed[i]:
+                continue
+            base = dict(group[i])
+            consumed[i] = True
+            for j in range(i + 1, len(group)):
+                if consumed[j]:
+                    continue
+                if _dup_score(base, group[j]) >= 28:
+                    base = _merge_rows(base, group[j])
+                    consumed[j] = True
+                    STATS["dedupe_merged"] += 1
+            merged_groups.append(base)
+    out = list(merged_groups)
+    for r in loose:
+        attached = False
+        for idx, ex in enumerate(out):
+            if _dup_score(r, ex) >= 34:
+                out[idx] = _merge_rows(ex, r)
+                STATS["dedupe_merged"] += 1
+                attached = True
+                break
+        if not attached:
+            out.append(r)
     return out
 
 
-def promote_card_lot_to_prospect(card: Dict[str, Any], date: str) -> Optional[Dict[str, Any]]:
-    fid = card.get("file_id") or ""
-    if not fid:
-        return None
+# ============================================================
+# CONSOLIDATION
+# ============================================================
 
-    try:
-        img = tg_download_file(fid)
-    except Exception:
-        img = b""
-    if not img:
-        return None
-
-    agency = (card.get("agency") or "").upper().strip()
-    initials = card_user_initials(card)
-    comment = safe_strip(card.get("comment", ""))
-
-    row = unify_from_card(date, agency, initials, comment, img)
-    score = confidence_score_card_row(row)
-    row["_confidence"] = score
-    row["_source_type"] = "lot_card"
-
-    if score < 30:
-        return None
-
-    STATS["lot_cards_promoted"] += 1
-    log_fusion("promote_card_lot_to_prospect", {
-        "name": row.get("name", ""),
-        "city": row.get("city", ""),
-        "confidence": score,
-        "agency": agency,
-        "initials": initials,
-    })
-    return row
-
-
-def promote_photo_lot_to_prospect(photo: Dict[str, Any], date: str) -> Optional[Dict[str, Any]]:
-    fid = photo.get("file_id") or ""
-    if not fid:
-        return None
-
-    try:
-        img = tg_download_file(fid)
-    except Exception:
-        img = b""
-    if not img:
-        return None
-
-    agency = (photo.get("agency") or "").upper().strip()
-    initials = (safe_get(photo, "user", "initials") or "").upper().strip()
-    city_hint = photo.get("city") or ""
-    comment = safe_strip(photo.get("comment") or photo.get("meeting") or "")
-
-    row = unify_from_photo(date, agency, initials, city_hint, comment, img)
-    score = confidence_score_photo_row(row)
-    row["_confidence"] = score
-    row["_source_type"] = "lot_photo"
-
-    if score < 32:
-        return None
-
-    STATS["lot_photos_promoted"] += 1
-    log_fusion("promote_photo_lot_to_prospect", {
-        "name": row.get("name", ""),
-        "city": row.get("city", ""),
-        "confidence": score,
-        "agency": agency,
-        "initials": initials,
-    })
-    return row
-
-
-def consolidate_rows_for_send_mode(
+def consolidate(
     date: str,
-    prospects: List[Dict[str, Any]],
-    photos: List[Dict[str, Any]],
-    cards: List[Dict[str, Any]],
+    prospects: List[Dict],
+    photos: List[Dict],
+    cards: List[Dict],
     agency_filter: str = "",
     initials_filter: str = "",
-) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
+) -> List[Dict]:
+    agency_filter   = agency_filter.upper().strip()
+    initials_filter = initials_filter.upper().strip()
 
-    agency_filter = (agency_filter or "").upper().strip()
-    initials_filter = (initials_filter or "").upper().strip()
+    def match_agency(r: Dict) -> bool:
+        ag = str(r.get("agency") or "").upper()
+        return not agency_filter or ag == agency_filter
 
-    filtered_prospects = []
+    def match_initials(r: Dict) -> bool:
+        ini = str(r.get("initials") or r.get("user") or "").upper()
+        return not initials_filter or ini == initials_filter
+
+    rows: List[Dict] = []
+
+    # 1. Prospects existants enrichis
     for p in prospects:
-        p_ag = (p.get("agency") or "").upper().strip()
-        p_ini = prospect_initials(p)
-
-        if agency_filter and p_ag != agency_filter:
+        if not match_agency(p) or not match_initials(p):
             continue
-        if initials_filter and p_ini != initials_filter:
+        rows.append(unify_prospect(p))
+
+    # 2. Lots cartes (standalone — pas liés à un prospect existant)
+    prospect_card_ids = {
+        str(p.get("card_photo_file_id") or "") for p in prospects
+        if p.get("card_photo_file_id")
+    }
+    standalone_cards = [
+        c for c in cards
+        if match_agency(c) and match_initials(c)
+        and str(c.get("file_id") or "") not in prospect_card_ids
+    ][:MAX_OCR_IMAGES]
+
+    for card in standalone_cards:
+        fid = card.get("file_id") or ""
+        if not fid:
             continue
-        filtered_prospects.append(p)
-
-    filtered_photos = []
-    for ph in photos:
-        ph_ag = (ph.get("agency") or "").upper().strip()
-        ph_ini = (safe_get(ph, "user", "initials") or "").upper().strip()
-
-        if agency_filter and ph_ag != agency_filter:
+        try:
+            img = tg_download(fid)
+        except Exception as e:
+            logger.warning("Téléchargement carte %s : %s", fid, e)
             continue
-        if initials_filter and ph_ini != initials_filter:
-            continue
-        filtered_photos.append(ph)
-
-    filtered_cards = []
-    for ca in cards:
-        ca_ag = (ca.get("agency") or "").upper().strip()
-        ca_ini = card_user_initials(ca)
-
-        if agency_filter and ca_ag != agency_filter:
-            continue
-        if initials_filter and ca_ini != initials_filter:
-            continue
-        filtered_cards.append(ca)
-
-    # prospects enrichis par cartes liées
-    for p in filtered_prospects:
-        row = unify_from_prospect_with_linked_cards(p, filtered_cards)
-        rows.append(row)
-
-    # lots standalone cartes
-    for c in standalone_cards(filtered_cards)[:MAX_OCR_IMAGES]:
-        row = promote_card_lot_to_prospect(c, date)
+        row = unify_from_card(card, date, img)
         if row:
             rows.append(row)
 
-    # lots façades
-    for ph in filtered_photos[:MAX_PHOTO_IMAGES]:
-        row = promote_photo_lot_to_prospect(ph, date)
+    # 3. Lots photos façades
+    prospect_photo_ids = {
+        str(p.get("facade_photo_file_id") or "") for p in prospects
+        if p.get("facade_photo_file_id")
+    }
+    standalone_photos = [
+        ph for ph in photos
+        if match_agency(ph) and match_initials(ph)
+        and str(ph.get("file_id") or "") not in prospect_photo_ids
+    ][:MAX_PHOTO_IMAGES]
+
+    for photo in standalone_photos:
+        fid = photo.get("file_id") or ""
+        if not fid:
+            continue
+        try:
+            img = tg_download(fid)
+        except Exception as e:
+            logger.warning("Téléchargement photo %s : %s", fid, e)
+            continue
+        row = unify_from_photo(photo, date, img)
         if row:
             rows.append(row)
 
-    # nettoyage final
-    out = []
+    # Nettoyage + déduplication
+    rows = [r for r in rows if any(str(v or "").strip() for v in r.values())]
     for r in rows:
-        if not any(str(v or "").strip() for v in r.values()):
-            continue
-
-        r["date"] = r.get("date") or date
-        r["agency"] = (r.get("agency") or agency_filter or "").upper()
+        r["date"]    = r.get("date") or date
+        r["agency"]  = (r.get("agency") or agency_filter or "").upper()
         r["initials"] = (r.get("initials") or initials_filter or "").upper()
 
-        r = ensure_contact_fallback(r)
-        r = normalize_row_address(r)
-        r = uppercase_business_fields(r)
+    rows = deduplicate(rows)
 
-        out.append(r)
-
-    out = dedupe_rows(out)
-    return out
+    # Tri par score décroissant
+    rows.sort(key=lambda r: r.get("_confidence", 0), reverse=True)
+    STATS["rows_exported"] += len(rows)
+    return rows
 
 
 # ============================================================
-# EXCEL
+# RÉSUMÉ MANAGER TELEGRAM (si MANAGER_CHAT_ID configuré)
 # ============================================================
 
-def to_row(d: Dict[str, Any]) -> List[Any]:
-    return [d.get(h, "") for h in HEADERS]
-
-
-def build_excel_one_sheet(date: str, rows: List[Dict[str, Any]], suffix: str) -> str:
-    rows = dedupe_rows(rows)
-    rows_sorted = sorted(rows, key=lambda x: (record_score(x), int(x.get("_confidence", 0))), reverse=True)
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "DATA"
-    ws.append(HEADERS)
-
-    for r in rows_sorted:
-        ws.append(to_row(r))
-
-    for c in range(1, len(HEADERS) + 1):
-        cell = ws.cell(row=1, column=c)
-        cell.font = Font(bold=True)
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    ws.freeze_panes = "A2"
-    autosize(ws)
-
-    filename = os.path.join(OUT_DIR, f"PROSPECTION_{date}_{suffix}.xlsx")
-    wb.save(filename)
-    return filename
-
-
-# ============================================================
-# MEDIA ZIP
-# ============================================================
-
-def build_media_zip(
+def build_manager_summary(
     date: str,
-    agency: str,
-    initials: str,
-    photos: List[Dict[str, Any]],
-    cards: List[Dict[str, Any]]
-) -> Optional[Tuple[str, bytes]]:
-    agency = (agency or "").upper().strip()
-    initials = (initials or "").upper().strip()
-
-    photos_u = [
-        p for p in photos
-        if (p.get("agency") or "").upper() == agency
-        and (safe_get(p, "user", "initials") or "").upper().strip() == initials
-    ]
-    cards_u = [
-        c for c in cards
-        if (c.get("agency") or "").upper() == agency
-        and card_user_initials(c) == initials
-    ]
-
-    if not photos_u and not cards_u:
-        return None
-
-    photos_u = photos_u[:MAX_PHOTO_IMAGES]
-    cards_u = cards_u[:MAX_OCR_IMAGES]
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        lines = ["type;file;date;agency;initials;city;comment;geo_lat;geo_lon"]
-
-        for i, p in enumerate(photos_u, start=1):
-            fid = p.get("file_id") or ""
-            try:
-                img = tg_download_file(fid) if fid else b""
-            except Exception:
-                img = b""
-            if not img:
-                continue
-
-            fname = f"photos/{date}_{agency}_{initials}_{i:02d}.jpg"
-            z.writestr(fname, img)
-            geo = p.get("geo") or {}
-            comment = p.get("comment") or p.get("meeting") or ""
-            lines.append(
-                f"photo;{fname};{date};{agency};{initials};{(p.get('city') or '')};"
-                f"{comment};{geo.get('lat') or ''};{geo.get('lon') or ''}"
+    rows_by_agency: Dict[str, List[Dict]],
+    close_by_agency: Dict[str, List[Dict]],
+) -> str:
+    lines = [f"📊 <b>Bilan prospection — {date}</b>", ""]
+    total_all = 0
+    for agency in sorted(rows_by_agency.keys()):
+        rows = rows_by_agency[agency]
+        if not rows:
+            continue
+        by_ini: Dict[str, List] = {}
+        for r in rows:
+            ini = str(r.get("initials") or "?")
+            by_ini.setdefault(ini, []).append(r)
+        lines.append(f"🏷️ <b>{agency}</b>")
+        total_agency = 0
+        for ini, ini_rows in sorted(by_ini.items()):
+            hot  = sum(1 for r in ini_rows if r.get("qualification") == "chaud")
+            warm = sum(1 for r in ini_rows if r.get("qualification") == "tiede")
+            cold = sum(1 for r in ini_rows if r.get("qualification") == "froid")
+            total = len(ini_rows)
+            total_agency += total
+            closed = any(
+                str(c.get("initials") or "").upper() == ini
+                for c in close_by_agency.get(agency, [])
             )
+            close_icon = "✅" if closed else "⚠️ pas de clôture"
+            lines.append(
+                f"  👤 {ini} : {total} fiche(s) · "
+                f"{hot} 🔥 · {warm} 📅 · {cold} ❄️ — {close_icon}"
+            )
+        lines.append(f"  Total agence : <b>{total_agency}</b>")
+        total_all += total_agency
+    lines += ["", f"<b>Total global : {total_all} nouveaux prospects</b>",
+              "Export CRM : ✅ déclenché"]
+    return "\n".join(lines)
 
-        for i, c in enumerate(cards_u, start=1):
-            fid = c.get("file_id") or ""
-            try:
-                img = tg_download_file(fid) if fid else b""
-            except Exception:
-                img = b""
-            if not img:
-                continue
 
-            fname = f"cards/{date}_{agency}_{initials}_{i:02d}.jpg"
-            z.writestr(fname, img)
-            lines.append(f"card;{fname};{date};{agency};{initials};;{(c.get('comment') or '')};;")
-
-        z.writestr("index.csv", ("\n".join(lines)).encode("utf-8"))
-
-    zip_name = f"MEDIA_{date}_{agency}_{initials}.zip"
-    return zip_name, buf.getvalue()
+def send_telegram_summary(chat_id: str, text: str) -> bool:
+    if not TELEGRAM_TOKEN or not chat_id:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+            timeout=15,
+        )
+        return r.status_code == 200
+    except Exception as e:
+        logger.warning("Envoi résumé Telegram : %s", e)
+        return False
 
 
 # ============================================================
 # BREVO EMAIL
 # ============================================================
 
-def brevo_send_email(
+def brevo_send(
     to_email: str,
     subject: str,
     html: str,
-    attachments: Optional[List[Tuple[str, bytes]]] = None
-):
+    attachments: Optional[List[Tuple[str, bytes]]] = None,
+) -> None:
     if not BREVO_API_KEY:
-        raise RuntimeError("BREVO_API_KEY missing")
+        raise RuntimeError("BREVO_API_KEY manquant")
     to_email = clean_email(to_email)
     if not is_valid_email(to_email):
-        raise RuntimeError(f"Invalid recipient email: '{to_email}'")
-
-    payload = {
-        "sender": {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
-        "to": [{"email": to_email}],
-        "subject": subject,
+        raise ValueError(f"Email destinataire invalide : '{to_email}'")
+    payload: Dict[str, Any] = {
+        "sender":      {"name": BREVO_SENDER_NAME, "email": BREVO_SENDER_EMAIL},
+        "to":          [{"email": to_email}],
+        "subject":     subject,
         "htmlContent": html,
     }
-
     if attachments:
-        payload["attachment"] = []
-        for filename, content in attachments:
-            payload["attachment"].append({
-                "name": filename,
-                "content": base64.b64encode(content).decode("ascii")
-            })
-
+        payload["attachment"] = [
+            {"name": name, "content": base64.b64encode(content).decode("ascii")}
+            for name, content in attachments
+        ]
     r = requests.post(
         "https://api.brevo.com/v3/smtp/email",
         headers={
             "accept": "application/json",
             "api-key": BREVO_API_KEY,
-            "content-type": "application/json"
+            "content-type": "application/json",
         },
         data=json.dumps(payload),
-        timeout=60
+        timeout=60,
     )
     if r.status_code >= 300:
-        raise RuntimeError(f"Brevo send failed {r.status_code}: {r.text[:400]}")
+        raise RuntimeError(f"Brevo {r.status_code}: {r.text[:300]}")
     STATS["emails_sent"] += 1
+    logger.info("Email envoyé à %s", to_email)
+
+
+def _email_html(title: str, body_lines: List[str]) -> str:
+    body = "".join(f"<p>{line}</p>" for line in body_lines)
+    return (
+        f"<html><body style='font-family:Arial,sans-serif'>"
+        f"<h2>{title}</h2>{body}"
+        f"<hr><p style='color:#888;font-size:12px'>Bot Prospection — export automatique</p>"
+        f"</body></html>"
+    )
 
 
 # ============================================================
@@ -3113,192 +1560,181 @@ def send_individual_pack(
     date: str,
     agency: str,
     initials: str,
-    prospects: List[Dict[str, Any]],
-    photos: List[Dict[str, Any]],
-    cards: List[Dict[str, Any]]
-):
+    prospects: List[Dict],
+    photos: List[Dict],
+    cards: List[Dict],
+) -> None:
     to_email = email_for_initials(initials)
     if not to_email:
-        print(f"[WARN] No email for initials={initials}, skip individual pack.")
+        logger.warning("Pas d'email pour initiales=%s, skip", initials)
         return
 
-    initials = initials.upper().strip()
-    agency = agency.upper().strip()
-
-    rows = consolidate_rows_for_send_mode(
-        date=date,
-        prospects=prospects,
-        photos=photos,
-        cards=cards,
-        agency_filter=agency,
-        initials_filter=initials,
-    )
+    rows = consolidate(date, prospects, photos, cards,
+                       agency_filter=agency, initials_filter=initials)
     rows = [r for r in rows if any(str(v or "").strip() for v in r.values())]
-
     if not rows:
-        print(f"[INFO] No rows for {agency}/{initials}, skip.")
+        logger.info("Aucune ligne pour %s/%s", agency, initials)
         return
 
-    xlsx = build_excel_one_sheet(date, rows, f"INDIV_{agency}_{initials}")
+    path_xlsx, path_xls = export_commercial(date, agency, initials, rows, OUT_DIR)
+    attachments = build_email_attachments(path_xlsx, path_xls)
 
-    attachments: List[Tuple[str, bytes]] = []
-    with open(xlsx, "rb") as f:
-        attachments.append((os.path.basename(xlsx), f.read()))
-
-    media = build_media_zip(date, agency, initials, photos, cards)
-    if media:
-        attachments.append(media)
-
-    subject = f"Prospection {date} — {agency}/{initials} (Excel + médias)"
-    html = (
-        f"<p>Bonjour,</p>"
-        f"<p>Voici ton export de prospection du <b>{date}</b> pour <b>{agency}/{initials}</b>.</p>"
-        f"<ul>"
-        f"<li><b>Excel</b> consolidé, trié par complétude</li>"
-        f"<li><b>ZIP médias</b> (photos + cartes)</li>"
-        f"</ul>"
-        f"<p>— Bot Prospection</p>"
+    qualifs = {
+        "chaud": sum(1 for r in rows if r.get("qualification") == "chaud"),
+        "tiede": sum(1 for r in rows if r.get("qualification") == "tiede"),
+        "froid": sum(1 for r in rows if r.get("qualification") == "froid"),
+    }
+    html = _email_html(
+        f"Prospection {date} — {agency}/{initials}",
+        [
+            f"Bonjour,",
+            f"Voici ton export de prospection du <b>{date}</b> pour <b>{agency}/{initials}</b>.",
+            f"<b>{len(rows)}</b> fiche(s) : "
+            f"{qualifs['chaud']} 🔥 chaud · {qualifs['tiede']} 📅 tiède · {qualifs['froid']} ❄️ froid",
+            "Pièces jointes : <b>Excel consultation</b> (xlsx) + <b>Excel import CRM</b> (xls)",
+        ],
     )
+    brevo_send(to_email, f"Prospection {date} — {agency}/{initials}", html, attachments)
+    logger.info("Pack individuel envoyé → %s (%s/%s, %d fiches)", to_email, agency, initials, len(rows))
 
-    brevo_send_email(to_email, subject, html, attachments=attachments)
-    print(f"[OK] individual pack sent to {to_email} ({agency}/{initials})")
 
-
-def send_agency_manager_pack(
+def send_agency_pack(
     date: str,
     agency: str,
-    prospects: List[Dict[str, Any]],
-    photos: List[Dict[str, Any]],
-    cards: List[Dict[str, Any]]
-):
-    agencies_cfg = ROUTING.get("agencies") or {}
-    cfg = agencies_cfg.get(agency) or {}
+    prospects: List[Dict],
+    photos: List[Dict],
+    cards: List[Dict],
+) -> List[Dict]:
+    agencies_cfg = (ROUTING.get("agencies") or {})
+    cfg     = agencies_cfg.get(agency) or {}
     manager = (cfg.get("manager") or {})
     to_email = clean_email(manager.get("email") or "")
     if not is_valid_email(to_email):
-        print(f"[WARN] No valid manager email for agency={agency} ({to_email})")
-        return
+        logger.warning("Pas d'email manager pour agence=%s", agency)
+        return []
 
-    rows = consolidate_rows_for_send_mode(
-        date=date,
-        prospects=prospects,
-        photos=photos,
-        cards=cards,
-        agency_filter=agency,
-        initials_filter="",
-    )
+    rows = consolidate(date, prospects, photos, cards, agency_filter=agency)
     rows = [r for r in rows if any(str(v or "").strip() for v in r.values())]
-
     if not rows:
-        print(f"[INFO] No rows for agency={agency}, skip manager mail.")
-        return
+        logger.info("Aucune ligne pour agence=%s", agency)
+        return rows
 
-    xlsx = build_excel_one_sheet(date, rows, f"AGENCE_{agency}")
+    path_xlsx, path_xls = export_agency_manager(date, agency, rows, OUT_DIR)
+    attachments = build_email_attachments(path_xlsx, path_xls)
 
-    with open(xlsx, "rb") as f:
-        attachments = [(os.path.basename(xlsx), f.read())]
-
-    html = (
-        f"<p>Bonjour,</p>"
-        f"<p>Voici le consolidé de prospection du <b>{date}</b> pour l’agence <b>{agency}</b>.</p>"
-        f"<p>— Bot Prospection</p>"
+    html = _email_html(
+        f"Prospection {date} — Agence {agency}",
+        [
+            "Bonjour,",
+            f"Voici le consolidé de prospection du <b>{date}</b> pour l'agence <b>{agency}</b>.",
+            f"<b>{len(rows)}</b> fiche(s) au total.",
+        ],
     )
-
-    brevo_send_email(
-        to_email,
-        f"Prospection {date} — Agence {agency} (consolidé)",
-        html,
-        attachments=attachments
-    )
-    print(f"[OK] agency manager pack sent to {to_email} (agency={agency})")
+    brevo_send(to_email, f"Prospection {date} — Agence {agency}", html, attachments)
+    logger.info("Pack agence envoyé → %s (%s, %d fiches)", to_email, agency, len(rows))
+    return rows
 
 
 def send_admin_pack(
     date: str,
-    prospects: List[Dict[str, Any]],
-    photos: List[Dict[str, Any]],
-    cards: List[Dict[str, Any]]
-):
-    admin = ROUTING.get("admin") or {}
+    prospects: List[Dict],
+    photos: List[Dict],
+    cards: List[Dict],
+    rows_by_agency: Optional[Dict[str, List[Dict]]] = None,
+    close_by_agency: Optional[Dict[str, List[Dict]]] = None,
+) -> None:
+    admin    = ROUTING.get("admin") or {}
     to_email = clean_email(admin.get("email") or "")
     if not is_valid_email(to_email):
-        print(f"[WARN] No valid admin email configured ({to_email})")
+        logger.warning("Pas d'email admin configuré")
         return
 
-    rows = consolidate_rows_for_send_mode(
-        date=date,
-        prospects=prospects,
-        photos=photos,
-        cards=cards,
-        agency_filter="",
-        initials_filter="",
-    )
-    rows = [r for r in rows if any(str(v or "").strip() for v in r.values())]
-
-    if not rows:
-        print(f"[INFO] No rows for admin date={date}, skip.")
+    all_rows = consolidate(date, prospects, photos, cards)
+    all_rows = [r for r in all_rows if any(str(v or "").strip() for v in r.values())]
+    if not all_rows:
+        logger.info("Aucune ligne pour admin date=%s", date)
         return
 
-    xlsx = build_excel_one_sheet(date, rows, "ADMIN_ALL")
+    path_xlsx, path_xls = export_admin(date, all_rows, OUT_DIR)
+    attachments = build_email_attachments(path_xlsx, path_xls)
 
-    with open(xlsx, "rb") as f:
-        attachments = [(os.path.basename(xlsx), f.read())]
-
-    html = (
-        f"<p>Bonjour,</p>"
-        f"<p>Consolidé global de prospection du <b>{date}</b> pour toutes les agences.</p>"
-        f"<p>— Bot Prospection</p>"
-    )
-
-    brevo_send_email(
-        to_email,
+    html = _email_html(
         f"Prospection {date} — ADMIN (toutes agences)",
-        html,
-        attachments=attachments
+        [
+            "Bonjour,",
+            f"Voici le consolidé global de prospection du <b>{date}</b> pour toutes les agences.",
+            f"<b>{len(all_rows)}</b> fiche(s) au total.",
+            "Pièces jointes : Excel multi-onglets (xlsx) + Excel import CRM (xls)",
+        ],
     )
-    print(f"[OK] admin pack sent to {to_email}")
+    brevo_send(to_email, f"Prospection {date} — ADMIN", html, attachments)
+    logger.info("Pack admin envoyé → %s (%d fiches)", to_email, len(all_rows))
+
+    # Résumé Telegram manager général
+    manager_chat_id = env_str("MANAGER_CHAT_ID", "")
+    if manager_chat_id and rows_by_agency and close_by_agency is not None:
+        summary = build_manager_summary(date, rows_by_agency, close_by_agency)
+        if send_telegram_summary(manager_chat_id, summary):
+            logger.info("Résumé Telegram envoyé → chat_id %s", manager_chat_id)
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
+def main() -> None:
     if not WORKER_BASE_URL or not EXPORT_TOKEN or not TELEGRAM_TOKEN:
-        raise RuntimeError("Missing WORKER_BASE_URL / EXPORT_TOKEN / TELEGRAM_TOKEN")
+        raise RuntimeError("Variables manquantes : WORKER_BASE_URL / EXPORT_TOKEN / TELEGRAM_TOKEN")
 
-    run_date = RUN_DATE if RUN_DATE else paris_ymd_fallback()
+    date = RUN_DATE or paris_today()
+    logger.info("🚀 export_and_mail.py v2.0 — mode=%s date=%s agency=%s initials=%s",
+                SEND_MODE, date, AGENCY, INITIALS)
+    logger.info("📦 OUT_DIR=%s | Gemini=%s | Places=%s",
+                OUT_DIR, "ON" if GEMINI_API_KEY else "OFF",
+                "ON" if GOOGLE_PLACES_API_KEY else "OFF")
 
-    print(f"🚀 export_and_mail.py — mode={SEND_MODE} date={run_date} agency={AGENCY} initials={INITIALS}")
-    print(f"📦 OUT_DIR={OUT_DIR}")
-    print(f"🔑 Gemini={'ON' if GEMINI_API_KEY else 'OFF'} | Places={'ON' if GOOGLE_PLACES_API_KEY else 'OFF'}")
+    # Dump KV
+    prospects = worker_dump("prospects", date)
+    photos    = worker_dump("photos",    date)
+    cards     = worker_dump("cards",     date)
+    closes    = worker_dump("closes",    date)
 
-    prospects = worker_dump("prospects", run_date)
-    photos = worker_dump("photos", run_date)
-    cards = worker_dump("cards", run_date)
-
+    # ── Mode individual ───────────────────────────────
     if SEND_MODE == "individual":
         if AGENCY not in VALID_AGENCIES:
-            raise RuntimeError("AGENCY required (GR|VR|GRS|SLS) for mode=individual")
+            raise RuntimeError(f"AGENCY requis (GR|VR|GRS|SLS) pour mode=individual — reçu : '{AGENCY}'")
         if not INITIALS:
-            raise RuntimeError("INITIALS required for mode=individual")
-
-        send_individual_pack(run_date, AGENCY, INITIALS, prospects, photos, cards)
-        print(json.dumps(STATS, ensure_ascii=False))
+            raise RuntimeError("INITIALS requis pour mode=individual")
+        send_individual_pack(date, AGENCY, INITIALS, prospects, photos, cards)
+        logger.info("📊 Stats : %s", json.dumps(STATS, ensure_ascii=False))
         return
 
+    # ── Mode agency_manager ───────────────────────────
     if SEND_MODE == "agency_manager":
-        for ag in sorted(VALID_AGENCIES):
-            send_agency_manager_pack(run_date, ag, prospects, photos, cards)
-        print(json.dumps(STATS, ensure_ascii=False))
+        agency = AGENCY if AGENCY in VALID_AGENCIES else None
+        targets = [agency] if agency else sorted(VALID_AGENCIES)
+        for ag in targets:
+            send_agency_pack(date, ag, prospects, photos, cards)
+        logger.info("📊 Stats : %s", json.dumps(STATS, ensure_ascii=False))
         return
 
+    # ── Mode admin ────────────────────────────────────
     if SEND_MODE == "admin":
-        send_admin_pack(run_date, prospects, photos, cards)
-        print(json.dumps(STATS, ensure_ascii=False))
+        rows_by_agency: Dict[str, List[Dict]] = {}
+        close_by_agency: Dict[str, List[Dict]] = {}
+        for ag in sorted(VALID_AGENCIES):
+            ag_rows = consolidate(date, prospects, photos, cards, agency_filter=ag)
+            rows_by_agency[ag] = ag_rows
+            close_by_agency[ag] = [c for c in closes if str(c.get("agency") or "").upper() == ag]
+        # Envoi pack agence à chaque manager
+        for ag in sorted(VALID_AGENCIES):
+            send_agency_pack(date, ag, prospects, photos, cards)
+        # Envoi pack admin global
+        send_admin_pack(date, prospects, photos, cards, rows_by_agency, close_by_agency)
+        logger.info("📊 Stats : %s", json.dumps(STATS, ensure_ascii=False))
         return
 
-    raise RuntimeError(f"Unknown SEND_MODE={SEND_MODE}")
+    raise RuntimeError(f"SEND_MODE inconnu : '{SEND_MODE}' — valeurs : individual | agency_manager | admin")
 
 
 if __name__ == "__main__":
