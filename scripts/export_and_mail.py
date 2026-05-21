@@ -201,6 +201,7 @@ def build_photos_zip(rows: List[Dict], date: str, agency: str, initials: str) ->
     """Construit un ZIP avec toutes les cartes de visite et photos de façade."""
     buf = io.BytesIO()
     count = 0
+    seen_fids = set()  # Éviter les doublons par file_id
 
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as z:
         index_lines = ["société;fichier;type"]
@@ -210,7 +211,8 @@ def build_photos_zip(rows: List[Dict], date: str, agency: str, initials: str) ->
 
             # Carte de visite
             card_fid = (row.get("card_photo_file_id") or "").strip()
-            if card_fid:
+            if card_fid and card_fid not in seen_fids:
+                seen_fids.add(card_fid)
                 img = tg_download(card_fid)
                 if img:
                     fname = f"cartes/{safe}_carte.jpg"
@@ -220,7 +222,8 @@ def build_photos_zip(rows: List[Dict], date: str, agency: str, initials: str) ->
 
             # Photo façade
             facade_fid = (row.get("facade_photo_file_id") or "").strip()
-            if facade_fid:
+            if facade_fid and facade_fid not in seen_fids:
+                seen_fids.add(facade_fid)
                 img = tg_download(facade_fid)
                 if img:
                     fname = f"facades/{safe}_facade.jpg"
@@ -229,7 +232,7 @@ def build_photos_zip(rows: List[Dict], date: str, agency: str, initials: str) ->
                     count += 1
 
         if count == 0:
-            return None  # Pas de photos → pas de ZIP
+            return None
 
         z.writestr("INDEX.csv", "\n".join(index_lines).encode("utf-8"))
 
@@ -343,6 +346,7 @@ def run_individual():
     if ADMIN_EMAIL and ADMIN_EMAIL not in sent:
         att = make_attachments(path_xlsx, path_xls, zip_data)
         send_brevo(ADMIN_EMAIL, "Admin SL", subject, html, att)
+        sent.add(ADMIN_EMAIL)
 
     print(f"✅ Individual terminé — {len(sent)} destinataire(s)")
 
