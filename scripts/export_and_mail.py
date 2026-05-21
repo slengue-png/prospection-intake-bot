@@ -38,7 +38,7 @@ SEND_MODE          = os.environ.get("SEND_MODE", "individual")
 RUN_DATE           = os.environ.get("RUN_DATE", datetime.date.today().strftime("%Y-%m-%d"))
 AGENCY             = os.environ.get("AGENCY", "")
 INITIALS           = os.environ.get("INITIALS", "")
-OUT_DIR            = "out"
+OUT_DIR            = "out/reports"
 
 try:
     MAIL_ROUTING = json.loads(MAIL_ROUTING_JSON)
@@ -205,7 +205,11 @@ def run_individual():
     ag_cfg     = MAIL_ROUTING.get("agencies", {}).get(AGENCY, {})
     commercial = ag_cfg.get("commercial", {})
     manager    = ag_cfg.get("manager", {})
-    subject    = f"Prospection {RUN_DATE} — {AGENCY}/{INITIALS} ({len(rows)} fiche(s))"
+    print(f"  DEBUG routing: agencies={list(MAIL_ROUTING.get('agencies',{}).keys())}")
+    print(f"  DEBUG ag_cfg={ag_cfg}")
+    print(f"  DEBUG commercial={commercial}")
+    print(f"  DEBUG manager={manager}")
+    print(f"  DEBUG admin={ADMIN_EMAIL}")
     html       = html_body(rows, AGENCY, INITIALS, RUN_DATE, "individual")
 
     sent_to = set()
