@@ -239,6 +239,10 @@ def _try_libreoffice_convert(xlsx_path, out_dir, base_name):
 
 
 def save_pair(wb_cons, wb_crm, out_dir, base_name):
+    import shutil as _shutil
+    # Supprimer si c'est un fichier (pas un dossier)
+    if os.path.exists(out_dir) and not os.path.isdir(out_dir):
+        os.remove(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     path_xlsx = os.path.join(out_dir, f"{base_name}.xlsx")
     path_xls  = os.path.join(out_dir, f"{base_name}.xls")
