@@ -91,7 +91,7 @@ def fetch_prospects(agency="", initials="", date="") -> List[Dict]:
                 obj = json.loads(line)
                 if isinstance(obj, dict): prospects.append(obj)
             except: pass
-        print(f"  → {len(prospects)} prospect(s)")
+        print(f"  → {len(prospects)} prospect(s) | headers: count={r.headers.get('x-record-count','?')}")
         return prospects
     except Exception as e:
         print(f"  ✗ fetch: {e}")
@@ -216,14 +216,12 @@ def run_individual():
     if not prospects_raw:
         print("  Aucun prospect"); return
 
-    rows = [normalize_prospect(p) for p in prospects_raw]
+    # Filtrer par agence et initiales
+    rows = [normalize_prospect(p) for p in prospects_raw
+            if (p.get("agency") or "").upper() == AGENCY.upper()
+            and (p.get("initials") or "").upper() == INITIALS.upper()]
+    print(f"  → {len(rows)} fiche(s) après filtre {AGENCY}/{INITIALS}")
     path_xlsx, path_xls = export_commercial(RUN_DATE, AGENCY, INITIALS, rows, OUT_DIR)
-    # DEBUG — premier prospect complet
-    if prospects_raw:
-        import json as _json
-        d0 = prospects_raw[0].get("draft", prospects_raw[0])
-        photo_keys = {k: v for k, v in d0.items() if "photo" in k.lower() or "card" in k.lower() or "facade" in k.lower()}
-        print(f"  DEBUG photo fields: {_json.dumps(photo_keys, ensure_ascii=False)}")
 
     ag_cfg     = MAIL_ROUTING.get("agencies", {}).get(AGENCY, {})
     commercial = ag_cfg.get("commercial", {})
@@ -270,8 +268,8 @@ def run_agency_manager():
         if not prospects_raw:
             print(f"    Aucun prospect"); continue
 
-        rows = [normalize_prospect(p) for p in prospects_raw]
-        path_xlsx, path_xls = export_agency_manager(RUN_DATE, agency, rows, OUT_DIR)
+        rows = [normalize_prospect(p) for p in prospects_raw
+                if (p.get("agency") or "").upper() == agency.upper()]        path_xlsx, path_xls = export_agency_manager(RUN_DATE, agency, rows, OUT_DIR)
         manager = config.get("manager", {})
         subject = f"Récap {RUN_DATE} — Agence {agency} ({len(rows)} fiche(s))"
         html    = html_body(rows, agency, "", RUN_DATE, "agency_manager")
