@@ -176,11 +176,13 @@ def normalize_prospect(p: Dict) -> Dict:
 def filter_rows(prospects_raw, agency="", initials="") -> List[Dict]:
     rows = []
     for p in prospects_raw:
-        ag  = (p.get("agency") or "").upper()
-        ini = (p.get("initials") or "").upper()
-        if agency  and ag  != agency.upper():  continue
-        if initials and ini != initials.upper(): continue
-        rows.append(normalize_prospect(p))
+        ag  = (p.get("agency") or p.get("draft", {}).get("agency", "")).upper()
+        ini = (p.get("initials") or p.get("draft", {}).get("initials", "")).upper()
+        match = (not agency or ag == agency.upper()) and (not initials or ini == initials.upper())
+        if not match:
+            print(f"  ⏭ ignoré: agency={ag} initials={ini}")
+        else:
+            rows.append(normalize_prospect(p))
     return rows
 
 
