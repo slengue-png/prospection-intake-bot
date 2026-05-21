@@ -54,12 +54,17 @@ ADMIN_INITIALS = MAIL_ROUTING.get("admin", {}).get("initials", "SL")
 # ─────────────────────────────────────────────
 
 def fetch_prospects(agency="", initials="", date="") -> List[Dict]:
-    params = {"token": EXPORT_TOKEN}
+    params = {}
     if date:     params["date"]     = date
     if agency:   params["agency"]   = agency
     if initials: params["initials"] = initials
     try:
-        r = requests.get(f"{WORKER_BASE_URL}/dump", params=params, timeout=60)
+        r = requests.get(
+            f"{WORKER_BASE_URL}/dump",
+            params=params,
+            headers={"X-Export-Token": EXPORT_TOKEN},
+            timeout=60,
+        )
         r.raise_for_status()
         prospects = []
         for line in r.text.strip().split("\n"):
