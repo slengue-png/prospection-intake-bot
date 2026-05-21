@@ -38,7 +38,7 @@ SEND_MODE          = os.environ.get("SEND_MODE", "individual")
 RUN_DATE           = os.environ.get("RUN_DATE", datetime.date.today().strftime("%Y-%m-%d"))
 AGENCY             = os.environ.get("AGENCY", "")
 INITIALS           = os.environ.get("INITIALS", "")
-OUT_DIR            = "out/reports"
+OUT_DIR            = "/tmp/prospection_out"
 
 try:
     MAIL_ROUTING = json.loads(MAIL_ROUTING_JSON)
