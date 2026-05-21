@@ -218,6 +218,12 @@ def run_individual():
 
     rows = [normalize_prospect(p) for p in prospects_raw]
     path_xlsx, path_xls = export_commercial(RUN_DATE, AGENCY, INITIALS, rows, OUT_DIR)
+    # DEBUG — premier prospect complet
+    if prospects_raw:
+        import json as _json
+        d0 = prospects_raw[0].get("draft", prospects_raw[0])
+        photo_keys = {k: v for k, v in d0.items() if "photo" in k.lower() or "card" in k.lower() or "facade" in k.lower()}
+        print(f"  DEBUG photo fields: {_json.dumps(photo_keys, ensure_ascii=False)}")
 
     ag_cfg     = MAIL_ROUTING.get("agencies", {}).get(AGENCY, {})
     commercial = ag_cfg.get("commercial", {})
