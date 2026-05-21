@@ -45,6 +45,23 @@ try:
 except Exception:
     MAIL_ROUTING = {}
 
+# Fallback hardcodé si le JSON est vide ou mal parsé
+if not MAIL_ROUTING.get("agencies"):
+    MAIL_ROUTING = {
+        "agencies": {
+            "GR":  {"manager": {"initials": "JL", "email": "jennifer.laurens@ras-interim.fr"},
+                    "commercial": {"initials": "CZ", "email": "celine.zunarelli@ras-interim.fr"}},
+            "VR":  {"manager": {"initials": "JB", "email": "jelena.carrasso@ras-interim.fr"},
+                    "commercial": {"initials": "LB", "email": "laura.berthet@ras-interim.fr"}},
+            "GRS": {"manager": {"initials": "PV", "email": "pauline.vieira@ras-interim.fr"},
+                    "commercial": {"initials": "ST", "email": "severine.thevenin@ras-interim.fr"}},
+            "SLS": {"manager": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"},
+                    "commercial": {"initials": "AC", "email": "aurelie.curt@ras-interim.fr"}},
+        },
+        "admin": {"initials": "SL", "email": "samuel.lengue@ras-interim.fr"},
+    }
+    print("  ⚠️  MAIL_ROUTING_JSON invalide — routing hardcodé utilisé")
+
 ADMIN_EMAIL    = MAIL_ROUTING.get("admin", {}).get("email", "")
 ADMIN_INITIALS = MAIL_ROUTING.get("admin", {}).get("initials", "SL")
 
