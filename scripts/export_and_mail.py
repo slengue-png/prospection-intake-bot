@@ -222,11 +222,7 @@ def run_individual():
     ag_cfg     = MAIL_ROUTING.get("agencies", {}).get(AGENCY, {})
     commercial = ag_cfg.get("commercial", {})
     manager    = ag_cfg.get("manager", {})
-    print(f"  DEBUG routing: agencies={list(MAIL_ROUTING.get('agencies',{}).keys())}")
-    print(f"  DEBUG ag_cfg={ag_cfg}")
-    print(f"  DEBUG commercial={commercial}")
-    print(f"  DEBUG manager={manager}")
-    print(f"  DEBUG admin={ADMIN_EMAIL}")
+    subject    = f"Prospection {RUN_DATE} — {AGENCY}/{INITIALS} ({len(rows)} fiche(s))"
     html       = html_body(rows, AGENCY, INITIALS, RUN_DATE, "individual")
 
     sent_to = set()
