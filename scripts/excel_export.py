@@ -17,7 +17,7 @@ CRM_HEADERS = [
     "NOM", "NOM COMMERCIAL", "RUE", "CODE POSTAL", "VILLE",
     "Téléphone", "Téléphone (Portable)", "Mail générique", "Mail carte de visite",
     "SIRET", "NAF", "ACTIVITE", "EFFECTIF", "DATE CREATION", "CAPITAL",
-    "SITE WEB", "PREFIXE", "INTERLOCUTEUR", "DIRIGEANT",
+    "SITE WEB", "PREFIXE", "TITRE", "INTERLOCUTEUR", "DIRIGEANT",
     "RESUME ENTRETIEN", "COMMANDE", "QUALIFICATION",
     "CARTE DE VISITE", "AGENCE", "INITIALS",
 ]
@@ -31,6 +31,7 @@ FIELD_MAP = {
     "ACTIVITE": "activity_summary", "EFFECTIF": "effectif",
     "DATE CREATION": "date_creation", "CAPITAL": "capital",
     "SITE WEB": "website", "PREFIXE": "contact_civility",
+    "TITRE": "titre",
     "INTERLOCUTEUR": "interlocuteur", "DIRIGEANT": "dirigeant",
     "RESUME ENTRETIEN": "resume", "COMMANDE": "commande",
     "QUALIFICATION": "qualification", "CARTE DE VISITE": "card_photo_url",
@@ -48,7 +49,7 @@ COL_WIDTHS = {
     "Téléphone": 14, "Téléphone (Portable)": 14, "Mail générique": 30, "Mail carte de visite": 30,
     "SIRET": 16, "NAF": 7, "ACTIVITE": 28, "EFFECTIF": 14,
     "DATE CREATION": 14, "CAPITAL": 12, "SITE WEB": 28, "PREFIXE": 8,
-    "INTERLOCUTEUR": 22, "DIRIGEANT": 22, "RESUME ENTRETIEN": 40,
+    "PREFIXE": 8, "TITRE": 20, "INTERLOCUTEUR": 22, "DIRIGEANT": 22, "RESUME ENTRETIEN": 40,
     "COMMANDE": 20, "QUALIFICATION": 12, "CARTE DE VISITE": 14,
     "AGENCE": 8, "INITIALS": 8,
 }
