@@ -164,9 +164,9 @@ def normalize_prospect(p: Dict) -> Dict:
         "qualification":      d.get("qualification", ""),
         # Photos — on garde le file_id pour le ZIP
         "card_photo_file_id":   d.get("card_photo_file_id", ""),
-        "card_photo_url":       d.get("card_photo_url", ""),
+        "card_photo_url":       f"cartes/{_safe_name(d.get('name',''))}_carte.jpg" if d.get("card_photo_file_id") else "",
         "facade_photo_file_id": d.get("facade_photo_file_id", ""),
-        "facade_photo_url":     d.get("facade_photo_url", ""),
+        "facade_photo_url":     f"facades/{_safe_name(d.get('name',''))}_facade.jpg" if d.get("facade_photo_file_id") else "",
         "agency":    p.get("agency", d.get("agency", "")),
         "initials":  p.get("initials", d.get("initials", "")),
         "_confidence": int(p.get("_confidence", d.get("_confidence", 0)) or 0),
@@ -175,14 +175,33 @@ def normalize_prospect(p: Dict) -> Dict:
 
 def filter_rows(prospects_raw, agency="", initials="") -> List[Dict]:
     rows = []
+    seen_visit_ids = set()
+    seen_sirets = set()
+
     for p in prospects_raw:
         ag  = (p.get("agency") or p.get("draft", {}).get("agency", "")).upper()
         ini = (p.get("initials") or p.get("draft", {}).get("initials", "")).upper()
-        match = (not agency or ag == agency.upper()) and (not initials or ini == initials.upper())
-        if not match:
-            print(f"  ⏭ ignoré: agency={ag} initials={ini}")
-        else:
-            rows.append(normalize_prospect(p))
+        if agency  and ag  != agency.upper():  continue
+        if initials and ini != initials.upper(): continue
+
+        # Dédupliquer par visit_id
+        vid = p.get("visit_id") or p.get("draft", {}).get("visit_id", "")
+        if vid and vid in seen_visit_ids:
+            print(f"  ⏭ doublon visit_id: {vid[:30]}")
+            continue
+        if vid: seen_visit_ids.add(vid)
+
+        # Dédupliquer par SIRET si pas de visit_id
+        row = normalize_prospect(p)
+        siret = row.get("siret", "").strip()
+        name  = row.get("name", "").strip()
+        dedup_key = f"{siret}|{name}" if siret else ""
+        if dedup_key and dedup_key in seen_sirets:
+            print(f"  ⏭ doublon SIRET: {siret} — {name}")
+            continue
+        if dedup_key: seen_sirets.add(dedup_key)
+
+        rows.append(row)
     return rows
 
 
