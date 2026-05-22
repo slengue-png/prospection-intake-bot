@@ -149,6 +149,7 @@ def normalize_prospect(p: Dict) -> Dict:
         "phone":              d.get("phone", ""),
         "phone2":             d.get("phone2", ""),
         "email":              d.get("email", ""),
+        "email_card":         d.get("email_card", ""),  # Email personnel carte de visite
         "siret":              d.get("siret", ""),
         "naf":                d.get("naf", ""),
         "activity_summary":   d.get("secteur_activite") or d.get("activity_summary") or d.get("naf", ""),
