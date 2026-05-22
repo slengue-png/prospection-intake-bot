@@ -15,7 +15,7 @@ from PIL import Image as PILImage
 
 CRM_HEADERS = [
     "NOM", "NOM COMMERCIAL", "RUE", "CODE POSTAL", "VILLE",
-    "Téléphone", "Téléphone (Portable)", "Mail générique",
+    "Téléphone", "Téléphone (Portable)", "Mail générique", "Mail carte de visite",
     "SIRET", "NAF", "ACTIVITE", "EFFECTIF", "DATE CREATION", "CAPITAL",
     "SITE WEB", "PREFIXE", "INTERLOCUTEUR", "DIRIGEANT",
     "RESUME ENTRETIEN", "COMMANDE", "QUALIFICATION",
@@ -26,7 +26,8 @@ FIELD_MAP = {
     "NOM": "name", "NOM COMMERCIAL": "nom_commercial",
     "RUE": "address", "CODE POSTAL": "postal_code", "VILLE": "city",
     "Téléphone": "phone", "Téléphone (Portable)": "phone2",
-    "Mail générique": "email", "SIRET": "siret", "NAF": "naf",
+    "Mail générique": "email", "Mail carte de visite": "email_card",
+    "SIRET": "siret", "NAF": "naf",
     "ACTIVITE": "activity_summary", "EFFECTIF": "effectif",
     "DATE CREATION": "date_creation", "CAPITAL": "capital",
     "SITE WEB": "website", "PREFIXE": "contact_civility",
@@ -44,7 +45,7 @@ IMG_MAX_W, IMG_MAX_H = 90, 55
 
 COL_WIDTHS = {
     "NOM": 28, "NOM COMMERCIAL": 30, "RUE": 30, "CODE POSTAL": 9, "VILLE": 18,
-    "Téléphone": 14, "Téléphone (Portable)": 14, "Mail générique": 30,
+    "Téléphone": 14, "Téléphone (Portable)": 14, "Mail générique": 30, "Mail carte de visite": 30,
     "SIRET": 16, "NAF": 7, "ACTIVITE": 28, "EFFECTIF": 14,
     "DATE CREATION": 14, "CAPITAL": 12, "SITE WEB": 28, "PREFIXE": 8,
     "INTERLOCUTEUR": 22, "DIRIGEANT": 22, "RESUME ENTRETIEN": 40,
@@ -154,8 +155,16 @@ def build_sheet(ws, rows, with_images=True, sheet_title="DATA"):
             c.border = thin_border()
 
             if h == "CARTE DE VISITE":
-                if with_images: c.value, c.fill = "", rf
-                else: c.value, c.font, c.alignment, c.fill = val, cell_font(), left_aligned(), rf
+                # Afficher le nom du fichier dans le ZIP
+                fid = (row.get("card_photo_file_id") or "").strip()
+                if fid:
+                    import re as _re
+                    safe = _re.sub(r"[^\w\s-]", "", (row.get("name","") or "INCONNU").upper())
+                    safe = _re.sub(r"\s+", "_", safe.strip())[:40] or "INCONNU"
+                    zip_val = f"cartes/{safe}_carte.jpg"
+                else:
+                    zip_val = "—"
+                c.value, c.font, c.alignment, c.fill = zip_val, cell_font(), left_aligned(), rf
                 continue
             if h == "QUALIFICATION":
                 q = val.lower().strip()
