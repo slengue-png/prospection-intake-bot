@@ -156,6 +156,8 @@ def normalize_prospect(p: Dict) -> Dict:
         "date_creation":      d.get("date_creation", ""),
         "capital":            d.get("capital", ""),
         "website":            d.get("website", ""),
+        "gps_lat":            d.get("gps_lat", ""),
+        "gps_lon":            d.get("gps_lon", ""),
         "contact_civility":   d.get("contact_civility", ""),
         "interlocuteur":      d.get("interlocuteur", ""),
         "dirigeant":          d.get("dirigeant", ""),
