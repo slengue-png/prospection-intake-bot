@@ -151,7 +151,7 @@ def normalize_prospect(p: Dict) -> Dict:
         "email":              d.get("email", ""),
         "siret":              d.get("siret", ""),
         "naf":                d.get("naf", ""),
-        "activity_summary":   d.get("secteur_activite", ""),
+        "activity_summary":   d.get("secteur_activite") or d.get("activity_summary") or d.get("naf", ""),
         "effectif":           d.get("effectif", ""),
         "date_creation":      d.get("date_creation", ""),
         "capital":            d.get("capital", ""),
@@ -162,11 +162,11 @@ def normalize_prospect(p: Dict) -> Dict:
         "resume":             d.get("resume", ""),
         "commande":           d.get("commande", ""),
         "qualification":      d.get("qualification", ""),
-        # Photos — on garde le file_id pour le ZIP
+        # Photos — file_id pour le ZIP, url = placeholder
         "card_photo_file_id":   d.get("card_photo_file_id", ""),
-        "card_photo_url":       f"cartes/{_safe_name(d.get('name',''))}_carte.jpg" if d.get("card_photo_file_id") else "",
+        "card_photo_url":       "voir_zip" if d.get("card_photo_file_id") else "",
         "facade_photo_file_id": d.get("facade_photo_file_id", ""),
-        "facade_photo_url":     f"facades/{_safe_name(d.get('name',''))}_facade.jpg" if d.get("facade_photo_file_id") else "",
+        "facade_photo_url":     "voir_zip" if d.get("facade_photo_file_id") else "",
         "agency":    p.get("agency", d.get("agency", "")),
         "initials":  p.get("initials", d.get("initials", "")),
         "_confidence": int(p.get("_confidence", d.get("_confidence", 0)) or 0),
