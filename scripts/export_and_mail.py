@@ -153,7 +153,7 @@ def normalize_prospect(p: Dict) -> Dict:
         "titre":              d.get("titre", ""),
         "siret":              d.get("siret", ""),
         "naf":                d.get("naf", ""),
-        "activity_summary":   d.get("secteur_activite") or d.get("activity_summary") or d.get("naf", ""),
+        "activity_summary":   d.get("secteur_activite") or d.get("activity_summary") or "",
         "effectif":           d.get("effectif", ""),
         "date_creation":      d.get("date_creation", ""),
         "capital":            d.get("capital", ""),
