@@ -673,14 +673,6 @@ async function checkTelegramSecretAsync(req) {
 }
 
 // Alias synchrone conservé pour compatibilité interne
-function checkTelegramSecret(req) {
-  const expected = String(globalThis.TELEGRAM_WEBHOOK_SECRET || "").trim();
-  if (!expected) return { ok: false, reason: "secret_not_configured" };
-  const got = req.headers.get("X-Telegram-Bot-Api-Secret-Token");
-  if (!got || got !== expected) return { ok: false, reason: "secret_mismatch" };
-  return { ok: true };
-}
-
 // Version async timing-safe (pour /dump et /remind via X-Export-Token)
 async function checkExportToken(req) {
   const configured = String(globalThis.EXPORT_TOKEN || "").trim();
@@ -949,11 +941,6 @@ function sanitizeGeminiOutput(d) {
 
 async function sha1HexFromString(str) {
   const buf = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(String(str || "").toLowerCase()));
-  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-async function sha1HexFromBytes(bytes) {
-  const buf = await crypto.subtle.digest("SHA-1", bytes);
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
@@ -1384,15 +1371,6 @@ function validateDraftMinimum(d) {
     errors.push("la ville ou le code postal est obligatoire");
   }
   return errors;
-}
-
-function draftHasContact(d) {
-  return !!(
-    normalizePhone(d.phone) ||
-    normalizePhone(d.phone2) ||
-    normalizeEmail(d.email) ||
-    (d.website && d.website.trim())
-  );
 }
 
 
@@ -1876,16 +1854,6 @@ const PROMPT_FACADE =
   "Ne pas inventer. Si illisible : confidence low, autres champs vides.";
 
 // Helper interne : parse réponse Gemini
-function _parseGeminiJsonResponse(data) {
-  const parts = (((data && data.candidates) || [])[0]?.content?.parts) || [];
-  let raw = "";
-  for (const p of parts) { if (p && typeof p.text === "string") raw += p.text; }
-  raw = String(raw || "").trim().replace(/^```json/i, "").replace(/```$/i, "").trim();
-  const m = raw.match(/\{[\s\S]*\}/);
-  if (!m) return null;
-  try { return JSON.parse(m[0]); } catch (_) { return null; }
-}
-
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-lite-latest:generateContent";
 
 async function getGeminiEndpoint() {
@@ -1946,38 +1914,6 @@ async function geminiVisionJsonFromImageBytes(imgBytes, prompt, maxTokens = 700,
 }
 
 // Structuration texte brut par Gemini (sans image = 10x moins cher)
-async function geminiStructureFromText(rawText, type) {
-  const apiKey = String(globalThis.GEMINI_API_KEY || "").trim();
-  if (!apiKey || !rawText) return {};
-
-  const prompt = type === "card"
-    ? `Texte extrait d'une carte de visite par OCR:\n\n${rawText}\n\n` +
-      `Retourne STRICTEMENT un JSON: name, company, title, contact_civility, ` +
-      `email, phone, phone2, website, postal_code, city, address, confidence (low/medium/high). ` +
-      `Vide si inconnu. Ne pas inventer.`
-    : `Texte extrait d'une enseigne / façade par OCR:\n\n${rawText}\n\n` +
-      `Retourne STRICTEMENT un JSON: company, activity, phone, website, city, confidence (low/medium/high). ` +
-      `Vide si inconnu. Ne pas inventer.`;
-
-  try {
-    const endpoint = await getGeminiEndpoint(apiKey);
-    const r = await fetch(`${endpoint}?key=${encodeURIComponent(apiKey)}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.1, maxOutputTokens: 500 },
-      }),
-      signal: AbortSignal.timeout(10000),
-    });
-    if (!r.ok) return {};
-    const j = await r.json();
-    return sanitizeGeminiOutput(_parseGeminiJsonResponse(j) || {});
-  } catch (_) {
-    return {};
-  }
-}
-
 // Transcription audio via Gemini
 async function geminiTranscribeAudio(audioBytes, mimeType) {
   const apiKey = String(globalThis.GEMINI_API_KEY || "").trim();
@@ -2680,23 +2616,6 @@ async function guessEmailFromDomain(website, markAsGuessed = true) {
 }
 
 // Chercher l'email avec headers navigateur réalistes
-async function fetchEmailFromPage(url) {
-  if (!url || !isSafeUrl(url)) return "";
-  try {
-    const r = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-        "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "fr-FR,fr;q=0.9",
-      },
-      signal: AbortSignal.timeout(6000),
-    });
-    if (!r.ok) return "";
-    const html = await r.text();
-    return pickEmailFromHtml(html, url);
-  } catch (_) { return ""; }
-}
-
 // Recherche Google CSE — email ET infos générales entreprise
 // =====================================================
 // BRAVE SEARCH — enseigne→société, email, site, tel
@@ -2846,65 +2765,8 @@ async function scrapeEmailCached(url) {
 // BRAVE SEARCH — Recherche web pour enseignes/emails
 // =====================================================
 
-async function braveSearch(query, count = 5) {
-  const key = String(globalThis.BRAVE_SEARCH_KEY || "").trim();
-  if (!key) return [];
-  try {
-    const url = "https://api.search.brave.com/res/v1/web/search?q=" +
-      encodeURIComponent(query) + "&count=" + count + "&country=fr&lang=fr&search_lang=fr";
-    const r = await fetch(url, {
-      headers: {
-        "Accept": "application/json",
-        "Accept-Encoding": "gzip",
-        "X-Subscription-Token": key,
-      },
-      signal: AbortSignal.timeout(8000),
-    });
-    if (!r.ok) {
-      log("warn", null, "BRAVE_ERROR", { status: r.status, query: query.slice(0,50) });
-      return [];
-    }
-    const j = await r.json();
-    return j?.web?.results || [];
-  } catch (e) {
-    log("warn", null, "BRAVE_EXCEPTION", { err: e?.message, query: query.slice(0,50) });
-    return [];
-  }
-}
-
 // Extraire email depuis les snippets Brave
-function extractEmailFromBraveResults(results) {
-  const EMAIL_RE = /[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}/g;
-  for (const r of results) {
-    const text = `${r.title || ""} ${r.description || ""} ${r.url || ""}`;
-    for (const m of (text.match(EMAIL_RE) || [])) {
-      const e = normalizeEmail(m);
-      if (e && !/no-?reply|google|example|brave|w3c/i.test(e)) return e;
-    }
-  }
-  return "";
-}
-
 // Extraire SIREN depuis les snippets Brave
-function extractSirenFromBraveResults(results) {
-  const SIREN_RE = /\b(\d{3}[\s.\-]?\d{3}[\s.\-]?\d{3})\b/g;
-  const SIRET_RE = /\b(\d{3}[\s.\-]?\d{3}[\s.\-]?\d{3}[\s.\-]?\d{5})\b/g;
-  for (const r of results) {
-    const text = `${r.title || ""} ${r.description || ""}`;
-    // SIRET d'abord (plus précis)
-    for (const m of (text.match(SIRET_RE) || [])) {
-      const s = m.replace(/[\s.\-]/g, "");
-      if (s.length === 14) return s.slice(0, 9); // retourner le SIREN
-    }
-    // SIREN
-    for (const m of (text.match(SIREN_RE) || [])) {
-      const s = m.replace(/[\s.\-]/g, "");
-      if (s.length === 9 && !s.startsWith("000")) return s;
-    }
-  }
-  return "";
-}
-
 // Trouver la société juridique d'une enseigne via Brave
 async function findJuridicalFromEnseigne(enseigneName, ville, cp, phone = "") {
   const locFull = [ville, cp].filter(Boolean).join(" ");
@@ -4033,15 +3895,6 @@ async function saveCurrentVisitAsProspectForced(chatId, s) {
   return { ok: true, key, record, edit: !!editKey };
 }
 
-function attachCardKeyToDraft(draft, cardKey) {
-  const d = normalizeDraft(draft || {});
-  const arr = Array.isArray(d.linked_card_keys) ? [...d.linked_card_keys] : [];
-  if (cardKey && !arr.includes(cardKey)) arr.push(cardKey);
-  d.linked_card_keys = arr;
-  d.card_kv_key = d.card_kv_key || cardKey || "";
-  return d;
-}
-
 function attachPhotoKeyToDraft(draft, photoKey) {
   const d = normalizeDraft(draft || {});
   const arr = Array.isArray(d.linked_photo_keys) ? [...d.linked_photo_keys] : [];
@@ -4127,174 +3980,6 @@ async function createProspectFromFacade(chatId, s, file_id, cityHint = "", comme
   await setSession(chatId, s);
 
   return { draft: s.draft, ocrConf: facade.confidence || "low" };
-}
-
-async function createProspectFromCard(chatId, s, file_id, comment = null) {
-  await createNewActiveVisit(chatId, s, "card");
-
-  // ── Étape 1 : OCR carte ───────────────────────────
-  let card = {};
-  try {
-    const imgBytes = await withTimeout(getBytesFromFileId(file_id), 10_000, new Uint8Array());
-    if (imgBytes.length) card = await hybridExtractCard(imgBytes);
-  } catch (_) {}
-
-  // Fusion champs OCR dans le draft
-  if (card.company) s.draft.name = card.company;
-  if (card.name) {
-    s.draft.interlocuteur = card.name;
-    const sp = splitHumanName(card.name);
-    s.draft.contact_firstname = sp.first || "";
-    s.draft.contact_lastname  = sp.last  || card.name;
-  }
-  if (card.contact_civility) s.draft.contact_civility = card.contact_civility;
-  if (card.email) {
-    s.draft.email_card  = normalizeEmail(card.email);  // Email personnel carte
-    s.draft.email       = normalizeEmail(card.email);  // Sera potentiellement remplacé par email générique
-  }
-  if (card.phone)       s.draft.phone       = normalizePhone(card.phone);
-  if (card.phone2)      s.draft.phone2      = normalizePhone(card.phone2);
-  if (card.website)     s.draft.website     = card.website;
-  if (card.city)        s.draft.city        = card.city;
-  if (card.postal_code) s.draft.postal_code = card.postal_code;
-  if (card.address)     s.draft.address     = card.address;
-  if (card.title)       s.draft.titre       = card.title;
-  s.draft._ocr_confidence   = card._confidence || "low";
-  s.draft.card_photo_file_id = file_id;
-  s.draft.card_photo_url     = await tgGetFileUrl(file_id).catch(() => "");
-  if (comment) s.draft.resume = trunc(comment, 300);
-
-  await persistActiveVisit(chatId, s);
-  await setSession(chatId, s);
-
-  // ── Étape 2 : enrichissement Gouv + Places ─────────
-  const company = s.draft.name || "";
-  const city    = s.draft.city || "";
-
-  if (company) {
-    await sendMessage(chatId, `🔍 Enrichissement de <b>${escapeHtml(company)}</b>…`);
-
-    try {
-      // Construction des queries Gouv — combinaison de tous les signaux de la carte
-      const d = s.draft;
-      const cp = d.postal_code || "";
-      const emailDomain = (d.email || "").split("@")[1]?.replace(/\.(fr|com|net|org|eu)$/, "").replace(/[\-_.]/g, " ").trim() || "";
-      const siteDomain  = (d.website || "").replace(/https?:\/\/(www\.)?/, "").split("/")[0].replace(/\.(fr|com|net|org|eu)$/, "").replace(/[\-_.]/g, " ").trim();
-
-      const queries = new Set();
-      // 1. Nom + ville (priorité)
-      if (company && city)        queries.add(`${company} ${city}`);
-      // 2. Nom + code postal (très précis)
-      if (company && cp)          queries.add(`${company} ${cp}`);
-      // 3. Domaine email + code postal
-      if (emailDomain && cp)      queries.add(`${emailDomain} ${cp}`);
-      // 4. Domaine site + code postal
-      if (siteDomain && cp && siteDomain !== emailDomain) queries.add(`${siteDomain} ${cp}`);
-      // 5. Domaine email + ville
-      if (emailDomain && city)    queries.add(`${emailDomain} ${city}`);
-      // 6. Téléphone seul (API Gouv supporte la recherche par tel)
-      if (d.phone)                queries.add(normalizePhone(d.phone));
-      // 7. Nom seul en dernier recours
-      if (company)                queries.add(company);
-
-      let best = null;
-      for (const q of queries) {
-        if (!q.trim()) continue;
-        const results = await searchCompany(q.trim()).catch(() => []);
-        if (results[0]) { best = results[0]; break; }
-      }
-
-      if (best) {
-        if (!d.name          && best.nom)            d.name            = best.nom;
-        if (best.siret)                              d.siret           = best.siret;
-        if (best.naf)                                d.naf             = best.naf;
-        if (!d.address       && best.adresse)        d.address         = best.adresse;
-        if (!d.postal_code   && best.codePostal)     d.postal_code     = best.codePostal;
-        if (!d.city          && best.ville)          d.city            = best.ville;
-        if (best.effectif)                           d.effectif        = best.effectif;
-        if (best.date_creation)                      d.date_creation   = best.date_creation;
-        if (best.capital)                            d.capital         = best.capital;
-        if (!d.secteur_activite && best.secteur_activite) d.secteur_activite = best.secteur_activite;
-        if (best.dirigeants?.length && !d.dirigeant) {
-          const dir = best.dirigeants[0];
-          const nom = typeof dir === "string" ? dir
-            : cleanPersonName([dir.prenom?.split(" ")[0], dir.nom || dir.nom_usage].filter(Boolean).join(" "));
-          if (nom) d.dirigeant = normalizeSpaces(nom);
-        }
-      } else {
-        log("info", chatId, "CARD_ENRICH_NO_RESULT", { queries: [...queries].slice(0, 4) });
-      }
-
-      // Google Places : complète ce qui manque encore
-      if (!s.draft.phone || !s.draft.website) {
-        const place = await googlePlacesEnrich(s.draft.name || company, s.draft.city || city).catch(() => ({}));
-        if (place.phone   && !s.draft.phone)   s.draft.phone   = place.phone;
-        if (place.website && !s.draft.website)  s.draft.website = place.website;
-      }
-
-      // Email : scraping site → fallback Google CSE
-      if (!s.draft.email) {
-        if (s.draft.website) {
-          s.draft.email = await scrapeEmailCached(s.draft.website).catch(() => "");
-        }
-        if (!s.draft.email) s.draft.email = await searchEmailViaGoogle(s.draft.name || company, s.draft.city || city).catch(() => "");
-        if (!s.draft.email && s.draft.website) s.draft.email = await guessEmailFromDomain(s.draft.website).catch(() => "");
-      }
-
-    } catch (e) {
-      log("warn", chatId, "CARD_ENRICH_ERROR", { err: e?.message });
-    }
-
-    await persistActiveVisit(chatId, s);
-    await setSession(chatId, s);
-
-    // Feedback enrichissement complet
-    const lines = [`✅ <b>${escapeHtml(s.draft.name || company)}</b>`];
-    if (s.draft.interlocuteur)    lines.push(`👤 ${escapeHtml(s.draft.interlocuteur)}`);
-    if (s.draft.contact_civility) lines.push(`🎩 ${escapeHtml(s.draft.contact_civility)}`);
-    if (s.draft.siret)            lines.push(`🆔 SIRET : ${escapeHtml(s.draft.siret)}`);
-    if (s.draft.secteur_activite) lines.push(`🏭 ${escapeHtml(s.draft.secteur_activite)}`);
-    if (s.draft.effectif)         lines.push(`👥 ${escapeHtml(s.draft.effectif)}`);
-    if (s.draft.dirigeant)        lines.push(`👔 ${escapeHtml(s.draft.dirigeant)}`);
-    if (s.draft.phone)            lines.push(`📞 ${escapeHtml(formatPhone(s.draft.phone))}`);
-    if (s.draft.email)            lines.push(`✉️ ${escapeHtml(s.draft.email)}`);
-    if (s.draft.website)          lines.push(`🌐 ${escapeHtml(s.draft.website)}`);
-    if (s.draft.city || s.draft.postal_code)
-      lines.push(`📍 ${escapeHtml([s.draft.postal_code, s.draft.city].filter(Boolean).join(" "))}`);
-    await sendMessage(chatId, lines.join("\n"));
-
-    // Si enrichissement incomplet → proposer recherche ou voir fiche
-    if (!s.draft.siret) {
-      await sendMessage(chatId,
-        `⚠️ <b>Entreprise non trouvée automatiquement.</b>\n\n` +
-        `Tu peux :\n` +
-        `• 🔎 Lancer une recherche pour compléter le SIRET, l'effectif, etc.\n` +
-        `• ✏️ Voir et modifier la fiche telle quelle\n` +
-        `• ✅ Sauvegarder directement sans enrichissement`,
-        {
-          inline_keyboard: [
-            [{ text: "🔎 Rechercher l'entreprise", callback_data: "search_company" }],
-            [{ text: "✏️ Voir / modifier la fiche", callback_data: "visit:resume_active" }],
-            [{ text: "✅ Sauvegarder maintenant", callback_data: "save" }],
-          ],
-        }
-      );
-    } else {
-      // SIRET trouvé → ouvrir la fiche
-      s.step = "VISIT_ACTIVE";
-      s.mode = "company";
-      await persistActiveVisit(chatId, s);
-      await setSession(chatId, s);
-      return postOrReplaceForm(chatId, s);
-    }
-  }
-
-  s.step = "VISIT_ACTIVE";
-  s.mode = "company";
-  await persistActiveVisit(chatId, s);
-  await setSession(chatId, s);
-
-  return { draft: s.draft, ocrConf: card._confidence || "low", card };
 }
 
 async function buildVisitsListMessage(chatId, s) {

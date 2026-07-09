@@ -1,0 +1,18 @@
+# Configuration Cloudflare Workers — Prospection Intake Bot (worker v8.4)
+# Déploiement : npx wrangler deploy
+name = "prospection-intake-worker"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Binding KV utilisé par le worker (kv() -> globalThis.PROSPECTION_KV)
+# Renseigner l'id du namespace (Dashboard Cloudflare > Workers & Pages > KV).
+[[kv_namespaces]]
+binding = "PROSPECTION_KV"
+id = "REMPLACER_PAR_ID_KV"
+# preview_id = "REMPLACER_PAR_ID_KV_PREVIEW"
+
+# Secrets (NE PAS mettre ici) — à définir via `npx wrangler secret put <NOM>` :
+#   TELEGRAM_TOKEN, TELEGRAM_WEBHOOK_SECRET, EXPORT_TOKEN
+#   GEMINI_API_KEY, GOOGLE_VISION_API_KEY, GOOGLE_PLACES_API_KEY, BRAVE_SEARCH_KEY
+#   GITHUB_TOKEN, GITHUB_OWNER, GITHUB_REPO, GITHUB_WORKFLOW_FILE
+#   BREVO_API_KEY, BREVO_SENDER_EMAIL, MANAGER_CHAT_ID
