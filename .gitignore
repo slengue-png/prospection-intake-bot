@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Node / TypeScript
+node_modules/
+dist/
+
+# Generated exports / local artifacts
+out/
+reports/
+*.log
