@@ -22,6 +22,8 @@ type Draft = {
   name?: string;
   city?: string;
   phone?: string;
+  interlocuteur?: string;
+  interlocuteur_email?: string;
   resume?: string;
   commande?: string;
   photoFileId?: string;
@@ -105,7 +107,7 @@ async function tg(method: string, token: string, payload: any) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify(payload),
   });
-  const data = await res.json();
+  const data = await res.json() as { ok: boolean; result?: any };
   if (!data.ok) throw new Error(`Telegram API error: ${method} -> ${JSON.stringify(data)}`);
   return data.result;
 }
@@ -147,8 +149,11 @@ function buildPreview(d: Draft) {
     ``,
     `*NOM* : ${d.name || "—"}`,
     `*VILLE* : ${d.city || "—"}`,
-    `*TEL* : ${d.phone || "—"}\n*AGENCE* : ${d.agency || "—"}
-*USER* : ${d.userName || "—"} (${d.userId})`,
+    `*TEL* : ${d.phone || "—"}`,
+    `*AGENCE* : ${d.agency || "—"}`,
+    `*USER* : ${d.userName || "—"} (${d.userId})`,
+    `*Interlocuteur* : ${d.interlocuteur || "—"}`,
+    `*Mail interlocuteur* : ${d.interlocuteur_email || "—"}`,
     ``,
     `*Résumé entretien* : ${d.resume ? d.resume.slice(0, 800) : "—"}`,
     `*Commande* : ${d.commande ? d.commande.slice(0, 800) : "—"}`,
@@ -163,6 +168,11 @@ function buildPreview(d: Draft) {
     ``,
     d.photoFileId ? `📸 Carte de visite : *oui* (OCR V2)` : `📸 Carte de visite : *non*`,
   ].join("\n");
+}
+
+// Aperçu utilisé par le flow guidé (NEW)
+function renderDraftPreview(d: Draft) {
+  return buildPreview(d);
 }
 
 function keyboard(draftId: string) {
@@ -183,6 +193,11 @@ async function createOrGetDraft(env: Env, chatId: number, userId: number, userNa
   const d: Draft = { id: uid().slice(0, 8), createdAt: nowISO(), chatId, userId, userName };
   await env.KV.put(key, JSON.stringify(d), { expirationTtl: 60 * 60 * 24 * 7 });
   return d;
+}
+
+// Alias sémantique: garantit qu'un brouillon existe pour ce chat.
+async function loadDraft(env: Env, chatId: number, userId: number, userName?: string) {
+  return createOrGetDraft(env, chatId, userId, userName);
 }
 
 async function saveDraft(env: Env, d: Draft) {
@@ -220,22 +235,6 @@ async function githubCreateIssue(env: Env, title: string, body: string) {
   return githubCreateIssueWithLabels(env, title, body, ["intake"]);
 }
 
-
-  const [owner, repo] = env.GITHUB_REPO.split("/");
-  const res = await fetch(`https://api.github.com/repos/${owner}/${repo}/issues`, {
-    method: "POST",
-    headers: {
-      "accept": "application/vnd.github+json",
-      "authorization": `Bearer ${env.GITHUB_TOKEN}`,
-      "user-agent": "prospection-intake-worker",
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ title, body, labels: ["intake"] }),
-  });
-  if (!res.ok) throw new Error(`GitHub issue create failed: ${res.status} ${await res.text()}`);
-  return await res.json();
-}
-
 function buildIssueBody(d: Draft) {
   const e = d.enriched || {};
   const safe = (s?: string) => (s ? s.replace(/\r/g, "").trim() : "");
@@ -243,12 +242,13 @@ function buildIssueBody(d: Draft) {
     `source: telegram`,
     `draft_id: ${d.id}`,
     `created_at: ${d.createdAt}`,
-    user: ${safe(d.userName)}
-agency: ${safe(d.agency)}
-agency: ${safe(d.agency)},
+    `user: ${safe(d.userName)}`,
+    `agency: ${safe(d.agency)}`,
     `name: ${safe(d.name)}`,
     `city: ${safe(d.city)}`,
     `phone: ${safe(d.phone)}`,
+    `interlocuteur: ${safe(d.interlocuteur)}`,
+    `interlocuteur_email: ${safe(d.interlocuteur_email)}`,
     `resume_entretien: |`,
     ...safe(d.resume).split("\n").map(l => `  ${l}`),
     `commande: |`,
@@ -268,13 +268,46 @@ agency: ${safe(d.agency)},
 }
 
 async function handleMessage(env: Env, msg: any) {
-  const chatId = msg.chat.id;
-  const userId = msg.from.id;
-
-  // Photo message for guided flow
+  const chatId = msg.chat.id as number;
+  const userId = msg.from.id as number;
+  const userName = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(" ");
   const hasPhoto = !!msg.photo;
-
   const text = (msg.text || "").trim();
+
+  // Sécurité: autorisation par liste blanche
+  if (!isAllowedUser(env, userId)) {
+    await tg("sendMessage", env.TELEGRAM_TOKEN, {
+      chat_id: chatId,
+      text: "⛔ Accès non autorisé à ce bot. Contacte l'administrateur.",
+    });
+    return;
+  }
+
+  // Utilitaire: renvoyer l'ID Telegram (pour que l'admin puisse whitelister)
+  if (text === "/whoami") {
+    await tg("sendMessage", env.TELEGRAM_TOKEN, {
+      chat_id: chatId,
+      text: `👤 ${userName || "Utilisateur"}\n🆔 Telegram user_id: ${userId}`,
+    });
+    return;
+  }
+
+  if (text === "/start") {
+    await tg("sendMessage", env.TELEGRAM_TOKEN, {
+      chat_id: chatId,
+      parse_mode: "Markdown",
+      text:
+        "👋 *Prospection Intake*\n\n" +
+        "Envoie-moi :\n" +
+        "• `Nom ; Ville`\n" +
+        "• `Nom 06xxxxxxxx`\n" +
+        "• ou une *photo* de carte de visite\n\n" +
+        "Puis :\n• `resume: ...`\n• `cmd: ...`\n• `bilan: prospect=6 client=4 cmd=2 (option: visites=10)`\n\n" +
+        "Clique ✅ *Valider* pour envoyer au fichier de réception.",
+    });
+    await sendMainMenu(env, chatId, "Menu.");
+    return;
+  }
 
   // Main menu actions
   if (text === "↩️ Menu") {
@@ -396,13 +429,13 @@ async function handleMessage(env: Env, msg: any) {
       conv.data.cmd = (text === "-" ? "" : text);
 
       // Remplit le draft existant puis propose Valider
-      const d = await loadDraft(env, chatId, userId);
+      const d = await loadDraft(env, chatId, userId, userName);
       d.name = conv.data.name || d.name;
       d.city = conv.data.city || d.city;
       d.phone = conv.data.phone || d.phone;
       d.interlocuteur = conv.data.interlocuteur || d.interlocuteur;
       d.interlocuteur_email = conv.data.email || d.interlocuteur_email;
-      d.resume_entretien = conv.data.resume || d.resume_entretien;
+      d.resume = conv.data.resume || d.resume;
       d.commande = conv.data.cmd || d.commande;
       d.photoFileId = conv.data.photoFileId || d.photoFileId;
 
@@ -422,45 +455,7 @@ async function handleMessage(env: Env, msg: any) {
     }
   }
 
-  const chatId = msg.chat.id as number;
-  const userId = msg.from.id as number;
-  const userName = [msg.from.first_name, msg.from.last_name].filter(Boolean).join(\" \");
-  const text = (msg.text || \"\").trim();
-
-  // Sécurité: autorisation par liste blanche (9 utilisateurs)
-  if (!isAllowedUser(env, userId)) {
-    await tg(\"sendMessage\", env.TELEGRAM_TOKEN, {
-      chat_id: chatId,
-      text: \"⛔ Accès non autorisé à ce bot. Contacte l'administrateur.\",
-    });
-    return;
-  }
-
-  // Utilitaire: renvoyer l'ID Telegram (pour que l'admin puisse whitelister)
-  if (text === \"/whoami\") {
-    await tg(\"sendMessage\", env.TELEGRAM_TOKEN, {
-      chat_id: chatId,
-      text: `👤 ${userName || \"Utilisateur\"}\n🆔 Telegram user_id: ${userId}`,
-    });
-    return;
-  }
-
-  if (text === "/start") {
-    await tg("sendMessage", env.TELEGRAM_TOKEN, {
-      chat_id: chatId,
-      parse_mode: "Markdown",
-      text:
-        "👋 *Prospection Intake*\n\n" +
-        "Envoie-moi :\n" +
-        "• `Nom ; Ville`\n" +
-        "• `Nom 06xxxxxxxx`\n" +
-        "• ou une *photo* de carte de visite\n\n" +
-        "Puis :\n• `resume: ...`\n• `cmd: ...`\n• `bilan: prospect=6 client=4 cmd=2 (option: visites=10)`\n\n" +
-        "Clique ✅ *Valider* pour envoyer au fichier de réception.",
-    });
-    return;
-  }
-
+  // ── Saisie rapide (hors flow guidé) ────────────────────────────
   let d = await createOrGetDraft(env, chatId, userId, userName);
 
   if (msg.photo && Array.isArray(msg.photo) && msg.photo.length) {
@@ -468,12 +463,12 @@ async function handleMessage(env: Env, msg: any) {
     d.photoFileId = best.file_id;
     d.enriched = await enrichV1(d);
     await saveDraft(env, d);
-    await sendMainMenu(env, chatId, "Menu prospection ✅
-
-1) Choisis l’agence: /ag GR (ou VR/GRS/SLS)
-2) ➕ Nouvelle entrée
-3) 📊 Bilan session (bilan: prospect=.. client=.. cmd=..)
-4) 🔒 Clore session");
+    await sendMainMenu(env, chatId,
+      "Menu prospection ✅\n\n" +
+      "1) Choisis l’agence: /ag GR (ou VR/GRS/SLS)\n" +
+      "2) ➕ Nouvelle entrée\n" +
+      "3) 📊 Bilan session (bilan: prospect=.. client=.. cmd=..)\n" +
+      "4) 🔒 Clore session");
     return;
   }
 
@@ -547,9 +542,15 @@ async function handleMessage(env: Env, msg: any) {
 
 async function handleCallback(env: Env, cb: any) {
   const chatId = cb.message.chat.id as number;
+  const userId = cb.from.id as number;
   const data = cb.data as string;
-  const d = await createOrGetDraft(env, chatId, cb.from.id, [cb.from.first_name, cb.from.last_name].filter(Boolean).join(" "));
+  const d = await createOrGetDraft(env, chatId, userId, [cb.from.first_name, cb.from.last_name].filter(Boolean).join(" "));
 
+  if (data === "MENU") {
+    await tg("answerCallbackQuery", env.TELEGRAM_TOKEN, { callback_query_id: cb.id });
+    await sendMainMenu(env, chatId, "Menu.");
+    return;
+  }
   if (data.startsWith("cancel:")) {
     await clearDraft(env, chatId);
     await tg("answerCallbackQuery", env.TELEGRAM_TOKEN, { callback_query_id: cb.id, text: "Annulé ✅" });
@@ -566,7 +567,7 @@ async function handleCallback(env: Env, cb: any) {
     await tg("sendMessage", env.TELEGRAM_TOKEN, { chat_id: chatId, text: "Envoie: cmd: ta commande (en vrac)" });
     return;
   }
-  if (data.startsWith("validate:")) {
+  if (data === "VALIDATE" || data.startsWith("validate:")) {
     if (!d.agency) {
       await tg("answerCallbackQuery", env.TELEGRAM_TOKEN, { callback_query_id: cb.id, text: "Choisis l'agence (ex: /ag GR)" });
       return;
@@ -578,7 +579,7 @@ async function handleCallback(env: Env, cb: any) {
     d.enriched = await enrichV1(d);
     const issueTitle = `Prospection [${d.agency || 'NA'}]: ${d.name || "SansNom"}${d.city ? " — " + d.city : ""}`;
     const body = "```yaml\n" + buildIssueBody(d) + "\n```";
-    const issue = await githubCreateIssue(env, issueTitle, body);
+    const issue = await githubCreateIssue(env, issueTitle, body) as { html_url: string };
     await clearDraft(env, chatId);
     await tg("answerCallbackQuery", env.TELEGRAM_TOKEN, { callback_query_id: cb.id, text: "Validé ✅" });
     await tg("sendMessage", env.TELEGRAM_TOKEN, { chat_id: chatId, text: `✅ Enregistré. Issue: ${issue.html_url}\n\nEnvoie la prochaine société.` });
@@ -592,7 +593,7 @@ export default {
     if (url.pathname !== `/${env.TELEGRAM_WEBHOOK_SECRET}`) return new Response("Not found", { status: 404 });
     if (request.method !== "POST") return new Response("OK", { status: 200 });
 
-    const update = await request.json();
+    const update = await request.json() as any;
     try {
       if (update.message) await handleMessage(env, update.message);
       else if (update.callback_query) await handleCallback(env, update.callback_query);
