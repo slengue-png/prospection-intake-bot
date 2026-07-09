@@ -3505,7 +3505,6 @@ async function enrichDraftFromCurrentData(draft) {
   const isFacade = !!(d.facade_photo_file_id);
   if (d.siret && d.siret.length >= 9 && dDept && !isFacade) {
     log("info", null, "ENRICH_SKIP_HAS_SIRET", { siret: d.siret, dept: dDept });
-    log("info", null, "ENRICH_SKIP_HAS_SIRET", { siret: d.siret, dept: dDept });
     // Compléter seulement les données manquantes
     if (!d.email && (d.name || d.website)) {
       try {
@@ -5124,16 +5123,22 @@ async function handleMessage(msg, event = null) {
     if (!file_id) return sendMessage(chatId, "📸 Envoie la photo de la façade (via trombone pour meilleure qualité).", failSafeKeyboard());
     if (!isValidFileId(file_id)) return sendMessage(chatId, "⚠️ Photo invalide.", failSafeKeyboard());
 
-    // Utiliser le GPS disponible pour la ville hint
+    // Créer la visite active AVANT d'écrire les données OCR
+    // (createNewActiveVisit réinitialise s.draft : le faire après effacerait l'OCR)
+    if (!s.active_visit_id) await createNewActiveVisit(chatId, s, "photo");
+
+    // GPS → ville + code postal uniquement. JAMAIS l'adresse : elle appartient
+    // à l'entreprise (trouvée par l'enrichissement), pas à la position du commercial.
     const geoSnap = getFreshGeoOrNull(s);
-    if (geoSnap && !s.draft.city) {
-      const geo = await reverseGeocode(geoSnap.lat, geoSnap.lon).catch(() => null);
-      if (geo?.city) {
-        s.draft.city        = geo.city;
-        s.draft.postal_code = s.draft.postal_code || geo.postal_code || "";
-        s.draft.address     = s.draft.address     || geo.address     || "";
-        s.draft.gps_lat     = geoSnap.lat;
-        s.draft.gps_lon     = geoSnap.lon;
+    if (geoSnap) {
+      s.draft.gps_lat = geoSnap.lat;
+      s.draft.gps_lon = geoSnap.lon;
+      if (!s.draft.city || !s.draft.postal_code) {
+        const geo = await reverseGeocode(geoSnap.lat, geoSnap.lon).catch(() => null);
+        if (geo) {
+          if (!s.draft.city)        s.draft.city        = geo.city || "";
+          if (!s.draft.postal_code) s.draft.postal_code = geo.postal_code || "";
+        }
       }
     }
 
@@ -5160,10 +5165,27 @@ async function handleMessage(msg, event = null) {
     s.draft.facade_photo_url     = await tgGetFileUrl(file_id);
     s.draft._ocr_confidence      = facade.confidence || "low";
 
-    // Créer une visite active si pas encore fait
-    if (!s.active_visit_id) {
-      await createNewActiveVisit(chatId, s, "photo");
-      s.draft.facade_photo_file_id = file_id;
+    // Enrichissement automatique (Gouv/Places/Brave), calqué sur createProspectFromFacade.
+    // adresse vide + ville/CP GPS → la Stratégie 3 cherche par nom+CP sans l'adresse du commercial.
+    if (s.draft.name) {
+      const spinnerEnrich = await sendMessage(chatId, `🔍 Enrichissement de <b>${escapeHtml(s.draft.name)}</b>…`);
+      try {
+        const enriched = await enrichCompany({
+          nom:             s.draft.name,
+          codePostal:      s.draft.postal_code || "",
+          ville:           s.draft.city || "",
+          adresse:         "", // Jamais l'adresse GPS pour une façade
+          _places_phone:   normalizePhone(s.draft.phone || ""),
+          _places_website: s.draft.website || "",
+          _places_lat:     s.draft.gps_lat || null,
+          _places_lon:     s.draft.gps_lon || null,
+        });
+        s.draft = applyCompanyToDraft(s.draft, enriched);
+      } catch (err) {
+        log("warn", chatId, "AWAIT_PHOTO_FACADE_ENRICH_ERROR", { err: err?.message });
+      } finally {
+        await deleteMessage(chatId, spinnerEnrich?.message_id).catch(() => {});
+      }
     }
 
     s.step = "VISIT_ACTIVE"; s.awaitingField = null;
